@@ -86,10 +86,15 @@ app.use((req, res, next) => {
 
   // Headers de sécurité
   res.setHeader("X-Content-Type-Options", "nosniff");
-  res.setHeader("X-Frame-Options", "SAMEORIGIN");
+  // En environnement AI Studio / Cloud Run, l'application est hébergée dans une iframe.
+  // X-Frame-Options: SAMEORIGIN bloque le rendu de l'application dans l'interface de build.
+  // On utilise Content-Security-Policy frame-ancestors au lieu de bloquer l'iframe.
   res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
   res.setHeader("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload");
-  res.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://apis.google.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: blob:; connect-src 'self' https: wss:; frame-src 'self' https://ais-dev-6etwlfzn4irzgw5ljyhzsh-76486687314.europe-west2.run.app https://ais-pre-6etwlfzn4irzgw5ljyhzsh-76486687314.europe-west2.run.app; object-src 'none'");
+  res.setHeader(
+    "Content-Security-Policy",
+    "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://apis.google.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: https: blob:; connect-src 'self' https: wss:; frame-src 'self' https://ais-dev-6etwlfzn4irzgw5ljyhzsh-76486687314.europe-west2.run.app https://ais-pre-6etwlfzn4irzgw5ljyhzsh-76486687314.europe-west2.run.app; frame-ancestors *; object-src 'none'"
+  );
   res.setHeader("X-Engine-Vendor", "ORTHOGONAL - ENG");
   res.setHeader("X-Engine-Product", "Piping Design & Isometrics");
   next();

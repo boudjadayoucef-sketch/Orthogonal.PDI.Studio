@@ -96,8 +96,8 @@ Every normative decision (wall thickness calculation, pressure-temperature ratin
 
 ```bash
 # Clone repository
-git clone https://github.com/boudjadayoucef-sketch/Orthogonal-PDI-studio-.git
-cd Orthogonal-PDI-studio-
+git clone https://github.com/boudjadayoucef-sketch/Orthogonal.PDI.Studio.git
+cd Orthogonal.PDI.Studio
 
 # Install dependencies
 npm install
