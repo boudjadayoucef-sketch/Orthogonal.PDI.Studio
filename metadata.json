@@ -1,0 +1,8 @@
+{
+  "name": "Remix PDI",
+  "description": "Plateforme CAO / DAO Isométrie et Tuyauterie Industrielle ORTHOGONAL - ENG avec éditeur 2D/3D, calculs de métré, génération BOM et traçage AutoCAD.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

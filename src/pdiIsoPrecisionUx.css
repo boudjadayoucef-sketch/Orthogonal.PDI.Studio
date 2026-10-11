@@ -1,0 +1,299 @@
+/* =========================================================
+   008e — PD&I ISO Precision UX Workspace Fix
+   ========================================================= */
+
+:root {
+  --pdi-bg-deep: #030812;
+  --pdi-bg-panel: #07111f;
+  --pdi-bg-panel-2: #0a1728;
+  --pdi-border: rgba(0, 216, 255, 0.22);
+  --pdi-border-strong: rgba(0, 216, 255, 0.48);
+  --pdi-cyan: #00d9ff;
+  --pdi-cyan-soft: rgba(0, 217, 255, 0.16);
+  --pdi-text: #e8f7ff;
+  --pdi-muted: #7ea8c4;
+  --pdi-green: #00e676;
+  --pdi-orange: #ff9f1a;
+  --pdi-red: #ff4d5e;
+}
+
+body:has(.pdi-iso-workspace),
+body:has(.iso-workspace),
+body:has(.pdi-iso-canvas),
+body:has(canvas) {
+  overscroll-behavior: none;
+}
+
+/* Header ISO : plus haut et respirant pour éviter la superposition */
+.pdi-iso-header,
+.iso-header,
+.pdi-workspace-header,
+.iso-topbar,
+[class*="iso"][class*="header"],
+[class*="workspace"][class*="header"] {
+  min-height: 92px !important;
+  height: auto !important;
+  position: relative !important;
+  z-index: 50 !important;
+  background: linear-gradient(180deg, rgba(3, 8, 18, 0.98), rgba(5, 12, 24, 0.98)) !important;
+  border-bottom: 1px solid var(--pdi-border) !important;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.32) !important;
+  overflow: visible !important;
+}
+
+.pdi-iso-header > *,
+.iso-header > *,
+.pdi-workspace-header > *,
+.iso-topbar > * {
+  position: relative;
+  z-index: 2;
+}
+
+/* Ligne menus descendue : Fichier / Édition / Affichage / etc. */
+.pdi-iso-menu-row,
+.iso-menu-row,
+.pdi-iso-menu,
+.iso-menu,
+.top-menu-bar,
+[class*="menu-row"],
+[class*="top-menu"] {
+  min-height: 36px !important;
+  display: flex !important;
+  align-items: center !important;
+  gap: 18px !important;
+  padding-top: 4px !important;
+  padding-bottom: 7px !important;
+  border-top: 1px solid rgba(0, 217, 255, 0.08) !important;
+}
+
+/* Bouton retour */
+.pdi-iso-back-btn,
+.pdi-runtime-back-home {
+  height: 34px !important;
+  min-width: 88px !important;
+  padding: 0 14px !important;
+  border-radius: 10px !important;
+  border: 1px solid rgba(0, 210, 255, 0.46) !important;
+  background: rgba(0, 180, 255, 0.10) !important;
+  color: #dffaff !important;
+  font-size: 12px !important;
+  font-weight: 800 !important;
+  letter-spacing: 0.02em !important;
+  cursor: pointer !important;
+  white-space: nowrap !important;
+  transition: background 160ms ease, border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease !important;
+}
+
+.pdi-iso-back-btn:hover,
+.pdi-runtime-back-home:hover {
+  background: rgba(0, 210, 255, 0.22) !important;
+  border-color: rgba(0, 230, 255, 0.82) !important;
+  box-shadow: 0 0 16px rgba(0, 210, 255, 0.26) !important;
+  transform: translateY(-1px) !important;
+}
+
+.pdi-iso-logo,
+.iso-logo,
+.pdi-logo,
+[class*="logo"] img,
+img[src*="pdi-logo"] {
+  object-fit: contain !important;
+}
+
+/* Canvas / grille : pas de scroll navigateur, meilleure sensation CAO */
+.pdi-iso-canvas,
+.iso-canvas,
+canvas {
+  touch-action: none !important;
+  user-select: none !important;
+}
+
+.pdi-iso-drawing-area,
+.iso-drawing-area,
+.pdi-iso-grid,
+.iso-grid,
+.pdi-canvas-wrap,
+.iso-canvas-wrap,
+[class*="canvas"],
+[class*="grid"] {
+  overscroll-behavior: none !important;
+}
+
+.pdi-cursor-crosshair,
+.pdi-iso-canvas,
+.iso-canvas {
+  cursor: crosshair !important;
+}
+
+.pdi-pan-mode,
+.pdi-pan-mode canvas,
+.pdi-pan-mode .pdi-iso-canvas {
+  cursor: grab !important;
+}
+
+.pdi-panning,
+.pdi-panning canvas,
+.pdi-panning .pdi-iso-canvas {
+  cursor: grabbing !important;
+}
+
+.pdi-iso-toolbar button,
+.iso-toolbar button,
+[class*="toolbar"] button {
+  transition: border-color 140ms ease, background 140ms ease, box-shadow 140ms ease, transform 140ms ease !important;
+}
+
+.pdi-iso-toolbar button:hover,
+.iso-toolbar button:hover,
+[class*="toolbar"] button:hover {
+  border-color: rgba(0, 217, 255, 0.65) !important;
+  box-shadow: 0 0 12px rgba(0, 217, 255, 0.18) !important;
+}
+
+.pdi-meter-panel,
+.iso-meter-panel,
+.pdi-bottom-meter,
+[class*="meter"],
+[class*="counter"] {
+  min-height: 42px !important;
+}
+
+.pdi-meter-panel strong,
+.iso-meter-panel strong,
+.pdi-bottom-meter strong,
+[class*="meter"] strong,
+[class*="counter"] strong {
+  font-size: 14px !important;
+  line-height: 1.05 !important;
+}
+
+.pdi-runtime-zoom-badge {
+  position: fixed;
+  right: 22px;
+  bottom: 52px;
+  z-index: 9999;
+  padding: 7px 10px;
+  border-radius: 10px;
+  background: rgba(3, 9, 18, 0.88);
+  border: 1px solid rgba(0, 217, 255, 0.35);
+  color: #dffaff;
+  font: 700 12px/1.1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  box-shadow: 0 0 18px rgba(0, 217, 255, 0.16);
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(6px);
+  transition: opacity 140ms ease, transform 140ms ease;
+}
+
+.pdi-runtime-zoom-badge.is-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* PATCH 012 — hide lower metric strip */
+.pdi-bottom-meter,[class*="pdi-bottom-meter"],[data-pdi-studio] [class*="bottom-meter"]{display:none!important}
+
+/* PATCH 017D - Affichage de secours si la feuille de styles principale
+   (Tailwind) n est pas chargee par le serveur. Ces regles sont du CSS pur :
+   elles ne dependent d aucun utilitaire genere. */
+
+#pdi-style-alert {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 2147483000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 6px 12px;
+  background: #7f1d1d;
+  color: #fff;
+  font: 700 12px/1.2 system-ui, -apple-system, sans-serif;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+}
+
+#pdi-style-alert button {
+  background: #f97316;
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 4px 12px;
+  font: 800 11px/1.2 system-ui, sans-serif;
+  cursor: pointer;
+}
+
+html.pdi-no-tailwind,
+html.pdi-no-tailwind body {
+  background: #0b0f14 !important;
+  color: #e6edf3 !important;
+  font-family: system-ui, -apple-system, sans-serif;
+  margin: 0;
+}
+
+html.pdi-no-tailwind [data-pdi-studio] {
+  position: fixed;
+  inset: 0;
+  padding: 30px 10px 58px 10px;
+  overflow: auto;
+  box-sizing: border-box;
+}
+
+html.pdi-no-tailwind [data-pdi-studio] svg {
+  width: 100%;
+  height: 62vh;
+  background: #05080d;
+  border: 1px solid #30363d;
+  border-radius: 10px;
+}
+
+html.pdi-no-tailwind button {
+  background: #161b22;
+  color: #e6edf3;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  padding: 4px 9px;
+  margin: 2px;
+  font: 700 11px/1.2 system-ui, sans-serif;
+  cursor: pointer;
+}
+
+html.pdi-no-tailwind input,
+html.pdi-no-tailwind select,
+html.pdi-no-tailwind textarea {
+  background: #05080d;
+  color: #e6edf3;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 4px 7px;
+  font: 600 12px/1.2 ui-monospace, monospace;
+}
+
+html.pdi-no-tailwind .pdi-cmd-dock-017d {
+  position: fixed !important;
+  left: 168px;
+  right: 12px;
+  bottom: 8px;
+  z-index: 10030;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  background: #020617;
+  border: 1px solid rgba(34, 211, 238, 0.4);
+  border-radius: 12px;
+  box-sizing: border-box;
+}
+
+html.pdi-no-tailwind .pdi-cmd-dock-017d input[type="text"] {
+  flex: 1 1 auto;
+  min-width: 120px;
+}
+
+html.pdi-no-tailwind .pdi-cmd-restore-017d {
+  position: fixed !important;
+  left: 168px;
+  bottom: 8px;
+  z-index: 10030;
+}

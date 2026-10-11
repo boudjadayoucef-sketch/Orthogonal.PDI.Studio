@@ -1,0 +1,66 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "Profil Utilisateur",
+      "description": "Données utilisateur et appartenance au tenant SaaS",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string", "description": "Email de l'utilisateur" },
+        "displayName": { "type": "string", "description": "Nom complet" },
+        "photoURL": { "type": "string", "description": "Avatar URL" },
+        "tenantId": { "type": "string", "description": "ID de l'organisation/tenant" },
+        "role": { "type": "string", "enum": ["admin", "engineer", "viewer"], "description": "Rôle dans le tenant" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["email", "tenantId", "role"]
+    },
+    "Project": {
+      "title": "Projet de Tuyauterie / Isométrie",
+      "description": "Projet Isométrique sous un Tenant SaaS",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "code": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "tenantId": { "type": "string", "description": "ID du Tenant SaaS" },
+        "ownerId": { "type": "string", "description": "UID de l'auteur" },
+        "description": { "type": "string", "maxLength": 512 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "code", "tenantId", "ownerId"]
+    },
+    "Isometric": {
+      "title": "Plan Isométrique",
+      "description": "Document Isométrique de tuyauterie industrielle",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "projectId": { "type": "string" },
+        "tenantId": { "type": "string" },
+        "ownerId": { "type": "string" },
+        "drawingNumber": { "type": "string", "maxLength": 64 },
+        "linePid": { "type": "string", "maxLength": 64 },
+        "fluidCode": { "type": "string", "maxLength": 32 },
+        "status": { "type": "string", "enum": ["draft", "approved", "as_built"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["title", "projectId", "tenantId", "ownerId"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Collection des utilisateurs"
+    },
+    "/projects/{projectId}": {
+      "schema": { "$ref": "#/entities/Project" },
+      "description": "Collection des projets isolés par Tenant SaaS"
+    },
+    "/projects/{projectId}/isometrics/{isoId}": {
+      "schema": { "$ref": "#/entities/Isometric" },
+      "description": "Sous-collection des isométries d'un projet"
+    }
+  }
+}

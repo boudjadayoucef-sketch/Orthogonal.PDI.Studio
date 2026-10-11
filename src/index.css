@@ -1,0 +1,154 @@
+@import "tailwindcss";
+
+/* 
+ * Robust, cross-browser CSS fallbacks for legacy/corporate browsers 
+ * that might not support Tailwind v4 modern CSS Custom Properties.
+ */
+body, html {
+  margin: 0;
+  padding: 0;
+  background-color: #f8fafc; /* Matches bg-slate-50 of the main application layout */
+  color: #1e293b; /* Matches text-slate-800 of the main application layout */
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+}
+
+#splash-screen {
+  background-color: #020617 !important;
+  color: #ffffff !important;
+  display: flex !important;
+  flex-direction: column !important;
+  align-items: center !important;
+  justify-content: center !important;
+  min-height: 100vh !important;
+  position: relative !important;
+  box-sizing: border-box !important;
+  text-align: center !important;
+  padding: 16px !important;
+}
+
+#splash-screen h1 {
+  color: #ffffff !important;
+}
+
+#enter-app-button {
+  background-color: #f97316 !important; /* bg-orange-500 */
+  color: #ffffff !important;
+  border: none !important;
+  border-radius: 16px !important;
+  padding: 16px 32px !important;
+  font-size: 14px !important;
+  font-weight: 900 !important;
+  cursor: pointer !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  gap: 8px !important;
+  transition: all 0.2s ease-in-out !important;
+  text-decoration: none !important;
+  box-shadow: 0 10px 15px -3px rgba(249, 115, 22, 0.3) !important;
+}
+
+#enter-app-button:hover {
+  background-color: #ea580c !important; /* bg-orange-600 */
+}
+
+/* Prevent giant images if Tailwind max-w / object-contain fails */
+img {
+  max-width: 100%;
+  height: auto;
+}
+
+/* Force transparent background on the hero search input in all browsers */
+#hero-search-input {
+  background-color: transparent !important;
+  background: transparent !important;
+  border: none !important;
+  outline: none !important;
+  color: #ffffff !important;
+  box-shadow: none !important;
+}
+
+#hero-search-input::placeholder {
+  color: #cbd5e1 !important; /* slate-300 */
+  opacity: 0.8 !important;
+}
+
+/* Premium inline input fields for interactive PV sheet */
+.pv-inline-input {
+  background-color: rgba(241, 245, 249, 0.4);
+  border-bottom: 1px dashed #cbd5e1;
+  border-top: none;
+  border-left: none;
+  border-right: none;
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-weight: 600;
+  color: #1e293b;
+  transition: all 0.15s ease;
+}
+
+.pv-inline-input:hover {
+  background-color: rgba(241, 245, 249, 0.8);
+  border-bottom-color: #94a3b8;
+}
+
+.pv-inline-input:focus {
+  background-color: #ffffff;
+  border-bottom-color: #2563eb; /* blue-600 */
+  outline: none;
+  box-shadow: 0 2px 4px rgba(37, 99, 235, 0.08);
+}
+
+/* Print optimizations to hide all input controls and styling */
+@media print {
+  .pv-inline-input {
+    border: none !important;
+    background: transparent !important;
+    padding: 0 !important;
+    box-shadow: none !important;
+    outline: none !important;
+    border-bottom: none !important;
+    border-radius: 0 !important;
+  }
+  
+  .pv-inline-input::placeholder {
+    color: transparent !important;
+    opacity: 0 !important;
+  }
+  
+  select.pv-inline-input {
+    appearance: none !important;
+    -webkit-appearance: none !important;
+    -moz-appearance: none !important;
+    text-indent: 0.01px;
+    text-overflow: '';
+  }
+  
+  /* Hide page headers/footers default margin during printing */
+  @page {
+    margin: 1.2cm;
+  }
+}
+
+
+
+
+/* PATCH 006 — PD&I WORKSPACE PRIMARY */
+
+html,
+body,
+#root {
+  width: 100%;
+  min-height: 100%;
+}
+
+.pdi-v48d-primary-workspace {
+  width: 100%;
+  height: 100%;
+  min-height: 100vh;
+  overflow: hidden;
+}
+
+.pdi-v48d-primary-workspace > * {
+  width: 100%;
+  height: 100%;
+}

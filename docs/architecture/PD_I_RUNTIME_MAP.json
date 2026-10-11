@@ -1,0 +1,54 @@
+{
+  "schemaVersion": "1.0",
+  "workspace": {
+    "branch": "main",
+    "gitContainerState": "ai-studio-sandbox",
+    "packageManager": "npm",
+    "framework": "React 19 + Vite 6 + Tailwind 4",
+    "entryPoint": "src/main.tsx",
+    "appComponent": "src/App.tsx",
+    "unifiedRouter": "src/pdi/app/PdiUnifiedApp.tsx"
+  },
+  "isoArchitecture": {
+    "routeWrapper": "src/pdi/isometric/PdiIsometricEditor.tsx",
+    "activeEngine": "src/pdi/isometric/engine/IsometrieModuleV48d.tsx",
+    "renderer": "SVG Vector Canvas (viewBox 0 0 620 400)",
+    "projectionMath": {
+      "activeMethod": "isoProjectV4 / isoUnprojectV4 in IsometrieModuleV48d.tsx",
+      "angle": "30 degrees (Math.PI / 6)",
+      "scale": "28 * viewport.zoom",
+      "origin": "{ x: 310 + panX, y: 210 + panY }"
+    }
+  },
+  "sourceOfTruth": {
+    "nodes": "IsometrieModuleV48d.tsx -> nodes: IsoNode[]",
+    "segments": "IsometrieModuleV48d.tsx -> segments: IsoSegment[]",
+    "fittings": "IsometrieModuleV48d.tsx -> segment.fittings: IsoFitting[] and equipment nodes",
+    "ports": "IsometrieModuleV48d.tsx -> node.ports: IsoPort[]",
+    "topology": "IsometrieModuleV48d.tsx -> commitGraph / recalcSegmentLengths / validateProjectGraph",
+    "welds": "IsometrieModuleV48d.tsx -> deriveProjectJoints -> W00x",
+    "dimensions": "IsometrieModuleV48d.tsx -> dimensions: IsoDimension[]",
+    "bom": "IsometrieModuleV48d.tsx -> materialRows / cumulativeData / totalWeight / totalVolume",
+    "viewport": "IsometrieModuleV48d.tsx -> viewport: { zoom, panX, panY }",
+    "selection": "IsometrieModuleV48d.tsx -> selectedNodeIds, selectedSegmentIds, selectedFitting, selectedDimensionId",
+    "persistence": "IsometrieModuleV48d.tsx -> exportProjectJson / importProjectJson (schemaVersion 4.7.4)"
+  },
+  "classifications": {
+    "active": [
+      "src/App.tsx",
+      "src/pdi/app/PdiUnifiedApp.tsx",
+      "src/pdi/isometric/PdiIsometricEditor.tsx",
+      "src/pdi/isometric/engine/IsometrieModuleV48d.tsx",
+      "src/pdiIsoUxRuntimePatch.js"
+    ],
+    "canonicalDeclarations": [
+      "src/pdi/model/index.ts",
+      "src/pdi/model/serialization.ts"
+    ],
+    "duplicatedOrUnused": [
+      "src/pdi/isometric/isoProjection.ts",
+      "src/pdi/isometric/IsoWorkspace.tsx",
+      "src/pdi/isometric/IsoProfessionalWorkspace.tsx"
+    ]
+  }
+}

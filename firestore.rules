@@ -1,0 +1,187 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // =========================================================================
+    // FONCTIONS D'AUTORISATION STRICTES
+    // =========================================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isSuperAdmin() {
+      return isAuthenticated() && (
+        request.auth.token.role == "super_admin" ||
+        request.auth.token.email == "boudjada.youcef@gmail.com" ||
+        request.auth.token.email == "superadmin@pdi-vision.dz"
+      );
+    }
+
+    function isOwnerByUid(uid) {
+      return isAuthenticated() && request.auth.uid == uid;
+    }
+
+    // =========================================================================
+    // DENY BY DEFAULT SUR TOUT LE RESTE
+    // =========================================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 1. PROFILES : Isolation stricte par UID + Immuabilité des rôles par le client
+    match /profiles/{profileId} {
+      allow read: if isAuthenticated() && (request.auth.uid == profileId || isSuperAdmin());
+      allow create: if isAuthenticated() && (
+        (request.auth.uid == profileId && request.resource.data.role != "super_admin" && request.resource.data.role != "admin") ||
+        isSuperAdmin()
+      );
+      allow update: if isAuthenticated() && (
+        (request.auth.uid == profileId && 
+         !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'isSuperAdmin', 'permissions', 'isActivated'])) ||
+        isSuperAdmin()
+      );
+      allow delete: if isSuperAdmin();
+    }
+
+    // 2. AUTH_CREDENTIALS : Totalement inaccessible au client (Server / Superadmin via SDK uniquement)
+    match /auth_credentials/{credId} {
+      allow read, write: if false;
+    }
+
+    // 3. PROJECTS & SOUS-COLLECTION ISOMETRICS : Isolation par UID + Immuabilité d'owner
+    match /projects/{projectId} {
+      allow read: if isAuthenticated() && (
+        resource.data.ownerId == request.auth.uid ||
+        resource.data.uid == request.auth.uid ||
+        isSuperAdmin()
+      );
+      allow create: if isAuthenticated() && (
+        (request.resource.data.ownerId == request.auth.uid || request.resource.data.uid == request.auth.uid)
+      );
+      allow update: if isAuthenticated() && (
+        (
+          (resource.data.ownerId == request.auth.uid || resource.data.uid == request.auth.uid) &&
+          (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['ownerId', 'uid']) ||
+           request.resource.data.ownerId == resource.data.ownerId)
+        ) ||
+        isSuperAdmin()
+      );
+      allow delete: if isAuthenticated() && (
+        resource.data.ownerId == request.auth.uid ||
+        resource.data.uid == request.auth.uid ||
+        isSuperAdmin()
+      );
+
+      match /isometrics/{isoId} {
+        allow read, write: if isAuthenticated() && (
+          get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid ||
+          get(/databases/$(database)/documents/projects/$(projectId)).data.uid == request.auth.uid ||
+          isSuperAdmin()
+        );
+      }
+    }
+
+    // 4. PAYMENT_TRANSACTIONS : Interdiction de fabriquer des paiements validés
+    match /payment_transactions/{txId} {
+      allow read: if isAuthenticated() && (
+        resource.data.userId == request.auth.uid ||
+        isSuperAdmin()
+      );
+      allow create: if isAuthenticated() && (
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.status == "pending"
+      );
+      allow update, delete: if isSuperAdmin();
+    }
+
+    // 5. LICENSE_KEYS : Aucun listage global client. Lecture/activation unitaire sécurisée
+    match /license_keys/{keyId} {
+      allow get: if isAuthenticated() && (
+        resource.data.usedBy == request.auth.uid ||
+        resource.data.status == "available" ||
+        isSuperAdmin()
+      );
+      allow list: if isSuperAdmin();
+      allow create, delete: if isSuperAdmin();
+      allow update: if isAuthenticated() && (
+        (resource.data.status == "available" &&
+         request.resource.data.status == "active" &&
+         request.resource.data.usedBy == request.auth.uid) ||
+        isSuperAdmin()
+      );
+    }
+
+    // 6. NOTIFICATIONS : Isolation des destinataires et broadcasts
+    match /notifications/{notifId} {
+      allow read: if isAuthenticated() && (
+        resource.data.recipientId == request.auth.uid ||
+        resource.data.recipientEmail == request.auth.token.email ||
+        resource.data.isBroadcast == true ||
+        isSuperAdmin()
+      );
+      allow create, update, delete: if isSuperAdmin();
+    }
+
+    // 7. LOGS & AUDIT (Append-only strict, aucune lecture publique)
+    match /connection_logs/{logId} {
+      allow create: if true;
+      allow read, delete: if isSuperAdmin();
+      allow update: if false;
+    }
+
+    match /subscriber_usage/{usageId} {
+      allow create: if isAuthenticated() && request.resource.data.userId == request.auth.uid;
+      allow read, delete: if isSuperAdmin();
+      allow update: if false;
+    }
+
+    match /commercial_visits/{visitId} {
+      allow create: if true;
+      allow read, delete: if isSuperAdmin();
+      allow update: if false;
+    }
+
+    match /user_feedbacks/{feedId} {
+      allow create: if isAuthenticated();
+      allow read, update, delete: if isSuperAdmin();
+    }
+
+    match /feedbacks/{feedId} {
+      allow create: if isAuthenticated();
+      allow read, update, delete: if isSuperAdmin();
+    }
+
+    match /password_requests/{reqId} {
+      allow create: if true;
+      allow read, update, delete: if isSuperAdmin();
+    }
+
+    // 8. CONFIGURATION & CATALOGUES (Lecture contrôlée, écriture Super-Admin)
+    match /system_config/{configId} {
+      allow read: if true;
+      allow write: if isSuperAdmin();
+    }
+
+    match /plans/{planId} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+
+    match /settings/{settingId} {
+      allow read: if true;
+      allow write: if isSuperAdmin();
+    }
+
+    match /slides/{slideId} {
+      allow read: if true;
+      allow write: if isSuperAdmin();
+    }
+
+    // 9. HEALTHCHECK CONNECTION
+    match /test/{docId} {
+      allow read: if true;
+      allow write: if false;
+    }
+  }
+}
+

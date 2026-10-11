@@ -1,0 +1,22 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+firebase-applet-config.json
+firebase_applet_config.xml
+*.secret.json
+
+# PD&I patch backups / temporary files
+*.bak
+*.bak_*
+*.backup
+*.old
+*.tmp
+.patch_backups/
+_archive/isometrie_backups/
+# PD&I generated backups / temporary patch files
+# PD&I patch backups
