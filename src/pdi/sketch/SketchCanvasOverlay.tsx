@@ -15,7 +15,7 @@ import {
   applyImageFilters
 } from "./sketchRasterEngine";
 import { SketchAxisTriad } from "./SketchAxisTriad";
-import { AxisMappingConfig, DEFAULT_AXIS_MAPPING } from "./openCvSketchDetector";
+import { AxisMappingConfig, DEFAULT_AXIS_MAPPING } from "./sketchAxisConfig";
 import { AxisCursorOverlay } from "../shared/AxisCursorOverlay";
 
 export interface SketchCanvasOverlayProps {

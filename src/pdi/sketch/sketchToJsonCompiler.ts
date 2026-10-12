@@ -12,7 +12,7 @@ import {
   isoAngleToAxis,
   AxisMappingConfig,
   DEFAULT_AXIS_MAPPING
-} from "./openCvSketchDetector";
+} from "./sketchAxisConfig";
 import {
   IsoNode,
   IsoSegment,

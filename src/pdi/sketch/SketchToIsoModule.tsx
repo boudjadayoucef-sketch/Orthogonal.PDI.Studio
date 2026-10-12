@@ -25,10 +25,9 @@ import {
   DEMO_INITIAL_FITTINGS
 } from "./demoSketchTemplate";
 import {
-  detectSketchTopologyOpenCv,
   AxisMappingConfig,
   DEFAULT_AXIS_MAPPING
-} from "./openCvSketchDetector";
+} from "./sketchAxisConfig";
 import { SketchCropTool } from "./SketchCropTool";
 
 export interface SketchToIsoModuleProps {
@@ -157,8 +156,9 @@ export const SketchToIsoModule: React.FC<SketchToIsoModuleProps> = ({
         console.warn("[OCR Client] Serveur non joignable, bascule locale :", netErr);
       }
 
-      // 2. Fallback local avec OpenCV.js si serveur absent
+      // 2. Fallback local avec OpenCV.js si serveur absent (chargé à la demande)
       if (!data) {
+        const { detectSketchTopologyOpenCv } = await import("./openCvSketchDetector");
         data = await detectSketchTopologyOpenCv(targetImg, dims.width, dims.height);
       }
 

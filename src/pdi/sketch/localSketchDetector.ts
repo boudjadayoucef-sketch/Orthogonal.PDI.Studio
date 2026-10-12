@@ -10,7 +10,6 @@ import {
   SketchVectorFitting,
   SketchVectorEquipment
 } from "./sketchRasterEngine";
-import { detectSketchTopologyOpenCv } from "./openCvSketchDetector";
 
 export interface LocalDetectionResult {
   detectedTitle: string;
@@ -39,6 +38,7 @@ export async function detectSketchTopologyLocal(
   canvasHeight = 840
 ): Promise<LocalDetectionResult | null> {
   try {
+    const { detectSketchTopologyOpenCv } = await import("./openCvSketchDetector");
     const openCvResult = await detectSketchTopologyOpenCv(
       imageDataUrl,
       canvasWidth,

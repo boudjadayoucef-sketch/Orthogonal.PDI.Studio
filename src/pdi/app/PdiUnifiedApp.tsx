@@ -61,7 +61,9 @@ class PdiModuleErrorBoundary extends React.Component<
 import PdiBrandMark from "./PdiBrandMark";
 import { Folder, FolderOpen, Plus, X, Layers, FileText, Pin, Trash2, LayoutGrid, Search, CheckSquare, Square, Home, Box, HardDrive, PenTool, FileCode, Code2, Printer, PanelLeftClose, PanelLeftOpen } from "lucide-react";
 import PdiIsometricEditor from "../isometric/PdiIsometricEditor";
-import { SketchToIsoModule } from "../sketch/SketchToIsoModule";
+const SketchToIsoModule = React.lazy(() =>
+  import("../sketch/SketchToIsoModule").then((m) => ({ default: m.SketchToIsoModule }))
+);
 // PATCH 004c : modules applicatifs PD&I
 import HomePdi from "../home/HomePdi";
 import PdiIllustratorHome from "../home/PdiIllustratorHome";
@@ -1521,26 +1523,34 @@ export default function PdiUnifiedApp() {
         {activeModule === "drive" && <GoogleDriveWorkspace onLoadProjectToEditor={(data, name) => { openModuleInTab("isometric", name); }} />}
         {activeModule === "vision" && <ComingSoonPanel title="Vision PD&I"><p><b>Vision PD&I</b> préparera le flux <code>photo réelle → analyse agent → scripts Python → JSON PD&I → validation → ISO</code>. Les images restent en cache local temporaire navigateur.</p></ComingSoonPanel>}
         {activeModule === "sketch" && (
-          <SketchToIsoModule
-            onLoadProjectToEditor={(data, name) => {
-              const targetProjId = `project-${Date.now().toString(36)}`;
-              const resolvedName = name || "Plan Isométrique";
-              openModuleInTab("isometric", resolvedName, targetProjId);
-              // Passerelle d'injection instantanée vers l'éditeur ISO (Étape 5)
-              setTimeout(() => {
-                window.dispatchEvent(
-                  new CustomEvent("pdi:inject-iso-graph", {
-                    detail: {
-                      data,
-                      name: resolvedName,
-                      projectId: targetProjId,
-                      open3d: true,
-                    },
-                  })
-                );
-              }, 60);
-            }}
-          />
+          <React.Suspense
+            fallback={
+              <div className="flex items-center justify-center min-h-[400px] text-cyan-400 font-bold text-xs">
+                Chargement du module Croquis...
+              </div>
+            }
+          >
+            <SketchToIsoModule
+              onLoadProjectToEditor={(data, name) => {
+                const targetProjId = `project-${Date.now().toString(36)}`;
+                const resolvedName = name || "Plan Isométrique";
+                openModuleInTab("isometric", resolvedName, targetProjId);
+                // Passerelle d'injection instantanée vers l'éditeur ISO (Étape 5)
+                setTimeout(() => {
+                  window.dispatchEvent(
+                    new CustomEvent("pdi:inject-iso-graph", {
+                      detail: {
+                        data,
+                        name: resolvedName,
+                        projectId: targetProjId,
+                        open3d: true,
+                      },
+                    })
+                  );
+                }, 60);
+              }}
+            />
+          </React.Suspense>
         )}
         {activeModule === "cad" && <ComingSoonPanel title="Import CAO / DXF / PDF"><p>Import DXF/PDF, lecture des calques et entités, conversion déterministe Python vers JSON PD&I.</p></ComingSoonPanel>}
         {activeModule === "json" && <ComingSoonPanel title="Modèle JSON PD&I"><p>Le JSON devient la source de vérité : lignes, nœuds, équipements, ports, soudures, cotations, niveaux Z, massifs, dalle, exports.</p></ComingSoonPanel>}

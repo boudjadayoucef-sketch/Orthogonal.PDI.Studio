@@ -4,7 +4,7 @@
  * Reference: PATCH SKETCH-DETECT-07 (Partie 2)
  */
 import React, { useState, useRef, useEffect, useCallback } from "react";
-import { AxisMappingConfig, DEFAULT_AXIS_MAPPING } from "./openCvSketchDetector";
+import { AxisMappingConfig, DEFAULT_AXIS_MAPPING } from "./sketchAxisConfig";
 
 export interface SketchAxisTriadProps {
   axisMapping: AxisMappingConfig;
