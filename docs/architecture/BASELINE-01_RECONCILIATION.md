@@ -60,8 +60,8 @@ Cette matrice sépare rigoureusement :
 | **ARCH-12** | Extraction réalisée et vérifiée | `src/pdi/isometric/core/IsoTopologyGraph.ts` (893 lignes), `src/pdi/isometric/types/isoGraphTypes.ts` (426 lignes). | 8 tests Vitest passed (`arch12IsoTopologyExtractionTests.spec.ts`). | Topologie, connectivité des ports, dérivation des soudures W00x et BOM métré extraits du monolithe. |
 | **ARCH-13** | Extraction réalisée et vérifiée | `src/pdi/isometric/core/isoProjectionEngine.ts` (209 lignes). | 4 tests Vitest passed (`arch13IsoProjectionEngineTests.spec.ts`). | Calcul des axes orthonormés 30°, multi-vues (`iso`, `top`, `front`, `side`, `free`), zoom et pan. |
 | **ARCH-14** | Extraction réalisée et vérifiée | `src/pdi/isometric/serialization/dxfSerialization.ts` (85 lignes). | 1 test Vitest passed (`arch14DxfSerializationTests.spec.ts`). | Génération ASCII DXF pure (entités LINE, POINT, TEXT sur calques tuyauterie). |
-| **ARCH-14 FIX-01** | Implémenté / Tests passés | Fonctions de migration et normalisation graph/ports dans `IsometrieModuleV48d.tsx`. | 3 tests Vitest passed (`arch14Fix01ReliabilityTests.spec.ts`), 6 tests passed (`arch14JsonCommandsTests.spec.ts`). | Tests d'aller-retour (round-trip) JSON V4.7.4, robustesse des cotes et structure SVG. |
-| **ARCH-15** | Extraction partielle UI / Test d'existence | `src/pdi/isometric/ui/PdiRotationButton15.tsx` (160 lignes) extrait de `IsometrieModuleV48d.tsx`. | 1 test Vitest passed (`arch15UiModularizationTests.spec.ts`). | **Attention :** Le test vérifie uniquement la définition et le type de la fonction (`toBeDefined`, `typeof === "function"`). **La couverture comportementale (clic court, appui prolongé, affichage du menu ±15°/±45°/±90°, flip) n'est pas testée unitairement.** |
+| **ARCH-15** | Implémenté / Tests comportementaux validés | `src/pdi/isometric/ui/PdiRotationButton15.tsx` (161 lignes) extrait de `IsometrieModuleV48d.tsx`. | 6 tests Vitest passed (`arch15UiModularizationTests.spec.ts`). | Tests comportementaux complets (clic court, appui long 350 ms, pointerleave/pointercancel avec sécurisation anti-rotation intempestive au relâchement, sélection d'angles et flip). |
+| **ARCH-16** | Extraction UI réalisée / Tests validés | `src/pdi/isometric/ui/PdiCanvasToolbarControls16.tsx` (60 lignes) extrait de `IsometrieModuleV48d.tsx`. | 7 tests Vitest passed (`arch16CanvasToolbarControlsTests.spec.ts`). | Composant présentiel pur sans état interne pour les 4 boutons du canevas (Zoom arrière, Zoom avant, Désélection générale, Recentrer). Callbacks et styles préservés. |
 
 ---
 
@@ -89,25 +89,26 @@ Les vérifications automatisées réelles exécutées dans l'environnement lors 
 
 ### 4.1 Suite de tests Vitest (`npm test` / `npx vitest run`)
 - **Commande exécutée :** `npx vitest run`
-- **Fichiers de test (Suites) :** **12 passed (12 au total)**
-- **Nombre total de tests rapportés par Vitest :** **29 passed (29 au total)**
-- **Durée totale d'exécution :** ~14,5 secondes
+- **Fichiers de test (Suites) :** **13 passed (13 au total)**
+- **Nombre total de tests rapportés par Vitest :** **41 passed (41 au total)**
+- **Durée totale d'exécution :** ~16,4 secondes
 
-**Ventilation exacte des 12 fichiers de test exécutés :**
+**Ventilation exacte des 13 fichiers de test exécutés :**
 1. `src/pdi/isometric/tests/arch12IsoTopologyExtractionTests.spec.ts` : **8 tests passed**
 2. `src/pdi/isometric/tests/arch14JsonCommandsTests.spec.ts` : **6 tests passed**
-3. `src/pdi/isometric/tests/arch13IsoProjectionEngineTests.spec.ts` : **4 tests passed**
-4. `src/pdi/isometric/tests/arch14Fix01ReliabilityTests.spec.ts` : **3 tests passed**
-5. `src/pdi/isometric/tests/arch14DxfSerializationTests.spec.ts` : **1 test passed**
-6. `src/pdi/isometric/tests/arch15UiModularizationTests.spec.ts` : **1 test passed**
-7. `src/pdi/normative/tests/arch07IndustrialArchitectureTests.spec.ts` : **1 test passed** *(exécute en interne sa propre suite de conformité)*
-8. `src/pdi/normative/tests/arch08MultiDomainArchitectureTests.spec.ts` : **1 test passed**
-9. `src/pdi/normative/tests/arch09MultiCodeResolverTests.spec.ts` : **1 test passed** *(exécute en interne le résolveur de codes)*
-10. `src/pdi/normative/tests/arch10PipelineEngineeringModelTests.spec.ts` : **1 test passed** *(exécute en interne ≥15 assertions de pipeline)*
-11. `src/pdi/normative/tests/arch11B31_8PipelineReadinessTests.spec.ts` : **1 test passed** *(exécute en interne la suite de préparation B31.8)*
-12. `src/pdi/normative/tests/normativeGlobalIntegrationTests.spec.ts` : **1 test passed**
+3. `src/pdi/isometric/tests/arch15UiModularizationTests.spec.ts` : **6 tests passed** *(tests comportementaux ARCH-15-FIX-02)*
+4. `src/pdi/isometric/tests/arch16CanvasToolbarControlsTests.spec.ts` : **7 tests passed** *(composant canevas ARCH-16)*
+5. `src/pdi/isometric/tests/arch13IsoProjectionEngineTests.spec.ts` : **4 tests passed**
+6. `src/pdi/isometric/tests/arch14Fix01ReliabilityTests.spec.ts` : **3 tests passed**
+7. `src/pdi/isometric/tests/arch14DxfSerializationTests.spec.ts` : **1 test passed**
+8. `src/pdi/normative/tests/arch07IndustrialArchitectureTests.spec.ts` : **1 test passed** *(exécute en interne sa propre suite de conformité)*
+9. `src/pdi/normative/tests/arch08MultiDomainArchitectureTests.spec.ts` : **1 test passed**
+10. `src/pdi/normative/tests/arch09MultiCodeResolverTests.spec.ts` : **1 test passed** *(exécute en interne le résolveur de codes)*
+11. `src/pdi/normative/tests/arch10PipelineEngineeringModelTests.spec.ts` : **1 test passed** *(exécute en interne ≥15 assertions de pipeline)*
+12. `src/pdi/normative/tests/arch11B31_8PipelineReadinessTests.spec.ts` : **1 test passed** *(exécute en interne la suite de préparation B31.8)*
+13. `src/pdi/normative/tests/normativeGlobalIntegrationTests.spec.ts` : **1 test passed**
 
-*Remarque méthodologique importante :* Ne pas confondre un test Vitest unitaire direct (comme dans ARCH-12 avec 8 tests distincts) avec un adaptateur Vitest qui exécute une fonction de suite interne (ex. ARCH-10 qui valide 15 vérifications internes sous un seul wrapper Vitest `it(...)`).
+*Remarque méthodologique importante :* Ne pas confondre un test Vitest unitaire direct (comme dans ARCH-12 avec 8 tests distincts ou ARCH-16 avec 7 tests) avec un adaptateur Vitest qui exécute une fonction de suite interne (ex. ARCH-10 qui valide 15 vérifications internes sous un seul wrapper Vitest `it(...)`).
 
 ### 4.2 Vérification TypeScript Lint (`npm run lint`)
 - **Commande exécutée :** `npm run lint` (`tsc --noEmit`).

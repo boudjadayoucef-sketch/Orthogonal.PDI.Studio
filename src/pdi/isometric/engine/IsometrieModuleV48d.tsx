@@ -99,6 +99,7 @@ import {
 import { IsoSupportRenderer } from "../supports/IsoSupportRenderer";
 import { PdiSupportCivilPanel } from "../supports/PdiSupportCivilPanel";
 import { PdiRotationButton15 } from "../ui/PdiRotationButton15";
+import { PdiCanvasToolbarControls16 } from "../ui/PdiCanvasToolbarControls16";
 import { auth } from "../../../lib/firebase";
 import {
   PDI_LOGO_HORIZONTAL_SRC,
@@ -10053,12 +10054,18 @@ setLastSavedAt(restoredTime);setSaveState("autosaved");setRecoveryCandidate(null
                 </button>
               </div>
 
-              <div className="flex shrink-0 items-center gap-0.5 border border-slate-800 rounded-lg p-0.5 bg-slate-950">
-                <button type="button" onClick={zoomOut} className="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded text-slate-300 hover:text-white" title="Zoom arrière (-)"><ZoomOut className="w-3.5 h-3.5"/></button>
-                <button type="button" onClick={zoomIn} className="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded text-slate-300 hover:text-white" title="Zoom avant (+)"><ZoomIn className="w-3.5 h-3.5"/></button>
-                <button type="button" onClick={()=>{setSelectedNodeIds([]);setSelectedNodeId(null);setSelectedFitting(null);setSelectedSegmentIds([]);setSelectedSegmentId(null);}} className="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded text-[10px] font-bold text-slate-300 hover:text-white" title="Désélectionner tout">×</button>
-                <button type="button" onClick={resetView} className="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded text-cyan-300 hover:text-white" title="Recentrer et ajuster la vue (Touche 0 / Fit)"><RefreshCw className="w-3.5 h-3.5"/></button>
-              </div>
+              <PdiCanvasToolbarControls16
+                onZoomOut={zoomOut}
+                onZoomIn={zoomIn}
+                onClearSelection={() => {
+                  setSelectedNodeIds([]);
+                  setSelectedNodeId(null);
+                  setSelectedFitting(null);
+                  setSelectedSegmentIds([]);
+                  setSelectedSegmentId(null);
+                }}
+                onResetView={resetView}
+              />
             </div>
           </div>
 
