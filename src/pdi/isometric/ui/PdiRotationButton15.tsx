@@ -20,8 +20,10 @@ export function PdiRotationButton15({
   const [defaultAngle, setDefaultAngle] = useState(15);
   const longPressTimerRef = useRef<any>(null);
   const isLongPressRef = useRef(false);
+  const isPointerDownRef = useRef(false);
 
   const handlePointerDown = () => {
+    isPointerDownRef.current = true;
     isLongPressRef.current = false;
     longPressTimerRef.current = setTimeout(() => {
       isLongPressRef.current = true;
@@ -30,6 +32,9 @@ export function PdiRotationButton15({
   };
 
   const handlePointerUp = () => {
+    if (!isPointerDownRef.current) return;
+    isPointerDownRef.current = false;
+
     if (longPressTimerRef.current) {
       clearTimeout(longPressTimerRef.current);
       longPressTimerRef.current = null;
@@ -40,6 +45,7 @@ export function PdiRotationButton15({
   };
 
   const handlePointerCancel = () => {
+    isPointerDownRef.current = false;
     if (longPressTimerRef.current) {
       clearTimeout(longPressTimerRef.current);
       longPressTimerRef.current = null;

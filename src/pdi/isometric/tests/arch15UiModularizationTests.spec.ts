@@ -3,9 +3,10 @@ import React from "react";
 import { PdiRotationButton15, PdiRotationButton15Props } from "../ui/PdiRotationButton15";
 
 /**
- * Harness de test autonome et déterministe pour React 19 dans l'environnement Node de Vitest.
+ * Harness de test autonome et déterministe pour React dans l'environnement Node de Vitest.
  * Simule le cycle de vie React (useState, useRef), le re-rendu automatique lors des mises à jour d'état,
  * et permet l'exploration et le déclenchement réel d'événements de pointeur et de clic.
+ * Supporte React 19 (__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE) et versions antérieures.
  */
 class ReactComponentHarness {
   public states: any[] = [];
@@ -50,14 +51,29 @@ class ReactComponentHarness {
       useMemo: (fn: any) => fn(),
     };
 
-    const internals = (React as any).__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
-    const prevDispatcher = internals.H;
-    internals.H = dispatcher;
+    const internals =
+      (React as any).__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE ||
+      (React as any).__SECRET_INTERNALS_DO_NOT_USE_OR_YOU_WILL_BE_FIRED;
+
+    const prevDispatcher = internals ? (internals.H || internals.ReactCurrentDispatcher?.current) : null;
+    if (internals) {
+      if ("H" in internals) {
+        internals.H = dispatcher;
+      } else if (internals.ReactCurrentDispatcher) {
+        internals.ReactCurrentDispatcher.current = dispatcher;
+      }
+    }
 
     try {
       this.tree = this.Component(this.props);
     } finally {
-      internals.H = prevDispatcher;
+      if (internals) {
+        if ("H" in internals) {
+          internals.H = prevDispatcher;
+        } else if (internals.ReactCurrentDispatcher) {
+          internals.ReactCurrentDispatcher.current = prevDispatcher;
+        }
+      }
     }
   }
 
@@ -107,7 +123,7 @@ class ReactComponentHarness {
   }
 }
 
-describe("ARCH-15-FIX-01: Tests comportementaux complets de PdiRotationButton15", () => {
+describe("ARCH-15-FIX-02: Sécurisation des interactions Pointer et robustesse de PdiRotationButton15", () => {
   let timerCallback: (() => void) | null = null;
   let timerDelay = 0;
   let timerClearedCount = 0;
@@ -136,7 +152,7 @@ describe("ARCH-15-FIX-01: Tests comportementaux complets de PdiRotationButton15"
     global.clearTimeout = originalClearTimeout;
   });
 
-  it("A. Clic court : déclenche onRotate(15) une seule fois et ne doit pas ouvrir le menu", () => {
+  it("A. Clic court normal : déclenche onRotate(15) une seule fois et nettoie le minuteur sans ouvrir le menu", () => {
     const onRotate = vi.fn();
     const onFlip = vi.fn();
     const harness = new ReactComponentHarness(PdiRotationButton15, { onRotate, onFlip });
@@ -154,6 +170,8 @@ describe("ARCH-15-FIX-01: Tests comportementaux complets de PdiRotationButton15"
 
     expect(onRotate).toHaveBeenCalledTimes(1);
     expect(onRotate).toHaveBeenCalledWith(15);
+    expect(timerClearedCount).toBeGreaterThan(0);
+    expect(timerCallback).toBeNull();
     expect(harness.isMenuOpen()).toBe(false);
   });
 
@@ -180,7 +198,66 @@ describe("ARCH-15-FIX-01: Tests comportementaux complets de PdiRotationButton15"
     expect(harness.isMenuOpen()).toBe(true);
   });
 
-  it("C. Choix des angles dans le menu : transmet les angles exacts et ferme le menu après chaque choix", () => {
+  it("C. Annulation par sortie du pointeur (pointerleave) : aucun déclenchement au pointerup ultérieur et réarmement indépendant", () => {
+    const onRotate = vi.fn();
+    const harness = new ReactComponentHarness(PdiRotationButton15, { onRotate });
+
+    const mainBtn = harness.findButtonByTitle("Clic court");
+
+    // 1. Déclencher pointerdown, puis pointerleave avant 350 ms
+    mainBtn.props.onPointerDown();
+    expect(timerCallback).not.toBeNull();
+
+    mainBtn.props.onPointerLeave();
+    expect(timerClearedCount).toBeGreaterThan(0);
+    expect(timerCallback).toBeNull();
+    expect(harness.isMenuOpen()).toBe(false);
+
+    // 2. Déclencher ensuite pointerup : aucune rotation ne doit être exécutée
+    mainBtn.props.onPointerUp();
+    expect(onRotate).not.toHaveBeenCalled();
+    expect(harness.isMenuOpen()).toBe(false);
+
+    // 3. Vérifier qu'un nouvel appui indépendant fonctionne normalement
+    mainBtn.props.onPointerDown();
+    expect(timerCallback).not.toBeNull();
+    mainBtn.props.onPointerUp();
+
+    expect(onRotate).toHaveBeenCalledTimes(1);
+    expect(onRotate).toHaveBeenCalledWith(15);
+    expect(harness.isMenuOpen()).toBe(false);
+  });
+
+  it("D. Annulation par le système (pointercancel) : aucune rotation au pointerup ultérieur et réarmement correct", () => {
+    const onRotate = vi.fn();
+    const harness = new ReactComponentHarness(PdiRotationButton15, { onRotate });
+
+    const mainBtn = harness.findButtonByTitle("Clic court");
+
+    // 1. Déclencher pointerdown, puis pointercancel
+    mainBtn.props.onPointerDown();
+    expect(timerCallback).not.toBeNull();
+
+    mainBtn.props.onPointerCancel();
+    expect(timerClearedCount).toBeGreaterThan(0);
+    expect(timerCallback).toBeNull();
+    expect(harness.isMenuOpen()).toBe(false);
+
+    // 2. Simuler ensuite un éventuel pointerup : aucune rotation
+    mainBtn.props.onPointerUp();
+    expect(onRotate).not.toHaveBeenCalled();
+    expect(harness.isMenuOpen()).toBe(false);
+
+    // 3. Vérifier la réinitialisation complète lors d'un nouvel appui indépendant
+    mainBtn.props.onPointerDown();
+    expect(timerCallback).not.toBeNull();
+    mainBtn.props.onPointerUp();
+
+    expect(onRotate).toHaveBeenCalledTimes(1);
+    expect(onRotate).toHaveBeenCalledWith(15);
+  });
+
+  it("E. Choix des angles dans le menu, fermeture et miroir conditionnel", () => {
     const testCases: Array<{ label: string; expectedAngle: number }> = [
       { label: "+15° Horaire", expectedAngle: 15 },
       { label: "−15° Anti-horaire", expectedAngle: -15 },
@@ -190,6 +267,7 @@ describe("ARCH-15-FIX-01: Tests comportementaux complets de PdiRotationButton15"
       { label: "−90°", expectedAngle: -90 },
     ];
 
+    // Vérification de chaque angle individuellement
     for (const tc of testCases) {
       const onRotate = vi.fn();
       const harness = new ReactComponentHarness(PdiRotationButton15, { onRotate });
@@ -208,16 +286,12 @@ describe("ARCH-15-FIX-01: Tests comportementaux complets de PdiRotationButton15"
       expect(onRotate).toHaveBeenCalledWith(tc.expectedAngle);
       expect(harness.isMenuOpen()).toBe(false);
     }
-  });
 
-  it("D. Miroir : appelle onFlip une seule fois et ferme le menu ; masqué si onFlip n'est pas fourni", () => {
-    // 1. Avec onFlip fourni
-    const onRotate = vi.fn();
+    // Miroir avec onFlip fourni
     const onFlip = vi.fn();
-    const harnessWithFlip = new ReactComponentHarness(PdiRotationButton15, { onRotate, onFlip });
-
-    const chevronBtn = harnessWithFlip.findButtonByTitle("Menu de choix");
-    chevronBtn.props.onClick();
+    const harnessWithFlip = new ReactComponentHarness(PdiRotationButton15, { onRotate: vi.fn(), onFlip });
+    const chevronWithFlip = harnessWithFlip.findButtonByTitle("Menu de choix");
+    chevronWithFlip.props.onClick();
     expect(harnessWithFlip.isMenuOpen()).toBe(true);
 
     const flipBtn = harnessWithFlip.findButtonByText("Inverser / Miroir");
@@ -227,40 +301,14 @@ describe("ARCH-15-FIX-01: Tests comportementaux complets de PdiRotationButton15"
     expect(onFlip).toHaveBeenCalledTimes(1);
     expect(harnessWithFlip.isMenuOpen()).toBe(false);
 
-    // 2. Sans onFlip fourni
-    const harnessWithoutFlip = new ReactComponentHarness(PdiRotationButton15, { onRotate });
-    const chevronBtn2 = harnessWithoutFlip.findButtonByTitle("Menu de choix");
-    chevronBtn2.props.onClick();
+    // Miroir absent si onFlip non fourni
+    const harnessWithoutFlip = new ReactComponentHarness(PdiRotationButton15, { onRotate: vi.fn() });
+    const chevronWithoutFlip = harnessWithoutFlip.findButtonByTitle("Menu de choix");
+    chevronWithoutFlip.props.onClick();
     expect(harnessWithoutFlip.isMenuOpen()).toBe(true);
 
     const flipBtnAbsent = harnessWithoutFlip.findButtonByText("Inverser / Miroir");
     expect(flipBtnAbsent).toBeNull();
-  });
-
-  it("E. Annulation et nettoyage : pointerLeave ou pointerCancel annule le minuteur et n'ouvre pas le menu", () => {
-    const onRotate = vi.fn();
-    const harness = new ReactComponentHarness(PdiRotationButton15, { onRotate });
-
-    const mainBtn = harness.findButtonByTitle("Clic court");
-
-    // Test PointerLeave
-    mainBtn.props.onPointerDown();
-    expect(timerCallback).not.toBeNull();
-
-    mainBtn.props.onPointerLeave();
-    expect(timerClearedCount).toBeGreaterThan(0);
-    expect(timerCallback).toBeNull();
-    expect(harness.isMenuOpen()).toBe(false);
-    expect(onRotate).not.toHaveBeenCalled();
-
-    // Test PointerCancel
-    mainBtn.props.onPointerDown();
-    expect(timerCallback).not.toBeNull();
-
-    mainBtn.props.onPointerCancel();
-    expect(timerCallback).toBeNull();
-    expect(harness.isMenuOpen()).toBe(false);
-    expect(onRotate).not.toHaveBeenCalled();
   });
 
   it("F. Mémorisation de l'angle par défaut : sélectionner −15° ajuste le clic court, +15° le rétablit", () => {
@@ -287,7 +335,8 @@ describe("ARCH-15-FIX-01: Tests comportementaux complets de PdiRotationButton15"
     expect(onRotate).toHaveBeenLastCalledWith(-15);
 
     // Rétablissement à +15° via le menu
-    chevron.props.onClick();
+    const chevronReopen = harness.findButtonByTitle("Menu de choix");
+    chevronReopen.props.onClick();
     const plus15 = harness.findButtonByText("+15° Horaire");
     plus15.props.onClick();
 
