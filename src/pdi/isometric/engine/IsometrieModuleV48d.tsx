@@ -100,6 +100,10 @@ import { IsoSupportRenderer } from "../supports/IsoSupportRenderer";
 import { PdiSupportCivilPanel } from "../supports/PdiSupportCivilPanel";
 import { PdiRotationButton15 } from "../ui/PdiRotationButton15";
 import { PdiCanvasToolbarControls16 } from "../ui/PdiCanvasToolbarControls16";
+import {
+  CanvasVisibilityControls18,
+  CanvasVisibilityLayerKey,
+} from "../ui/CanvasVisibilityControls18";
 import { auth } from "../../../lib/firebase";
 import {
   PDI_LOGO_HORIZONTAL_SRC,
@@ -10021,14 +10025,45 @@ setLastSavedAt(restoredTime);setSaveState("autosaved");setRecoveryCandidate(null
               </select>
 
               <div className="flex shrink-0 items-center gap-0.5 border border-slate-800 rounded-lg p-0.5 bg-slate-950">
-                <button type="button" onClick={()=>setShowGrid(v=>!v)} className={`px-2 py-1 rounded text-[10px] font-bold transition-all ${showGrid ? "bg-blue-600 text-white" : "bg-slate-800 text-slate-400"}`} title="Afficher la grille (#)">#</button>
-                <button type="button" onClick={()=>setGcVisibleEditor(v=>!v)} className={`px-2 py-1 rounded text-[10px] font-bold transition-all ${gcVisibleEditor?"bg-cyan-600 text-white":"bg-slate-800 text-slate-400"}`} title="Afficher le génie civil (GC)">GC</button>
-                <button type="button" onClick={()=>setShowDimensions(v=>!v)} className={`px-2 py-1 rounded text-[10px] font-bold transition-all ${showDimensions ? "bg-blue-600 text-white" : "bg-slate-800 text-slate-400"}`} title="Afficher les cotes (⇔)">⇔</button>
-                <button type="button" onClick={()=>setShowPipeLabels(v=>!v)} className={`px-2 py-1 rounded text-[10px] font-bold transition-all ${showPipeLabels?"bg-cyan-600 text-white":"bg-slate-800 text-slate-400"}`} title="Labels des tuyauteries (PL)">PL</button>
-                <button type="button" onClick={()=>setShowWelds(v=>!v)} className={`px-2 py-1 rounded text-[10px] font-bold transition-all ${showWelds?"bg-amber-600 text-white":"bg-slate-800 text-slate-400"}`} title="Afficher les soudures Wxxx (W)">W</button>
-                <button type="button" onClick={()=>setColorBySpool(v=>!v)} className={`px-2 py-1 rounded text-[10px] font-bold transition-all ${colorBySpool?"bg-purple-600 text-white":"bg-slate-800 text-slate-400"}`} title="Coloration par Spool (SP)">SP</button>
+                <CanvasVisibilityControls18
+                  visibility={{
+                    grid: showGrid,
+                    civilBackground: gcVisibleEditor,
+                    dimensions: showDimensions,
+                    pipeLabels: showPipeLabels,
+                    welds: showWelds,
+                    spoolColoring: colorBySpool,
+                    annotations: showLabels,
+                  }}
+                  actions={{
+                    onToggleLayer: (layer: CanvasVisibilityLayerKey) => {
+                      switch (layer) {
+                        case "grid":
+                          setShowGrid(v => !v);
+                          break;
+                        case "civilBackground":
+                          setGcVisibleEditor(v => !v);
+                          break;
+                        case "dimensions":
+                          setShowDimensions(v => !v);
+                          break;
+                        case "pipeLabels":
+                          setShowPipeLabels(v => !v);
+                          break;
+                        case "welds":
+                          setShowWelds(v => !v);
+                          break;
+                        case "spoolColoring":
+                          setColorBySpool(v => !v);
+                          break;
+                        case "annotations":
+                          setShowLabels(v => !v);
+                          break;
+                      }
+                    },
+                  }}
+                />
                 <button type="button" onClick={()=>setWeldSpoolModalOpen(true)} className="px-2 py-1 rounded text-[10px] font-bold bg-slate-800 hover:bg-slate-700 text-amber-400 hover:text-amber-300" title="Carnet de Spools & Soudures (Weld Map)"><Flame className="w-3 h-3 inline"/></button>
-                <button type="button" onClick={()=>setShowLabels(v=>!v)} className={`px-2 py-1 rounded text-[10px] font-bold transition-all ${showLabels ? "bg-indigo-600 text-white" : "bg-slate-800 text-slate-400"}`} title="Afficher les annotations (Aa)">Aa</button>
                 <button
                   type="button"
                   onClick={() => {
