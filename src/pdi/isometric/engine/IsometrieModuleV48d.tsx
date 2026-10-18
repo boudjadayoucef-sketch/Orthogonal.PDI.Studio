@@ -16,24 +16,19 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { onAuthStateChanged } from "firebase/auth";
 // PATCH 017J : identite de cartouche parametrable (R15).
-import { pdiCompanyName, pdiStandardsNote } from "../../branding/pdiBranding";
+import { pdiCompanyName } from "../../branding/pdiBranding";
 // PATCH 017P : precision geometrique (accroche a priorites, axes ISO, QA).
 import {
   PDI_SNAP_TOL_PX,
   pdiRound3,
   pdiSnapValue,
-  pdiSnapDirectionIso,
-  pdiFindCoincidentNodes,
   pdiAuditGraph,
 } from "./pdiPrecision017P";
 import { pdiReorientPorts, pdiTolViewBox } from "./pdiPorts017P2";
-import { pdiIsoAxisDirs017P3, pdiNodeRadius017P3, pdiNodeHasFaceOffset017P3, PDI_METRE_CONVENTION_017P3 } from "./pdiAxes017P3";
-import { performUniversalAlign, performUniversalParallel, performObjectAlign, performObjectParallel, extractEntityAnchors, type PdiAnchorPoint } from "./pdiAlignParallel017Q";
+import { pdiNodeRadius017P3, PDI_METRE_CONVENTION_017P3 } from "./pdiAxes017P3";
+import { performUniversalAlign, performUniversalParallel, performObjectAlign, performObjectParallel, type PdiAnchorPoint } from "./pdiAlignParallel017Q";
 import { PDI_PATCH_VERSION } from "../../pdiVersion";
 import {
-  PDI_ISO_ANGLE_017I2,
-  PDI_ISO_COS_017I2,
-  PDI_ISO_SIN_017I2,
   getProjectionAxes as getProjectionAxesEngine,
   isoProjectV4 as isoProjectV4Engine,
   isoUnprojectV4 as isoUnprojectV4Engine,
@@ -41,7 +36,6 @@ import {
 import {
   compactIsoLabel,
   buildIsoAnnotationLayout,
-  type IsoAnnotationPlacement,
 } from "../core/isoAnnotationEngine";
 import { generateDxfFile } from "../serialization/dxfSerialization";
 import { pdiGlyphScale017P5 } from "./pdiGlyphes017P5";
@@ -50,8 +44,8 @@ import { pdiUnifyAnomalies017P9, pdiAnomalieKind017P9, pdiAnomalieLibelle017P9 }
 // PATCH 017P10 : regles de validation de saisie (un seul endroit).
 import { pdiValiderLongueur017P10, pdiValiderDn017P10, pdiEcartAccrochage017P10 } from "./pdiSaisie017P10";
 // PATCH 017M : registre unique des commandes, source du ruban.
-import { PDI_ONGLETS_RUBAN_017M, PDI_INVITE_COMMANDE_017M, pdiGroupesOnglet017M, pdiEntreesGroupe017M } from "./pdiRegistreCommandes.v1";
-import { PDI_CLASSES_B165_017K3, PDI_DESIGNATIONS_PN_017K3, PDI_CLASSE_PAR_DEFAUT_017K3, pdiClasseDeSpec017K3, pdiMateriauDeSpec017K3, pdiClasseConforme017K3, pdiMessageDerogation017K3 } from "./pdiClassePression017K3";
+import { PDI_ONGLETS_RUBAN_017M, PDI_INVITE_COMMANDE_017M } from "./pdiRegistreCommandes.v1";
+import { PDI_CLASSE_PAR_DEFAUT_017K3, pdiClasseDeSpec017K3, pdiMateriauDeSpec017K3, pdiClasseConforme017K3, pdiMessageDerogation017K3 } from "./pdiClassePression017K3";
 import { defaultIsometricNormativeBridge } from "../../normative/integration/isometricNormativeBridge";
 import type { PdiEntreeRuban017M } from "./pdiRegistreCommandes.v1";
 import { isoState } from "../core/isoProjectionState";
@@ -66,24 +60,16 @@ import {
   deriveSpoolsAndWelds,
   WeldSpoolResult,
   PdiWeldEntry,
-  PdiSpoolEntry,
 } from "../../welding/isoWeldSpoolEngine";
-import {
-  TROUVAY_CAUVIN_CATALOG,
-  getComponentVignetteSvg,
-} from "../../catalog/trouvayCauvinCatalog";
 import {
   UnitSystem,
   formatLength,
   formatPressure,
   formatMass,
-  formatTemperature,
   parsePdiValue,
 } from "../../units/pdiUnitSystem";
 import {
   LineSegment2D,
-  intersectSegments2D,
-  intersectRayWithSegment,
   cad2dTrimLine,
   cad2dExtendLine,
   cad2dOffsetLine,
@@ -98,8 +84,6 @@ import {
   MssSupportCode,
   MSS_SUPPORT_CATALOG,
   projectSupportOnSegment,
-  computeCivilMto,
-  verifyPipingSpans,
 } from "../supports/pdiMssSupportEngine";
 import { IsoSupportRenderer } from "../supports/IsoSupportRenderer";
 import { PdiSupportCivilPanel } from "../supports/PdiSupportCivilPanel";
@@ -110,24 +94,18 @@ import {
   CanvasVisibilityLayerKey,
 } from "../ui/CanvasVisibilityControls18";
 import { auth } from "../../../lib/firebase";
-import {
-  PDI_LOGO_HORIZONTAL_SRC,
-  PDI_LOGO_SQUARE_SRC,
-  PDI_LOGO_HORIZONTAL_DATA_URL,
-  PDI_LOGO_SQUARE_DATA_URL,
-} from "../../../assets/pdiLogos";
 import PdiBrandMark from "../../app/PdiBrandMark";
 // V4.8d_DIMENSIONS_ALIGNMENT : logos PD & I réels haute définition.
 
 import {
   Compass, Plus, Trash2, Printer, FileText, Layers, Ruler,
-  RefreshCw, Maximize2, ZoomIn, ZoomOut, Move, Pencil, Save,
+  RefreshCw, Maximize2, Move, Pencil, Save,
   X, GitBranch, Settings2, CircleDot, Flame, Waypoints, Info, Hand, MousePointer2, Undo2, Redo2,
-  ChevronLeft, ChevronRight, SlidersHorizontal, Disc, CornerDownRight, GitFork, ArrowRightLeft,
-  Eye, EyeOff, Crosshair, Check, Copy, Scissors, RotateCw, RotateCcw, PanelRightClose, PanelRightOpen,
+  ChevronLeft, ChevronRight, SlidersHorizontal, CornerDownRight, GitFork,
+  Eye, Copy, RotateCw,
   Circle, Spline, FolderOpen, Download, LayoutGrid, Magnet, Type, Square, Hexagon, Slash, Disc3,
-  Minimize2, Triangle, Clipboard, CopyPlus, Terminal, CornerDownLeft, ChevronDown, Anchor, Sparkles, Box,
-  SplitSquareVertical, Tv2, Monitor, FileSpreadsheet, HelpCircle
+  Minimize2, Triangle, ChevronDown, Anchor, Sparkles, Box,
+  SplitSquareVertical, FileSpreadsheet, HelpCircle
 } from "lucide-react";
 import { generateComplexIndustrialIsoDemo } from "../demo/pdiComplexIsoDemo";
 import { generateChambreTechniqueDemo, generateSkidFiltrationDemo } from "../demo/pdiNewDemos";
@@ -146,7 +124,6 @@ import {
   ArcCreationMode,
   CadCommandItem,
   AUTOCAD_COMMANDS,
-  searchCadCommands,
   PDI_PLANT3D_COMMAND_TABLE,
   buildEquilateralTriangle,
   buildRightTriangle,
@@ -157,10 +134,8 @@ import {
   cadDist,
   cadAngleDeg,
 } from "./CadAutocadEngine";
-import { CadCommandLineBar } from "../components/CadCommandLineBar";
 import { IsoRibbonBar } from "../ui/IsoRibbonBar";
 import { IsoCommandDock } from "../ui/IsoCommandDock";
-import { CadShapeToolbar } from "../components/CadShapeToolbar";
 import {
   PDI_DEFAULT_PROJECT_SETUP,
   pdiActiveFormat,
@@ -217,8 +192,6 @@ import {
   pdiUid as uid,
   pdiClamp as clamp,
   pdiDia as dia,
-  EQUIPMENT_NODE_TYPES,
-  isEquipmentNode,
   equipmentLabel,
   elbowAngle,
   defaultFreeNodePorts,
@@ -234,8 +207,6 @@ import {
   segmentEndpoints,
   rotateWorldPoint,
   downstreamNodeIds,
-  inferJointType,
-  isWeldableConnection,
   deriveProjectJoints,
   validateProjectGraph,
   normalizedGraphPorts,
