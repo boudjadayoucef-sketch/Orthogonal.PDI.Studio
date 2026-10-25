@@ -64,7 +64,8 @@ Cette matrice sépare rigoureusement :
 | **ARCH-16** | Extraction UI réalisée / Tests validés | `src/pdi/isometric/ui/PdiCanvasToolbarControls16.tsx` (60 lignes) extrait de `IsometrieModuleV48d.tsx`. | 7 tests Vitest passed (`arch16CanvasToolbarControlsTests.spec.ts`). | Composant présentiel pur sans état interne pour les 4 boutons du canevas (Zoom arrière, Zoom avant, Désélection générale, Recentrer). Callbacks et styles préservés. |
 | **ARCH-18** | Extraction UI visibilité réalisée / Tests validés | `src/pdi/isometric/ui/CanvasVisibilityControls18.tsx` (137 lignes) extrait de `IsometrieModuleV48d.tsx`. | 6 tests Vitest passed (`arch18CanvasVisibilityControlsTests.spec.ts`). | Composant présentiel contrôlé pour les 7 bascules de visibilité du canevas (#, GC, ⇔, PL, W, SP, Aa). Setters explicites, exclusions strictes de Weld Map, MSS et GUIDE. |
 | **ARCH-19** | Extraction moteur annotations réalisée / Tests validés | `src/pdi/isometric/core/isoAnnotationEngine.ts` (190 lignes) extrait de `IsometrieModuleV48d.tsx`. | 13 tests Vitest passed (`arch19IsoAnnotationEngineTests.spec.ts`). | Moteur algorithmique déterministe d'évitement de collisions et de placement d'étiquettes (nœuds, soudures, tronçons, réservation équipements). Pureté algorithmique, zéro import circulaire. |
-| **ARCH-20** | Stabilisation architecturale & Clôture Phase 1 validées | Nettoyage de 46 imports inutilisés en tête de `IsometrieModuleV48d.tsx` (confirmés par `tsc`). Conservation intégrale des exports fournisseurs. Barrière anti-cycle structurelle. | 10 tests Vitest passed (`arch20ArchitectureStabilizationTests.spec.ts`). | Clôture de la Phase 1 (ARCH). Dépendance ascendante `IsoTopologyGraph.ts` -> `pdiAxes017P3.ts` documentée et acyclique. Convention de nommage sans numéros de tickets pour les nouveaux fichiers. |
+| **ARCH-20** | Stabilisation architecturale initiale | Nettoyage de 46 imports inutilisés en tête de `IsometrieModuleV48d.tsx` (confirmés par `tsc`). Conservation intégrale des exports fournisseurs. Barrière anti-cycle structurelle initiale. | 10 tests Vitest passed (`arch20ArchitectureStabilizationTests.spec.ts`). | Audit initial : parcours anti-cycle limité au premier niveau des répertoires `core/` et `ui/`. |
+| **ARCH-20-FIX-01** | Correctif parcours récursif anti-cycle (25 oct 2026) | Implémentation de `collectTsFilesRecursively` dans `arch20ArchitectureStabilizationTests.spec.ts`. Scan récursif toutes profondeurs de `core/` et `ui/`, exclusion des tests, interdiction des symlinks. Aucun fichier de production modifié. | 11 tests Vitest passed (suite ARCH-20), 71 tests passed au global (100% green). | Commit de base `e604d7fc2cd32bd31046068660a77df5dedf3a8d`. ARCH-20 en attente d'audit externe. Phase 1 non clôturée automatiquement. |
 
 ---
 
@@ -93,12 +94,12 @@ Les vérifications automatisées réelles exécutées dans l'environnement lors 
 ### 4.1 Suite de tests Vitest (`npm test` / `npx vitest run`)
 - **Commande exécutée :** `npx vitest run`
 - **Fichiers de test (Suites) :** **16 passed (16 au total)**
-- **Nombre total de tests rapportés par Vitest :** **70 passed (70 au total)**
-- **Durée totale d'exécution :** ~14,3 secondes
+- **Nombre total de tests rapportés par Vitest :** **71 passed (71 au total)**
+- **Durée totale d'exécution :** ~15,3 secondes
 
 **Ventilation exacte des 16 fichiers de test exécutés :**
 1. `src/pdi/isometric/tests/arch19IsoAnnotationEngineTests.spec.ts` : **13 tests passed** *(moteur annotations ARCH-19)*
-2. `src/pdi/isometric/tests/arch20ArchitectureStabilizationTests.spec.ts` : **10 tests passed** *(stabilisation Phase 1, barrière anti-cycle et exports fournisseurs ARCH-20)*
+2. `src/pdi/isometric/tests/arch20ArchitectureStabilizationTests.spec.ts` : **11 tests passed** *(stabilisation Phase 1, barrière anti-cycle récursive toutes profondeurs ARCH-20-FIX-01)*
 3. `src/pdi/isometric/tests/arch12IsoTopologyExtractionTests.spec.ts` : **8 tests passed**
 4. `src/pdi/isometric/tests/arch16CanvasToolbarControlsTests.spec.ts` : **7 tests passed**
 5. `src/pdi/isometric/tests/arch14JsonCommandsTests.spec.ts` : **6 tests passed**
@@ -114,7 +115,7 @@ Les vérifications automatisées réelles exécutées dans l'environnement lors 
 15. `src/pdi/normative/tests/arch11B31_8PipelineReadinessTests.spec.ts` : **1 test passed** *(exécute en interne la suite de préparation B31.8)*
 16. `src/pdi/normative/tests/normativeGlobalIntegrationTests.spec.ts` : **1 test passed**
 
-*Remarque méthodologique importante :* Ne pas confondre un test Vitest unitaire direct (comme dans ARCH-19 avec 13 tests, ARCH-20 avec 10 tests, ARCH-12 avec 8 tests, ARCH-16 avec 7 tests, etc.) avec un adaptateur Vitest qui exécute une fonction de suite interne (ex. ARCH-10 qui valide 15 vérifications internes sous un seul wrapper Vitest `it(...)`).
+*Remarque méthodologique importante :* Ne pas confondre un test Vitest unitaire direct (comme dans ARCH-19 avec 13 tests, ARCH-20 avec 11 tests, ARCH-12 avec 8 tests, ARCH-16 avec 7 tests, etc.) avec un adaptateur Vitest qui exécute une fonction de suite interne (ex. ARCH-10 qui valide 15 vérifications internes sous un seul wrapper Vitest `it(...)`).
 
 ### 4.2 Vérification TypeScript Lint (`npm run lint`)
 - **Commande exécutée :** `npm run lint` (`tsc --noEmit`).
@@ -171,9 +172,9 @@ Afin d'éviter toute confusion entre intention et réalité technique, les 15 ax
 - **[DÉCLARÉ EN CODE]** : Composants ou structures de données présents dans le code source / l'inventaire, mais dont le fonctionnement complet n'est pas couvert par un test automatisé direct.
 - **[ROADMAP / À AUDITER]** : Fonctionnalités planifiées, déclarations d'intention ou études préalables nécessitant un audit dédié.
 
-1. **Architecture modulaire & Réduction des monolithes :** **[DÉMONTRÉ / PHASE 1 CLÔTURÉE]**
-   - Extractions ARCH-12 (topologie), ARCH-13 (projection), ARCH-14 (DXF), ARCH-15 (UI rotation), ARCH-16 (toolbar), ARCH-18 (visibilité), ARCH-19 (annotations) et ARCH-20 (stabilisation, imports propres et barrière anti-cycle) effectives et vérifiées par tests.
-   - Monolithe `IsometrieModuleV48d.tsx` assaini en en-tête d'imports ; barrière anti-cycle automatisée protégeant `core/` et `ui/`.
+1. **Architecture modulaire & Réduction des monolithes :** **[DÉMONTRÉ / ARCH-20 EN ATTENTE D'AUDIT]**
+   - Extractions ARCH-12 (topologie), ARCH-13 (projection), ARCH-14 (DXF), ARCH-15 (UI rotation), ARCH-16 (toolbar), ARCH-18 (visibilité), ARCH-19 (annotations) et ARCH-20/ARCH-20-FIX-01 (stabilisation, imports propres et barrière anti-cycle récursive) effectives et vérifiées par tests.
+   - Monolithe `IsometrieModuleV48d.tsx` assaini en en-tête d'imports ; barrière anti-cycle récursive automatisée protégeant `core/` et `ui/` à toutes les profondeurs.
 2. **Sketch-to-Iso :** **[DÉMONTRÉ]**
    - Module `SketchToIsoModule.tsx` actif, configuration d'axes découplée (`sketchAxisConfig.ts`), chargement différé d'OpenCV vérifié au build.
 3. **Dessin 2D et 3D :** **[DÉMONTRÉ / DÉCLARÉ EN CODE]**
@@ -192,7 +193,7 @@ Afin d'éviter toute confusion entre intention et réalité technique, les 15 ax
 8. **BOM/MTO et livrables industriels :** **[DÉMONTRÉ PARTIELLEMENT]**
    - Génération des tables matérielles (`materialRows`) et métrés cumulés couverte dans `IsoTopologyGraph.ts` et testée dans ARCH-12.
 9. **Tests, CI et industrialisation :** **[DÉMONTRÉ]**
-   - **70 tests Vitest passés avec succès** sur 16 suites de tests (100% green) ; workflow CI GitHub Actions documenté dans `.github/workflows/ci.yml`.
+   - **71 tests Vitest passés avec succès** sur 16 suites de tests (100% green) ; workflow CI GitHub Actions documenté dans `.github/workflows/ci.yml`.
 10. **Sécurité, isolation des projets et gestion des secrets :** **[DÉCLARÉ EN CODE]**
     - Architecture Firebase / PostgreSQL Cloud SQL présente côté serveur ; clés d'API protégées hors UI.
 11. **Préparation du SaaS et commercialisation :** **[DÉCLARÉ EN CODE]**
@@ -212,11 +213,12 @@ Afin d'éviter toute confusion entre intention et réalité technique, les 15 ax
 
 ### 8.1 Risques résiduels
 - **Couverture de tests UI sur ARCH-15 :** Sécurisée et comportementalement testée sous ARCH-15-FIX-01 et ARCH-15-FIX-02 (appui long, pointerleave/pointercancel).
-- **Volume et intégrité de `IsometrieModuleV48d.tsx` :** imports assainis par diagnostic officiel `tsc` (46 symboles inutilisés retirés), zéro régression dans le corps du module, barrière anti-cycle structurelle active sous ARCH-20.
+- **Volume et intégrité de `IsometrieModuleV48d.tsx` :** imports assainis par diagnostic officiel `tsc` (46 symboles inutilisés retirés), zéro régression dans le corps du module, barrière anti-cycle récursive active sous ARCH-20-FIX-01.
 
 ### 8.2 Recommandation pour la suite
-- **Phase 1 (ARCH-01 à ARCH-20) :** **CLÔTURÉE ET VALIDÉE**.
-- **Phase 2.1 (SKETCH-ISO) :** Déblocage recommandé pour cadrage technique et lancement des travaux sous validation humaine.
+- **Statut ARCH-20-FIX-01 :** **`IMPLEMENTED`**.
+- **Statut ARCH-20 :** **`EN ATTENTE D'AUDIT EXTERNE`** (audit ChatGPT et contre-audit Gemini après le push utilisateur sur la branche `main`).
+- **Phase 1 et déblocage de la Phase 2.1 (SKETCH-ISO) :** En attente de validation formelle de l'audit externe ; aucun déblocage automatique n'est anticipé.
 
 ---
 *Fin du document BASELINE-01 réconcilié — Orthogonal PD&I Studio.*

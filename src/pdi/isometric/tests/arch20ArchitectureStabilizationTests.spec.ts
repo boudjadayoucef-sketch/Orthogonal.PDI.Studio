@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 
 // 1. Contrats publics des modules de la Phase 1
 import * as IsoTopologyGraph from "../core/IsoTopologyGraph";
@@ -46,6 +47,37 @@ export function detectMonolithImports(code: string): string[] {
   }
 
   return matches;
+}
+
+/**
+ * Parcourt récursivement un répertoire pour collecter tous les fichiers source TypeScript (.ts, .tsx)
+ * à toutes les profondeurs, en excluant les fichiers de test (*.spec.ts, *.test.ts, etc.)
+ * et sans suivre les liens symboliques afin de prévenir tout cycle ou boucle infinie.
+ */
+export function collectTsFilesRecursively(dir: string): string[] {
+  if (!fs.existsSync(dir)) return [];
+  const files: string[] = [];
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+    // Ne pas suivre les liens symboliques de répertoire pour éviter les cycles
+    if (entry.isSymbolicLink()) {
+      continue;
+    }
+
+    if (entry.isDirectory()) {
+      files.push(...collectTsFilesRecursively(fullPath));
+    } else if (entry.isFile()) {
+      const isTsSource = /\.(ts|tsx)$/.test(entry.name);
+      const isTestFile = /\.(spec|test)\.(ts|tsx)$/.test(entry.name);
+      if (isTsSource && !isTestFile) {
+        files.push(path.resolve(fullPath));
+      }
+    }
+  }
+
+  return files.sort();
 }
 
 describe("ARCH-20 — Stabilisation architecturale et clôture de Phase 1", () => {
@@ -112,19 +144,14 @@ describe("ARCH-20 — Stabilisation architecturale et clôture de Phase 1", () =
       path.resolve(__dirname, "../ui"),
     ];
 
-    it("vérifie qu'aucun fichier source dans core/ et ui/ n'importe IsometrieModuleV48d", () => {
+    it("vérifie qu'aucun fichier source dans core/ et ui/ (toutes profondeurs) n'importe IsometrieModuleV48d", () => {
       const violations: Array<{ file: string; imports: string[] }> = [];
 
       for (const dir of inspectedDirs) {
         expect(fs.existsSync(dir)).toBe(true);
-        const files = fs.readdirSync(dir).filter((file) => {
-          const isSource = /\.(ts|tsx)$/.test(file);
-          const isTest = /\.(spec|test)\.(ts|tsx)$/.test(file);
-          return isSource && !isTest;
-        });
+        const files = collectTsFilesRecursively(dir);
 
-        for (const file of files) {
-          const filePath = path.join(dir, file);
+        for (const filePath of files) {
           const content = fs.readFileSync(filePath, "utf-8");
           const prohibitedImports = detectMonolithImports(content);
 
@@ -178,6 +205,64 @@ describe("ARCH-20 — Stabilisation architecturale et clôture de Phase 1", () =
       `;
       const detectedComments = detectMonolithImports(safeCommentedCode);
       expect(detectedComments).toHaveLength(0);
+    });
+
+    it("prouve que collectTsFilesRecursively descend à au moins 2 niveaux de profondeur, exclut les tests et détecte les imports interdits (ARCH-20-FIX-01)", () => {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "arch20-fix01-recursion-"));
+      try {
+        const root = tempDir;
+        const nestedDir = path.join(root, "nested");
+        const subDir = path.join(nestedDir, "sub");
+
+        // Création de 2 niveaux de sous-répertoires
+        fs.mkdirSync(subDir, { recursive: true });
+
+        // Écriture de fichiers de test aux différents niveaux
+        const topLevelFile = path.join(root, "topLevel.ts");
+        const levelOneFile = path.join(nestedDir, "levelOne.tsx");
+        const testFileToExclude = path.join(nestedDir, "component.spec.ts");
+        const ordinarySubFile = path.join(subDir, "ordinary.ts");
+        const badSubFile = path.join(subDir, "badFile.ts");
+
+        fs.writeFileSync(topLevelFile, "export const rootVal = 1;");
+        fs.writeFileSync(levelOneFile, "export const LevelOne = () => null;");
+        fs.writeFileSync(testFileToExclude, "import { it } from 'vitest'; // fichier test à exclure");
+        fs.writeFileSync(ordinarySubFile, "export const ordinary = true;");
+        fs.writeFileSync(
+          badSubFile,
+          'import { IsometrieModuleV48d } from "../../engine/IsometrieModuleV48d";\nexport const x = 10;'
+        );
+
+        // Appel du collecteur récursif
+        const collectedFiles = collectTsFilesRecursively(root);
+
+        // 1. Vérification que les fichiers de tous les niveaux sont collectés
+        expect(collectedFiles).toContain(path.resolve(topLevelFile));
+        expect(collectedFiles).toContain(path.resolve(levelOneFile));
+        expect(collectedFiles).toContain(path.resolve(ordinarySubFile));
+        expect(collectedFiles).toContain(path.resolve(badSubFile));
+
+        // 2. Vérification de l'exclusion des fichiers de test
+        expect(collectedFiles).not.toContain(path.resolve(testFileToExclude));
+        expect(collectedFiles.length).toBe(4);
+
+        // 3. Vérification de l'ordre déterministe (tri alphabétique)
+        const sortedCopy = [...collectedFiles].sort();
+        expect(collectedFiles).toEqual(sortedCopy);
+
+        // 4. Vérification que le fichier de profondeur 2 (nested/sub/badFile.ts) est analysé par detectMonolithImports
+        const badContent = fs.readFileSync(badSubFile, "utf-8");
+        const detectedProhibited = detectMonolithImports(badContent);
+        expect(detectedProhibited.length).toBeGreaterThan(0);
+        expect(detectedProhibited[0]).toContain("IsometrieModuleV48d");
+
+        // 5. Vérification qu'un fichier ordinaire en profondeur 2 ne génère aucune fausse alerte
+        const ordinaryContent = fs.readFileSync(ordinarySubFile, "utf-8");
+        expect(detectMonolithImports(ordinaryContent)).toHaveLength(0);
+      } finally {
+        // Nettoyage systématique de l'arborescence temporaire
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
     });
   });
 

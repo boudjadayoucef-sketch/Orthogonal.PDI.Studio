@@ -213,15 +213,74 @@ Afin d'éviter la prolifération de numéros de jalons ou de tickets dans l'arbo
 
 ---
 
-## 9. STATUT FINAL ET CRITÈRES DE CLÔTURE DE LA PHASE 1
+## 9. STATUT INITIAL ARCH-20 ET TRANSITION VERS FIX-01
 
-- **Statut de l'étape ARCH-20 :** **`IMPLEMENTED`**
-- **Tous les critères techniques d'ARCH-20 sont rigoureusement satisfaits :**
-  - Nettoyage des imports inutilisés du monolithe réalisé sans toucher au corps du composant ;
-  - Zéro régression sur les 15 suites de tests existantes ;
-  - Ajout d'une 16ᵉ suite de tests avec 10 nouveaux tests dédiés ;
-  - Zéro cycle entre `core/`, `ui/` et le monolithe ;
-  - Préservation intégrale des exports fournisseurs ;
-  - Compilation et build réussis avec code 0.
-- **Statut architectural de la Phase 1 (ARCH-01 à ARCH-20) :** **`CLÔTURÉE`**
-- **Autorisation de passage à la Phase 2.1 (`SKETCH-ISO`) :** **PRÊTE POUR VALIDATION HUMAINE**
+- **Statut initial ARCH-20 :** **`IMPLEMENTED (AVANT CORRECTIF RECURSION)`**
+- **Validation technique initiale :** 10 tests unitaires, 70 tests globaux, typecheck et build réussis.
+- **Réserve relevée lors de l'audit de reprise :** Le parcours anti-cycle initial utilisait `fs.readdirSync(dir)` sans descente récursive, ne couvrant que le niveau racine immédiat de `core/` et `ui/`.
+
+---
+
+## 10. ARCH-20-FIX-01 — CORRECTION DU PARCOURS RÉCURSIF ANTI-CYCLE
+
+**Date d'exécution :** 25 octobre 2026  
+**Commit de base obligatoire :** `e604d7fc2cd32bd31046068660a77df5dedf3a8d`  
+**Statut du correctif :** **`IMPLEMENTED`**
+
+### 10.1 Diagnostic du défaut
+Le test anti-cycle initial utilisait un appel à plat `fs.readdirSync(dir)` :
+- **Conséquence :** Si un fichier source TypeScript était placé dans un sous-répertoire de `core/` (ex. `core/sub/engineBridge.ts`) ou de `ui/` (ex. `ui/controls/subPanel.tsx`), il échappait silencieusement au contrôle anti-cycle.
+
+### 10.2 Implémentation du collecteur récursif
+Dans `src/pdi/isometric/tests/arch20ArchitectureStabilizationTests.spec.ts`, la fonction suivante a été introduite :
+```ts
+export function collectTsFilesRecursively(dir: string): string[]
+```
+- **Mécanisme :**
+  - Utilise `fs.readdirSync(dir, { withFileTypes: true })`.
+  - Descend récursivement dans toute entrée où `entry.isDirectory()` est vrai.
+  - Sécurisation contre les cycles : **ne suit pas les liens symboliques** (`entry.isSymbolicLink() === false`).
+  - Filtrage des fichiers source : collecte les extensions `.ts` et `.tsx`.
+  - **Règle d'exclusion stricte des fichiers de test :** les fichiers `*.spec.ts`, `*.spec.tsx`, `*.test.ts` et `*.test.tsx` sont exclus du scan des fichiers de production afin d'éviter les faux positifs sur les suites de test elles-mêmes.
+  - Déterminisme : tri alphabétique des chemins absolus via `.sort()`.
+
+### 10.3 Répertoires surveillés et extensions
+- **Répertoires racines analysés :** `src/pdi/isometric/core/` et `src/pdi/isometric/ui/` à toutes les profondeurs d'arborescence.
+- **Extensions inspectées :** `.ts`, `.tsx`.
+
+### 10.4 Test unitaire d'arborescence temporaire imbriquée (profondeur ≥ 2)
+Un test unitaire dédié utilisant `fs.mkdtempSync` dans `os.tmpdir()` a été ajouté dans la suite :
+- Structure temporaire créée :
+  - `root/topLevel.ts` (niveau 0)
+  - `root/nested/levelOne.tsx` (niveau 1)
+  - `root/nested/component.spec.ts` (fichier test à exclure)
+  - `root/nested/sub/ordinary.ts` (niveau 2)
+  - `root/nested/sub/badFile.ts` (niveau 2, contenant un import interdit ciblant `IsometrieModuleV48d`)
+- **Résultats vérifiés par assertions strictes :**
+  1. Exactement 4 fichiers collectés (les 4 fichiers source `.ts`/`.tsx`).
+  2. Le fichier de test `component.spec.ts` est formellement ignoré par le collecteur.
+  3. L'ordre des chemins retournés est strictement déterministe.
+  4. Le fichier en profondeur 2 (`nested/sub/badFile.ts`) est bien inspecté par `detectMonolithImports` et l'import interdit est détecté.
+  5. Le fichier ordinaire de profondeur 2 ne lève aucune fausse alerte.
+  6. Nettoyage garanti du répertoire temporaire dans un bloc `finally` via `fs.rmSync(tempDir, { recursive: true, force: true })`.
+
+### 10.5 Évolution du nombre de tests ARCH-20
+- **Avant ARCH-20-FIX-01 :** 10 tests dans la suite `arch20ArchitectureStabilizationTests.spec.ts` (total projet : 70 tests).
+- **Après ARCH-20-FIX-01 :** **11 tests** dans la suite `arch20ArchitectureStabilizationTests.spec.ts` (total projet : **71 tests**).
+
+### 10.6 Résultats réels observés lors des vérifications
+- **Test ciblé ARCH-20 :** `npx vitest run src/pdi/isometric/tests/arch20ArchitectureStabilizationTests.spec.ts` -> **PASS (11/11 tests, 23 ms)**.
+- **Suite complète Vitest :** `npx vitest run` -> **PASS (16 suites, 71 tests, 100% green)**.
+- **Typecheck officiel :** `npm run lint` (`tsc --noEmit`) -> **PASS (0 erreur, code 0)**.
+- **Build de production :** `npm run build` -> **PASS (code 0, Vite web + server.cjs 23.5 Ko)**.
+- **Compilateur AI Studio :** `compile_applet` -> **PASS (`Build succeeded - the applet is compiled`)**.
+
+### 10.7 Limites connues du détecteur de motifs d'import
+- La barrière anti-cycle analyse les imports statiques (`import ... from '...'`), les réexports (`export * from '...'`) et les imports dynamiques standards (`import('...')`) ciblant `IsometrieModuleV48d` dans `core/` et `ui/`.
+- Elle ne prétend pas détecter des constructions dynamiques exotiques (ex. `eval`, calculs dynamiques de chaînes de chemins ou `require.resolve` indirect) ni garantir l'absence absolue de tout cycle entre l'ensemble des modules tiers du projet.
+- La barrière est spécifique et dédiée à l'étanchéité des couches `core/` et `ui/` vis-à-vis du monolithe `IsometrieModuleV48d.tsx`.
+
+### 10.8 Statut global d'ARCH-20 post-correctif
+- **ARCH-20-FIX-01 :** **`IMPLEMENTED`**
+- **ARCH-20 :** **`EN ATTENTE D'AUDIT EXTERNE`** (soumis à l'audit externe ChatGPT et au contre-audit Gemini après le push utilisateur).
+- **Phase 1 et déblocage SKETCH-ISO :** En attente de validation finale distincte ; aucun déblocage automatique n'est anticipé.
