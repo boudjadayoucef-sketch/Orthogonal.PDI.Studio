@@ -85,13 +85,13 @@ export const PAPER_FORMATS: Record<PaperFormat, PaperDimensionsMm> = {
 };
 
 /**
- * Standard isometric angles in degrees
- * 30° (+X / East-ish)
- * 90° (+Z / Up)
- * 150° (-Y / North-ish)
- * 210° (-X / West-ish)
- * 270° (-Z / Down)
- * 330° (+Y / South-ish)
+ * Standard isometric angles in degrees (aligned with isoProjectV4 & DEFAULT_AXIS_MAPPING):
+ * 330° (+X / South-East, dx > 0, dy > 0 on screen)
+ * 150° (-X / North-West, dx < 0, dy < 0 on screen)
+ * 210° (+Y / South-West, dx < 0, dy > 0 on screen)
+ * 30°  (-Y / North-East, dx > 0, dy < 0 on screen)
+ * 90°  (+Z / Up,         dx = 0, dy < 0 on screen)
+ * 270° (-Z / Down,       dx = 0, dy > 0 on screen)
  */
 export const ISO_STANDARD_ANGLES = [30, 90, 150, 210, 270, 330];
 

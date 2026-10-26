@@ -3,8 +3,8 @@
  * SHARED COMPONENT — CURSEUR TRIÈDRE D'AXES ISOMÉTRIQUES (SKETCH-DETECT-08 / PARTIE 2)
  *
  * Petit trièdre mobile (3 segments convergeant vers un point) :
- * - Famille 30° / 210° (Axe X)  : #EF4444 (Rouge)
- * - Famille 150° / 330° (Axe Y) : #10B981 (Vert)
+ * - Famille 330° / 150° (Axe X) : #EF4444 (Rouge)
+ * - Famille 210° / 30° (Axe Y)  : #10B981 (Vert)
  * - Famille 90° / 270° (Axe Z)  : #3B82F6 (Bleu)
  * S'affiche à la position courante (x, y) lorsqu'un déplacement (drag) est en cours.
  */
@@ -87,7 +87,7 @@ export const AxisCursorOverlay: React.FC<AxisCursorOverlayProps> = ({
       />
 
       {/* Segments principaux d'axes */}
-      {/* Axe X (30°) - Rouge */}
+      {/* Axe X (330° / Sud-Est) - Rouge */}
       <line
         x1={0}
         y1={0}

@@ -273,7 +273,8 @@ async function extractDimensionsWithOcr(
 export function mergeCollinearSegments(
   nodes: SketchVectorNode[],
   segs: SketchVectorSegment[],
-  calibrationScale?: number
+  calibrationScale?: number,
+  axisMapping: AxisMappingConfig = DEFAULT_AXIS_MAPPING
 ): { nodes: SketchVectorNode[]; segs: SketchVectorSegment[] } {
   let merged = true;
   let workingNodes = [...nodes];
@@ -324,7 +325,7 @@ export function mergeCollinearSegments(
         fromNodeId: otherAId,
         toNodeId: otherBId,
         angleIsoDeg: mergedSnap.angleDeg,
-        detectedAxis: isoAngleToAxis(mergedSnap.angleDeg).axis,
+        detectedAxis: isoAngleToAxis(mergedSnap.angleDeg, axisMapping).axis,
         lengthMm: Math.round(Math.hypot(nB.x - nA.x, nB.y - nA.y) / (calibrationScale || 0.25)),
       };
 
@@ -351,7 +352,8 @@ export function bridgeNearbyEndpoints(
   segs: SketchVectorSegment[],
   maxGapPx: number = 90,
   maxAngleDeviationDeg: number = 15,
-  calibrationScale?: number
+  calibrationScale?: number,
+  axisMapping: AxisMappingConfig = DEFAULT_AXIS_MAPPING
 ): { nodes: SketchVectorNode[]; segs: SketchVectorSegment[] } {
   // 1. Calculer le degré de chaque nœud.
   const nodeDegrees = new Map<string, number>();
@@ -482,7 +484,7 @@ export function bridgeNearbyEndpoints(
         fromNodeId: cb.ep.node.id,
         toNodeId: cb.candNode.id,
         angleIsoDeg: cb.snapAngleDeg,
-        detectedAxis: isoAngleToAxis(cb.snapAngleDeg).axis,
+        detectedAxis: isoAngleToAxis(cb.snapAngleDeg, axisMapping).axis,
         lengthMm: lengthMm > 0 ? lengthMm : 100,
         nominalDiameter: cb.ep.seg.nominalDiameter || 100,
         pressureClass: cb.ep.seg.pressureClass || "Class 150",
@@ -495,7 +497,7 @@ export function bridgeNearbyEndpoints(
 
   // 6. Ré-appeler mergeCollinearSegments sur le résultat pour fusionner les ponts avec leurs voisins de même axe si pertinent.
   // 7. Retourner { nodes, segs }.
-  return mergeCollinearSegments(nodes, workingSegs, calibrationScale);
+  return mergeCollinearSegments(nodes, workingSegs, calibrationScale, axisMapping);
 }
 
 /**
@@ -505,7 +507,8 @@ export function bridgeNearbyEndpoints(
 export async function detectSketchTopologyOpenCv(
   imageDataUrl: string,
   canvasWidth = 1188,
-  canvasHeight = 840
+  canvasHeight = 840,
+  axisMapping: AxisMappingConfig = DEFAULT_AXIS_MAPPING
 ): Promise<LocalDetectionResult | null> {
   if (typeof window === "undefined" || typeof Image === "undefined" || !imageDataUrl) {
     return null;
@@ -746,7 +749,7 @@ export async function detectSketchTopologyOpenCv(
           processedPairs.add(pairKey2);
 
           const snap = snapToIsometricAngle(n1, n2, 25);
-          const { axis } = isoAngleToAxis(snap.angleDeg);
+          const { axis } = isoAngleToAxis(snap.angleDeg, axisMapping);
           const segId = `seg_${detectedSegs.length + 1}`;
           const distPx = Math.hypot(n2.x - n1.x, n2.y - n1.y);
 
@@ -820,7 +823,9 @@ export async function detectSketchTopologyOpenCv(
         // =========================================================================
         const { nodes: colNodes, segs: colSegs } = mergeCollinearSegments(
           detectedNodes,
-          detectedSegs
+          detectedSegs,
+          undefined,
+          axisMapping
         );
 
         // =========================================================================
@@ -830,7 +835,9 @@ export async function detectSketchTopologyOpenCv(
           colNodes,
           colSegs,
           90,
-          15
+          15,
+          undefined,
+          axisMapping
         );
 
         // =========================================================================
