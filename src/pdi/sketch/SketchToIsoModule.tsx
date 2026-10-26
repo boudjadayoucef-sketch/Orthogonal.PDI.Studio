@@ -129,47 +129,18 @@ export const SketchToIsoModule: React.FC<SketchToIsoModuleProps> = ({
 
     const dims = overrideDims || imageDimensions;
     setIsDetectingAI(true);
-    setStatusMessage("🔍 Analyse OCR & Vision : Lecture du cartouche, reconnaissance des cotes mm, pompe et segmentation de la table BOM...");
+    setStatusMessage("🔍 Détection vectorielle locale : Analyse géométrique autonome et reconnaissance de la tuyauterie...");
 
     try {
-      let data: any = null;
-
-      // 1. Tenter l'analyse OCR avancée sur le serveur
-      try {
-        const res = await fetch("/api/sketch/detect-iso", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            imageBase64: targetImg,
-            imageWidth: dims.width,
-            imageHeight: dims.height,
-            format: format
-          })
-        });
-        if (res.ok) {
-          const json = await res.json();
-          if (json?.data) {
-            data = json.data;
-          }
-        }
-      } catch (netErr) {
-        console.warn("[OCR Client] Serveur non joignable, bascule locale :", netErr);
-      }
-
-      // 2. Fallback local avec OpenCV.js si serveur absent (chargé à la demande)
-      if (!data) {
-        const { detectSketchTopologyOpenCv } = await import("./openCvSketchDetector");
-        data = await detectSketchTopologyOpenCv(targetImg, dims.width, dims.height);
-      }
+      // 100% Détection locale autonome dans le navigateur via OpenCV.js (WebAssembly)
+      // Confidentialité stricte : aucun appel réseau, aucune transmission d'image ou de croquis vers un serveur
+      const { detectSketchTopologyOpenCv } = await import("./openCvSketchDetector");
+      const data = await detectSketchTopologyOpenCv(targetImg, dims.width, dims.height, axisMapping);
 
       if (!data || !Array.isArray(data.nodes) || data.nodes.length === 0 || !Array.isArray(data.segments) || data.segments.length === 0) {
-        // Détection non concluante / confiance insuffisante -> Pointage manuel assisté
-        setNodes([]);
-        setSegments([]);
-        setFittings([]);
-        setAiDetectedEquipment([]);
+        // Détection non concluante / confiance insuffisante -> Conserver impérativement les éléments existants
         setActiveTool("pipe");
-        const msg = "⚠️ Détection automatique insuffisamment fiable pour ce croquis. Mode pointage manuel assisté activé : cliquez sur l'image pour placer les nœuds et tracer la tuyauterie.";
+        const msg = "⚠️ Détection automatique locale non concluante pour ce croquis. Mode pointage manuel activé : vos tracés existants sont conservés et vous pouvez placer ou ajuster les nœuds manuellement.";
         setAiDetectionSummary(msg);
         setStatusMessage(msg);
         return;
@@ -200,12 +171,12 @@ export const SketchToIsoModule: React.FC<SketchToIsoModuleProps> = ({
         setAiDetectedEquipment(data.equipment);
       }
 
-      const summaryText = data.summary || `Détection OCR terminée : ${data.nodes?.length || 0} nœuds, ${data.segments?.length || 0} tronçons, échelle calibrée à ${data.calibrationScale || calibrationScale} px/mm.`;
+      const summaryText = data.summary || `Détection locale terminée : ${data.nodes?.length || 0} nœuds, ${data.segments?.length || 0} tronçons, échelle calibrée à ${data.calibrationScale || calibrationScale} px/mm.`;
       setAiDetectionSummary(summaryText);
       setStatusMessage(`🎯 ${summaryText} Ajustez la position des éléments si nécessaire puis validez.`);
     } catch (err: any) {
-      console.error("OCR Vision Detection Error:", err);
-      setStatusMessage(`⚠️ Échec de l'analyse OCR : ${err.message || "Erreur"}`);
+      console.error("Local Sketch Detection Error:", err);
+      setStatusMessage(`⚠️ Échec de la détection locale : ${err.message || "Erreur"}`);
     } finally {
       setIsDetectingAI(false);
     }

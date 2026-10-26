@@ -27,6 +27,8 @@ export interface LocalDetectionResult {
   lowConfidence?: boolean;
 }
 
+import type { AxisMappingConfig } from "./sketchAxisConfig";
+
 /**
  * Analyse 100% locale, déterministe et autonome d'une image de tuyauterie / croquis via OpenCV.js.
  * Ne fait aucun appel réseau, aucune requête API, aucun modèle externe.
@@ -35,14 +37,16 @@ export interface LocalDetectionResult {
 export async function detectSketchTopologyLocal(
   imageDataUrl: string,
   canvasWidth = 1188,
-  canvasHeight = 840
+  canvasHeight = 840,
+  axisMapping?: AxisMappingConfig
 ): Promise<LocalDetectionResult | null> {
   try {
     const { detectSketchTopologyOpenCv } = await import("./openCvSketchDetector");
     const openCvResult = await detectSketchTopologyOpenCv(
       imageDataUrl,
       canvasWidth,
-      canvasHeight
+      canvasHeight,
+      axisMapping
     );
     if (openCvResult && openCvResult.nodes.length >= 2 && openCvResult.segments.length >= 1) {
       return openCvResult;
