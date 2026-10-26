@@ -111,6 +111,19 @@ export function mapSketchFittingTypeToIso(type: string): IsoFittingType {
 }
 
 /**
+ * Converts a calibration scale expressed in pixels per millimeter (px/mm)
+ * to pixels per meter (px/m) for isometric projection coordinates.
+ * Formula: px/m = px/mm * 1000.
+ * Falls back to 100 px/m if the scale is invalid, non-finite, or <= 0.
+ */
+export function convertCalibrationScaleToPixelsPerMeter(scale: number): number {
+  if (typeof scale !== "number" || isNaN(scale) || !isFinite(scale) || scale <= 0) {
+    return 100;
+  }
+  return scale * 1000;
+}
+
+/**
  * Compiles sketch vector data into standard PD&I Iso JSON model.
  */
 export function compileSketchToIsoModel(params: {
@@ -160,8 +173,9 @@ export function compileSketchToIsoModel(params: {
   const minY = nodes.length > 0 ? Math.min(...nodes.map((n) => n.y)) : 0;
 
   // Conversion factor from sketch px to world meters:
-  // Default calibration scale is ~0.25 px/mm = 250 px/m, or if uncalibrated, 100 px ≈ 1 m.
-  const pxPerMeter = scale > 0 ? (scale >= 1 ? scale : scale * 1000) : 100;
+  // Calibration scale is in px/mm, converted to px/m (scale * 1000).
+  // Falls back to 100 px/m if uncalibrated or non-positive.
+  const pxPerMeter = convertCalibrationScaleToPixelsPerMeter(calibrationScale);
 
   // 2. Map Nodes using multi-component isometric 3D pipe routing
   // Convert sketch segments and angles to true 3D orthogonal coordinates (in meters)
