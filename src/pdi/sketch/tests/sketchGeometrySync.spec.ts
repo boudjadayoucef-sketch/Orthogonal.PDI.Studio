@@ -10,9 +10,11 @@ import {
   calculateSegmentLengthMm,
   syncSegmentsOnNodeMove,
   syncSegmentsOnCalibrationChange,
-  isSegmentManualLength
+  isSegmentManualLength,
+  applyNodeDragDelta
 } from "../sketchRasterEngine";
 import { compileSketchToIsoModel } from "../sketchToJsonCompiler";
+import { resolveSegmentDisplayLengthMm } from "../SketchReviewTable";
 
 describe("SKETCH-ISO-03-FIX-01 : Synchronisation des longueurs géométriques", () => {
   // Test 1 : Un tronçon automatique dont la longueur change après déplacement d'un nœud
@@ -317,4 +319,126 @@ describe("SKETCH-ISO-03-FIX-01 : Synchronisation des longueurs géométriques", 
     expect(synced[0].lengthMm).toBe(2000);
     expect(synced[0].isManualLength).toBe(false);
   });
+
+  describe("Micro-fix 1 : Synchronisation du déplacement et élimination de closure obsolète", () => {
+    it("applyNodeDragDelta calcule avec précision la position finale sans altérer les nœuds non sélectionnés", () => {
+      const nodes: SketchVectorNode[] = [
+        { id: "n1", x: 100, y: 100, elevation: 0 },
+        { id: "n2", x: 200, y: 150, elevation: 0 }
+      ];
+      const startPositions = new Map<string, { x: number; y: number }>();
+      startPositions.set("n1", { x: 100, y: 100 });
+
+      const moved = applyNodeDragDelta(nodes, new Set(["n1"]), startPositions, 50, -30);
+      expect(moved[0].x).toBe(150);
+      expect(moved[0].y).toBe(70);
+      expect(moved[1].x).toBe(200); // Intact
+      expect(moved[1].y).toBe(150);
+    });
+
+    it("la synchronisation des tronçons s'exécute sur l'état final déplacé sans régression lors du relâchement", () => {
+      const initialNodes: SketchVectorNode[] = [
+        { id: "n1", x: 0, y: 0, elevation: 0 },
+        { id: "n2", x: 100, y: 0, elevation: 0 } // dist = 100px -> 400mm à 0.25
+      ];
+      const segments: SketchVectorSegment[] = [
+        {
+          id: "s1",
+          fromNodeId: "n1",
+          toNodeId: "n2",
+          nominalDiameter: 150,
+          pressureClass: "Class 300",
+          material: "Acier API 5L Gr. B",
+          lengthMm: 400,
+          isManualLength: false
+        }
+      ];
+
+      const startPositions = new Map<string, { x: number; y: number }>();
+      startPositions.set("n2", { x: 100, y: 0 });
+
+      // Déplacement final avec delta dx=200 -> nouvelle position n2 à x=300 -> dist = 300px -> 1200mm
+      const finalNodes = applyNodeDragDelta(initialNodes, new Set(["n2"]), startPositions, 200, 0);
+      const synced = syncSegmentsOnNodeMove(segments, finalNodes, new Set(["n2"]), 0.25);
+
+      expect(synced[0].lengthMm).toBe(1200);
+
+      // Simulation du bug évité : si un recalcul utilisait par erreur les anciens `initialNodes` capturés par closure,
+      // la longueur serait faussement écrasée à 400. La suppression du recalcul obsolète garantit que 1200 est conservé.
+      expect(synced[0].lengthMm).not.toBe(400);
+    });
+  });
+
+  describe("Micro-fix 2 : Priorité d'affichage dans la table de révision (resolveSegmentDisplayLengthMm)", () => {
+    const testNodes: SketchVectorNode[] = [
+      { id: "n1", x: 0, y: 0, elevation: 0 },
+      { id: "n2", x: 300, y: 0, elevation: 0 } // distance = 300px -> autoLengthMm = 1200mm à 0.25 px/mm
+    ];
+
+    it("priorise la longueur géométrique calculée (autoLengthMm) sur une valeur historique périmée pour un tronçon auto", () => {
+      const staleAutoSeg: SketchVectorSegment = {
+        id: "s_auto_stale",
+        fromNodeId: "n1",
+        toNodeId: "n2",
+        nominalDiameter: 150,
+        pressureClass: "Class 300",
+        material: "Acier API 5L Gr. B",
+        lengthMm: 9999, // Valeur historique périmée
+        isManualLength: false
+      };
+
+      // Doit afficher 1200mm (calcul géométrique 300 / 0.25) et ignorer la valeur périmée 9999
+      const displayed = resolveSegmentDisplayLengthMm(staleAutoSeg, testNodes, 0.25);
+      expect(displayed).toBe(1200);
+    });
+
+    it("priorise également la longueur géométrique pour un tronçon hérité sans marqueur isManualLength", () => {
+      const legacySeg: SketchVectorSegment = {
+        id: "s_legacy",
+        fromNodeId: "n1",
+        toNodeId: "n2",
+        nominalDiameter: 150,
+        pressureClass: "Class 300",
+        material: "Acier API 5L Gr. B",
+        lengthMm: 8888 // Valeur historique
+      };
+
+      const displayed = resolveSegmentDisplayLengthMm(legacySeg, testNodes, 0.25);
+      expect(displayed).toBe(1200);
+    });
+
+    it("affiche fidèlement la longueur manuelle saisie pour un tronçon avec isManualLength: true", () => {
+      const manualSeg: SketchVectorSegment = {
+        id: "s_manual",
+        fromNodeId: "n1",
+        toNodeId: "n2",
+        nominalDiameter: 150,
+        pressureClass: "Class 300",
+        material: "Acier API 5L Gr. B",
+        lengthMm: 4500, // Saisie manuelle utilisateur
+        isManualLength: true
+      };
+
+      // Doit afficher 4500mm même si la géométrie donne 1200mm
+      const displayed = resolveSegmentDisplayLengthMm(manualSeg, testNodes, 0.25);
+      expect(displayed).toBe(4500);
+    });
+
+    it("se replie sur seg.lengthMm si l'échelle est invalide ou non calibrée (<= 0)", () => {
+      const seg: SketchVectorSegment = {
+        id: "s_fallback",
+        fromNodeId: "n1",
+        toNodeId: "n2",
+        nominalDiameter: 150,
+        pressureClass: "Class 300",
+        material: "Acier API 5L Gr. B",
+        lengthMm: 600,
+        isManualLength: false
+      };
+
+      expect(resolveSegmentDisplayLengthMm(seg, testNodes, 0)).toBe(600);
+      expect(resolveSegmentDisplayLengthMm(seg, testNodes, -1)).toBe(600);
+    });
+  });
 });
+

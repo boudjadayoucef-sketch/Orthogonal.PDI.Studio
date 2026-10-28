@@ -25,6 +25,37 @@ export interface SketchReviewTableProps {
   onProfileChange: (profile: SketchLearningProfile) => void;
 }
 
+/**
+ * Resolves the displayed length in millimeters for a segment in the review table.
+ * Priority contract:
+ * - If seg.isManualLength === true: return the manual length seg.lengthMm (even if autoLengthMm differs).
+ * - If seg is automatic (isManualLength !== true): return autoLengthMm computed from current node coordinates
+ *   and calibrationScale, in priority over any stale historical value in seg.lengthMm.
+ * - If geometry cannot be computed (e.g. invalid scale or missing nodes), fallback to seg.lengthMm.
+ */
+export function resolveSegmentDisplayLengthMm(
+  seg: SketchVectorSegment,
+  nodes: SketchVectorNode[],
+  calibrationScale: number
+): number | undefined {
+  if (seg.isManualLength === true) {
+    return seg.lengthMm;
+  }
+  const n1 = nodes.find((n) => n.id === seg.fromNodeId);
+  const n2 = nodes.find((n) => n.id === seg.toNodeId);
+  if (
+    n1 &&
+    n2 &&
+    typeof calibrationScale === "number" &&
+    calibrationScale > 0 &&
+    isFinite(calibrationScale)
+  ) {
+    const distPx = Math.hypot(n2.x - n1.x, n2.y - n1.y);
+    return Math.round(distPx / calibrationScale);
+  }
+  return seg.lengthMm;
+}
+
 export const SketchReviewTable: React.FC<SketchReviewTableProps> = ({
   nodes,
   segments,
@@ -170,11 +201,7 @@ export const SketchReviewTable: React.FC<SketchReviewTableProps> = ({
         {activeTab === "segments" && (
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {segments.map((seg, idx) => {
-              const n1 = nodes.find((n) => n.id === seg.fromNodeId);
-              const n2 = nodes.find((n) => n.id === seg.toNodeId);
-              const autoLengthMm = n1 && n2 && calibrationScale > 0
-                ? Math.round(Math.hypot(n2.x - n1.x, n2.y - n1.y) / calibrationScale)
-                : 1000;
+              const displayLengthMm = resolveSegmentDisplayLengthMm(seg, nodes, calibrationScale);
 
               return (
                 <div
@@ -268,7 +295,7 @@ export const SketchReviewTable: React.FC<SketchReviewTableProps> = ({
                       </div>
                       <input
                         type="number"
-                        value={seg.isManualLength ? (seg.lengthMm ?? "") : (seg.lengthMm ?? autoLengthMm)}
+                        value={displayLengthMm ?? ""}
                         onChange={(e) => {
                           const val = Number(e.target.value);
                           updateSegment(seg.id, {

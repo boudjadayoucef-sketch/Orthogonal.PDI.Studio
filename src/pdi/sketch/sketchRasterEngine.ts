@@ -234,6 +234,33 @@ export function isSegmentManualLength(seg: SketchVectorSegment): boolean {
 }
 
 /**
+ * Calculates updated node positions during or after a drag operation
+ * based on starting positions and delta offsets (dx, dy).
+ */
+export function applyNodeDragDelta(
+  nodes: SketchVectorNode[],
+  selectedNodeIds: Set<string> | string[],
+  startPositions: Map<string, { x: number; y: number }>,
+  dx: number,
+  dy: number
+): SketchVectorNode[] {
+  const selectedSet = selectedNodeIds instanceof Set ? selectedNodeIds : new Set(selectedNodeIds);
+  return nodes.map((n) => {
+    if (selectedSet.has(n.id)) {
+      const startPos = startPositions.get(n.id);
+      if (startPos) {
+        return {
+          ...n,
+          x: Math.round(startPos.x + dx),
+          y: Math.round(startPos.y + dy)
+        };
+      }
+    }
+    return n;
+  });
+}
+
+/**
  * Synchronizes segment lengths after one or more nodes are moved.
  * - Updates automatic segments (isManualLength !== true) connected to moved nodes.
  * - Preserves manual segments (isManualLength === true).

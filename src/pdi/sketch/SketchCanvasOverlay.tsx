@@ -14,7 +14,8 @@ import {
   snapToIsometricAngle,
   applyImageFilters,
   syncSegmentsOnNodeMove,
-  syncSegmentsOnCalibrationChange
+  syncSegmentsOnCalibrationChange,
+  applyNodeDragDelta
 } from "./sketchRasterEngine";
 import { SketchAxisTriad } from "./SketchAxisTriad";
 import { AxisMappingConfig, DEFAULT_AXIS_MAPPING } from "./sketchAxisConfig";
@@ -103,6 +104,10 @@ export const SketchCanvasOverlay: React.FC<SketchCanvasOverlayProps> = ({
   const [isDraggingNode, setIsDraggingNode] = useState(false);
   const dragNodeStartPosRef = useRef<Map<string, { x: number; y: number }>>(new Map());
   const dragMouseStartRef = useRef<SketchPoint2D>({ x: 0, y: 0 });
+  const latestNodesRef = useRef<SketchVectorNode[]>(nodes);
+  useEffect(() => {
+    latestNodesRef.current = nodes;
+  }, [nodes]);
 
   // Drawing state
   const [pipeStartNodeId, setPipeStartNodeId] = useState<string | null>(null);
@@ -904,20 +909,15 @@ export const SketchCanvasOverlay: React.FC<SketchCanvasOverlayProps> = ({
       const dx = Math.round(pt.x - dragMouseStartRef.current.x);
       const dy = Math.round(pt.y - dragMouseStartRef.current.y);
 
-      const nextNodes = nodes.map((n) => {
-        if (selectedNodeIds.has(n.id)) {
-          const startPos = dragNodeStartPosRef.current.get(n.id);
-          if (startPos) {
-            return {
-              ...n,
-              x: Math.round(startPos.x + dx),
-              y: Math.round(startPos.y + dy)
-            };
-          }
-        }
-        return n;
-      });
+      const nextNodes = applyNodeDragDelta(
+        nodes,
+        selectedNodeIds,
+        dragNodeStartPosRef.current,
+        dx,
+        dy
+      );
 
+      latestNodesRef.current = nextNodes;
       onNodesChange(nextNodes);
       onSegmentsChange(
         syncSegmentsOnNodeMove(segments, nextNodes, selectedNodeIds, calibrationScale)
@@ -1010,12 +1010,6 @@ export const SketchCanvasOverlay: React.FC<SketchCanvasOverlayProps> = ({
       setIsBoxSelecting(false);
       setBoxSelectStart(null);
       setBoxSelectCurrent(null);
-    }
-
-    if (isDraggingNode && selectedNodeIds.size > 0) {
-      onSegmentsChange(
-        syncSegmentsOnNodeMove(segments, nodes, selectedNodeIds, calibrationScale)
-      );
     }
 
     setIsPanning(false);
