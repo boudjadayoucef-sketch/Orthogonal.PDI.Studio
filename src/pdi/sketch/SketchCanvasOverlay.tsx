@@ -12,7 +12,9 @@ import {
   PaperFormat,
   PAPER_FORMATS,
   snapToIsometricAngle,
-  applyImageFilters
+  applyImageFilters,
+  syncSegmentsOnNodeMove,
+  syncSegmentsOnCalibrationChange
 } from "./sketchRasterEngine";
 import { SketchAxisTriad } from "./SketchAxisTriad";
 import { AxisMappingConfig, DEFAULT_AXIS_MAPPING } from "./sketchAxisConfig";
@@ -287,10 +289,11 @@ export const SketchCanvasOverlay: React.FC<SketchCanvasOverlayProps> = ({
       ctx.font = "bold 11px Inter, sans-serif";
       ctx.textAlign = "center";
       const lengthMm =
-        seg.lengthMm ||
-        (calibrationScale > 0
-          ? Math.round(Math.hypot(n2.x - n1.x, n2.y - n1.y) / calibrationScale)
-          : null);
+        seg.isManualLength && seg.lengthMm !== undefined
+          ? seg.lengthMm
+          : (calibrationScale > 0
+              ? Math.round(Math.hypot(n2.x - n1.x, n2.y - n1.y) / calibrationScale)
+              : seg.lengthMm || null);
       const label = `DN${seg.nominalDiameter || 150}${lengthMm ? ` • ${lengthMm}mm` : ""}`;
       ctx.fillText(label, midX, midY - 6);
     });
@@ -821,6 +824,7 @@ export const SketchCanvasOverlay: React.FC<SketchCanvasOverlayProps> = ({
         }
 
         if (endNode.id !== startNode.id) {
+          const distPx = Math.hypot(endNode.x - startNode.x, endNode.y - startNode.y);
           const newSeg: SketchVectorSegment = {
             id: `seg_${Date.now()}`,
             fromNodeId: startNode.id,
@@ -828,7 +832,9 @@ export const SketchCanvasOverlay: React.FC<SketchCanvasOverlayProps> = ({
             nominalDiameter: 150,
             pressureClass: "Class 300",
             material: "Acier API 5L Gr. B",
-            angleIsoDeg: snap.angleDeg
+            angleIsoDeg: snap.angleDeg,
+            isManualLength: false,
+            lengthMm: calibrationScale > 0 ? Math.round(distPx / calibrationScale) : undefined
           };
           onSegmentsChange([...segments, newSeg]);
         }
@@ -865,6 +871,7 @@ export const SketchCanvasOverlay: React.FC<SketchCanvasOverlayProps> = ({
         if (userMmStr && !isNaN(Number(userMmStr)) && Number(userMmStr) > 0) {
           const scale = distPx / Number(userMmStr);
           onCalibrationChange(scale);
+          onSegmentsChange(syncSegmentsOnCalibrationChange(segments, nodes, scale));
         }
         setCalibrateP1(null);
         setCalibrateP2(null);
@@ -897,20 +904,23 @@ export const SketchCanvasOverlay: React.FC<SketchCanvasOverlayProps> = ({
       const dx = Math.round(pt.x - dragMouseStartRef.current.x);
       const dy = Math.round(pt.y - dragMouseStartRef.current.y);
 
-      onNodesChange(
-        nodes.map((n) => {
-          if (selectedNodeIds.has(n.id)) {
-            const startPos = dragNodeStartPosRef.current.get(n.id);
-            if (startPos) {
-              return {
-                ...n,
-                x: Math.round(startPos.x + dx),
-                y: Math.round(startPos.y + dy)
-              };
-            }
+      const nextNodes = nodes.map((n) => {
+        if (selectedNodeIds.has(n.id)) {
+          const startPos = dragNodeStartPosRef.current.get(n.id);
+          if (startPos) {
+            return {
+              ...n,
+              x: Math.round(startPos.x + dx),
+              y: Math.round(startPos.y + dy)
+            };
           }
-          return n;
-        })
+        }
+        return n;
+      });
+
+      onNodesChange(nextNodes);
+      onSegmentsChange(
+        syncSegmentsOnNodeMove(segments, nextNodes, selectedNodeIds, calibrationScale)
       );
     }
   };
@@ -1000,6 +1010,12 @@ export const SketchCanvasOverlay: React.FC<SketchCanvasOverlayProps> = ({
       setIsBoxSelecting(false);
       setBoxSelectStart(null);
       setBoxSelectCurrent(null);
+    }
+
+    if (isDraggingNode && selectedNodeIds.size > 0) {
+      onSegmentsChange(
+        syncSegmentsOnNodeMove(segments, nodes, selectedNodeIds, calibrationScale)
+      );
     }
 
     setIsPanning(false);

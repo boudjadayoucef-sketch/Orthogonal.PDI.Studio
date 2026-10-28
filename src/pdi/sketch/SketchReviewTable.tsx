@@ -258,17 +258,28 @@ export const SketchReviewTable: React.FC<SketchReviewTableProps> = ({
                     </div>
 
                     <div>
-                      <label style={{ fontSize: 10, color: "#94A3B8", display: "block", marginBottom: 2 }}>
-                        Longueur réelle (mm)
-                      </label>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 2 }}>
+                        <label style={{ fontSize: 10, color: "#94A3B8" }}>
+                          Longueur réelle (mm)
+                        </label>
+                        <span style={{ fontSize: 9, fontWeight: 700, color: seg.isManualLength ? "#F59E0B" : "#10B981" }}>
+                          {seg.isManualLength ? "MANUELLE" : "AUTO"}
+                        </span>
+                      </div>
                       <input
                         type="number"
-                        value={seg.lengthMm || autoLengthMm}
-                        onChange={(e) => updateSegment(seg.id, { lengthMm: Number(e.target.value) })}
+                        value={seg.isManualLength ? (seg.lengthMm ?? "") : (seg.lengthMm ?? autoLengthMm)}
+                        onChange={(e) => {
+                          const val = Number(e.target.value);
+                          updateSegment(seg.id, {
+                            lengthMm: val,
+                            isManualLength: true
+                          });
+                        }}
                         style={{
                           width: "100%",
                           background: "#020617",
-                          border: "1px solid #334155",
+                          border: seg.isManualLength ? "1px solid #F59E0B" : "1px solid #334155",
                           color: "#F8FAFC",
                           padding: "4px 6px",
                           borderRadius: 6,

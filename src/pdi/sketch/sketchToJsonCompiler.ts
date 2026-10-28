@@ -251,9 +251,18 @@ export function compileSketchToIsoModel(params: {
             const fromN = nodes.find((n) => n.id === currId);
             const nextN = nodes.find((n) => n.id === nextId);
 
-            const lenM = seg.lengthMm
-              ? seg.lengthMm / 1000
-              : (fromN && nextN ? Math.hypot(nextN.x - fromN.x, nextN.y - fromN.y) / pxPerMeter : 1.0);
+            let lenM = 1.0;
+            if (seg.isManualLength === true) {
+              lenM = seg.lengthMm ? seg.lengthMm / 1000 : 1.0;
+            } else if (seg.isManualLength === false) {
+              lenM = fromN && nextN
+                ? Math.hypot(nextN.x - fromN.x, nextN.y - fromN.y) / pxPerMeter
+                : (seg.lengthMm ? seg.lengthMm / 1000 : 1.0);
+            } else {
+              lenM = seg.lengthMm
+                ? seg.lengthMm / 1000
+                : (fromN && nextN ? Math.hypot(nextN.x - fromN.x, nextN.y - fromN.y) / pxPerMeter : 1.0);
+            }
 
             const ang = seg.angleIsoDeg !== undefined
               ? (isForward ? seg.angleIsoDeg : (seg.angleIsoDeg + 180) % 360)
@@ -412,10 +421,25 @@ export function compileSketchToIsoModel(params: {
     const fromN = nodes.find((n) => n.id === seg.fromNodeId);
     const toN = nodes.find((n) => n.id === seg.toNodeId);
 
-    let computedLength = seg.lengthMm ? seg.lengthMm / 1000 : 0;
-    if (!computedLength && fromN && toN) {
-      const distPx = Math.hypot(toN.x - fromN.x, toN.y - fromN.y);
-      computedLength = Number((distPx / pxPerMeter).toFixed(3));
+    let computedLength = 0;
+    if (seg.isManualLength === true) {
+      computedLength = seg.lengthMm ? seg.lengthMm / 1000 : 0;
+    } else if (seg.isManualLength === false) {
+      if (fromN && toN) {
+        const distPx = Math.hypot(toN.x - fromN.x, toN.y - fromN.y);
+        computedLength = Number((distPx / pxPerMeter).toFixed(3));
+      } else if (seg.lengthMm) {
+        computedLength = seg.lengthMm / 1000;
+      }
+    } else {
+      // Legacy object without isManualLength flag:
+      // Preserve explicit lengthMm if provided, otherwise compute from geometry
+      if (seg.lengthMm !== undefined && seg.lengthMm > 0) {
+        computedLength = seg.lengthMm / 1000;
+      } else if (fromN && toN) {
+        const distPx = Math.hypot(toN.x - fromN.x, toN.y - fromN.y);
+        computedLength = Number((distPx / pxPerMeter).toFixed(3));
+      }
     }
     if (!computedLength || computedLength <= 0) computedLength = 1.0;
 

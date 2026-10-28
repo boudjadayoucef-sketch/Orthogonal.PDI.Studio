@@ -28,6 +28,7 @@ export interface SketchVectorSegment {
   pressureClass: string; // PN / Class (ex: "Class 300")
   material: string;
   lengthMm?: number;
+  isManualLength?: boolean; // true if length was explicitly set/overridden by the user
   angleIsoDeg?: number; // 30, 90, 150, 210, 270, 330
   detectedAxis?: "X" | "Y" | "Z";
 }
@@ -199,3 +200,133 @@ export function applyImageFilters(
 
   ctx.putImageData(imgData, 0, 0);
 }
+
+/**
+ * Calculates the real-world length in millimeters for a segment between two points
+ * given a valid calibration scale in px/mm.
+ * Formula: lengthMm = Math.round(Math.hypot(x2 - x1, y2 - y1) / calibrationScale)
+ * Returns undefined if calibrationScale is non-positive or invalid.
+ */
+export function calculateSegmentLengthMm(
+  n1: { x: number; y: number },
+  n2: { x: number; y: number },
+  calibrationScale: number
+): number | undefined {
+  if (
+    typeof calibrationScale !== "number" ||
+    isNaN(calibrationScale) ||
+    !isFinite(calibrationScale) ||
+    calibrationScale <= 0
+  ) {
+    return undefined;
+  }
+  const distPx = Math.hypot(n2.x - n1.x, n2.y - n1.y);
+  return Math.round(distPx / calibrationScale);
+}
+
+/**
+ * Helper to determine whether a segment length is manual (explicitly edited by user)
+ * or automatic (derived from coordinates).
+ * Defaults to false for legacy objects without isManualLength.
+ */
+export function isSegmentManualLength(seg: SketchVectorSegment): boolean {
+  return seg.isManualLength === true;
+}
+
+/**
+ * Synchronizes segment lengths after one or more nodes are moved.
+ * - Updates automatic segments (isManualLength !== true) connected to moved nodes.
+ * - Preserves manual segments (isManualLength === true).
+ * - Leaves untouched segments that are not connected to any moved node.
+ */
+export function syncSegmentsOnNodeMove(
+  segments: SketchVectorSegment[],
+  nodes: SketchVectorNode[],
+  movedNodeIds: string[] | Set<string>,
+  calibrationScale: number
+): SketchVectorSegment[] {
+  const movedSet = movedNodeIds instanceof Set ? movedNodeIds : new Set(movedNodeIds);
+  if (movedSet.size === 0) return segments;
+
+  const nodeMap = new Map<string, SketchVectorNode>();
+  for (const n of nodes) {
+    nodeMap.set(n.id, n);
+  }
+
+  return segments.map((seg) => {
+    // Only update segments connected to at least one moved node
+    const isConnected = movedSet.has(seg.fromNodeId) || movedSet.has(seg.toNodeId);
+    if (!isConnected) {
+      return seg;
+    }
+
+    // Preserve manual lengths
+    if (seg.isManualLength === true) {
+      return seg;
+    }
+
+    // Automatic segment: recompute length if nodes and scale are valid
+    const n1 = nodeMap.get(seg.fromNodeId);
+    const n2 = nodeMap.get(seg.toNodeId);
+    if (n1 && n2 && calibrationScale > 0) {
+      const newLenMm = calculateSegmentLengthMm(n1, n2, calibrationScale);
+      if (newLenMm !== undefined) {
+        return {
+          ...seg,
+          lengthMm: newLenMm,
+          isManualLength: false
+        };
+      }
+    }
+
+    return seg;
+  });
+}
+
+/**
+ * Synchronizes segment lengths after calibration scale changes.
+ * - Updates all automatic segments (isManualLength !== true).
+ * - Preserves manual segments (isManualLength === true).
+ */
+export function syncSegmentsOnCalibrationChange(
+  segments: SketchVectorSegment[],
+  nodes: SketchVectorNode[],
+  newCalibrationScale: number
+): SketchVectorSegment[] {
+  if (
+    typeof newCalibrationScale !== "number" ||
+    isNaN(newCalibrationScale) ||
+    !isFinite(newCalibrationScale) ||
+    newCalibrationScale <= 0
+  ) {
+    return segments;
+  }
+
+  const nodeMap = new Map<string, SketchVectorNode>();
+  for (const n of nodes) {
+    nodeMap.set(n.id, n);
+  }
+
+  return segments.map((seg) => {
+    // Preserve manual lengths
+    if (seg.isManualLength === true) {
+      return seg;
+    }
+
+    const n1 = nodeMap.get(seg.fromNodeId);
+    const n2 = nodeMap.get(seg.toNodeId);
+    if (n1 && n2) {
+      const newLenMm = calculateSegmentLengthMm(n1, n2, newCalibrationScale);
+      if (newLenMm !== undefined) {
+        return {
+          ...seg,
+          lengthMm: newLenMm,
+          isManualLength: false
+        };
+      }
+    }
+
+    return seg;
+  });
+}
+
