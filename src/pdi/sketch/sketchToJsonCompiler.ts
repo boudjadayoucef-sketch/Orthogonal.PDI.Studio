@@ -23,10 +23,17 @@ import {
   IsoDimension
 } from "../isometric/types/isoGraphTypes";
 
+export interface OcrAnnotation {
+  text: string;
+  valueMm: number;
+  source: "ocr";
+}
+
 export interface CompiledIsoModel {
   version: string;
   generatedAt: string;
   source: "sketch_to_iso_calque";
+  transferId?: string;
   metadata: {
     title: string;
     paperFormat: string;
@@ -35,11 +42,14 @@ export interface CompiledIsoModel {
     totalFittingsCount: number;
     lineReference: string;
     service: string;
+    ocrDimensions?: OcrAnnotation[];
+    warnings?: string[];
   };
   lines: PipingLine[];
   nodes: IsoNode[];
   segments: IsoSegment[];
   dimensions: IsoDimension[];
+  ocrAnnotations?: OcrAnnotation[];
 }
 
 // Convert sketch fitting type to official IsoFittingType
@@ -124,10 +134,7 @@ export function convertCalibrationScaleToPixelsPerMeter(scale: number): number {
   return scale * 1000;
 }
 
-/**
- * Compiles sketch vector data into standard PD&I Iso JSON model.
- */
-export function compileSketchToIsoModel(params: {
+export interface CompileSketchParams {
   nodes: SketchVectorNode[];
   segments: SketchVectorSegment[];
   fittings: SketchVectorFitting[];
@@ -138,7 +145,14 @@ export function compileSketchToIsoModel(params: {
   lineReference?: string;
   service?: string;
   axisMapping?: AxisMappingConfig;
-}): CompiledIsoModel {
+  ocrDimensions?: Array<{ text: string; valueMm: number }>;
+  transferId?: string;
+}
+
+/**
+ * Compiles sketch vector data into standard PD&I Iso JSON model.
+ */
+export function compileSketchToIsoModel(params: CompileSketchParams): CompiledIsoModel {
   const {
     nodes: rawNodes,
     segments: rawSegments,
@@ -149,8 +163,19 @@ export function compileSketchToIsoModel(params: {
     paperFormat = "A4_LANDSCAPE",
     lineReference = "L-SKETCH-01",
     service = "PROC-CHIM",
-    axisMapping = DEFAULT_AXIS_MAPPING
+    axisMapping = DEFAULT_AXIS_MAPPING,
+    ocrDimensions = [],
+    transferId
   } = params;
+
+  // OCR Annotations normalization (provenance strictly preserved without inventing geometry)
+  const ocrAnnotations: OcrAnnotation[] = (ocrDimensions || []).map((dim) => ({
+    text: String(dim.text ?? ""),
+    valueMm: Number(dim.valueMm) || 0,
+    source: "ocr"
+  }));
+
+  const compilerWarnings: string[] = [];
 
   // Defensive sanitization: prune invalid nodes, broken segments, self-loops, and orphan fittings
   const {
@@ -364,8 +389,21 @@ export function compileSketchToIsoModel(params: {
     }
 
     // Check if any fitting or equipment is assigned directly to this node
-    const nodeFitting = fittings.find((f) => f.nodeId === node.id);
+    const matchingFittings = fittings.filter((f) => f.nodeId === node.id);
     const nodeEq = assignedEquipmentMap.get(node.id);
+
+    const hasMultiEquipment = matchingFittings.length > 1 || (matchingFittings.length > 0 && !!nodeEq);
+    if (hasMultiEquipment) {
+      const allLabels = [
+        ...matchingFittings.map((f) => f.label || f.type),
+        ...(nodeEq ? [nodeEq.label || nodeEq.tag || nodeEq.type] : [])
+      ];
+      compilerWarnings.push(
+        `Nœud ${node.id} : multi-équipements associés (${allLabels.join(" + ")}), combinés dans equipmentLabel et notes.`
+      );
+    }
+
+    const primaryFitting = matchingFittings[0];
 
     const coords = nodeCoords3D.get(node.id) || {
       x: Number(((node.x - minX) / pxPerMeter).toFixed(3)),
@@ -373,8 +411,8 @@ export function compileSketchToIsoModel(params: {
       z: Number(((node.elevation || 0) / 1000).toFixed(3))
     };
 
-    let eqType = nodeFitting
-      ? mapSketchFittingTypeToIso(nodeFitting.type)
+    let eqType = primaryFitting
+      ? mapSketchFittingTypeToIso(primaryFitting.type)
       : nodeEq
       ? mapSketchFittingTypeToIso(nodeEq.type)
       : node.equipmentType
@@ -396,12 +434,25 @@ export function compileSketchToIsoModel(params: {
       }
     }
 
-    const eqLabel =
-      nodeFitting?.label ||
-      nodeEq?.label ||
-      nodeEq?.tag ||
-      node.equipmentLabel ||
-      (node.equipmentType ? node.label || node.equipmentType : undefined);
+    let eqLabel: string | undefined;
+    if (hasMultiEquipment) {
+      const allLabels = [
+        ...matchingFittings.map((f) => f.label || f.type),
+        ...(nodeEq ? [nodeEq.label || nodeEq.tag || nodeEq.type] : [])
+      ];
+      eqLabel = allLabels.join(" + ");
+    } else {
+      eqLabel =
+        primaryFitting?.label ||
+        nodeEq?.label ||
+        nodeEq?.tag ||
+        node.equipmentLabel ||
+        (node.equipmentType ? node.label || node.equipmentType : undefined);
+    }
+
+    const multiNotes = hasMultiEquipment
+      ? `Équipements multiples: ${matchingFittings.map((f) => f.label || f.type).join(", ")}${nodeEq ? ` + ${nodeEq.tag || nodeEq.label || nodeEq.type}` : ""}`
+      : undefined;
 
     return {
       id: node.id,
@@ -414,6 +465,7 @@ export function compileSketchToIsoModel(params: {
       equipmentType: eqType,
       equipmentLabel: eqLabel,
       tag: nodeEq?.tag,
+      notes: multiNotes,
       material: defaultLine.material,
       pn: defaultLine.pressureClass,
       lineId: lineId
@@ -499,6 +551,7 @@ export function compileSketchToIsoModel(params: {
     version: "PD&I-ISO-4.8d",
     generatedAt: new Date().toISOString(),
     source: "sketch_to_iso_calque",
+    transferId: params.transferId,
     metadata: {
       title,
       paperFormat,
@@ -507,11 +560,14 @@ export function compileSketchToIsoModel(params: {
       totalFittingsCount:
         fittings.length + (Array.isArray(equipment) ? equipment.length : 0),
       lineReference,
-      service
+      service,
+      ocrDimensions: ocrAnnotations.length > 0 ? ocrAnnotations : undefined,
+      warnings: compilerWarnings.length > 0 ? compilerWarnings : undefined
     },
     lines: [defaultLine],
     nodes: allIsoNodes,
     segments: isoSegments,
-    dimensions
+    dimensions,
+    ocrAnnotations: ocrAnnotations.length > 0 ? ocrAnnotations : undefined
   };
 }

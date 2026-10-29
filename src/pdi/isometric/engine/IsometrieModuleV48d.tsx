@@ -1345,8 +1345,9 @@ function IsometrieModule(props: { projectId?: string }) {
   const [selectedFitting,setSelectedFitting]=useState<{segmentId:string;fittingId:string}|null>(null);
   useEffect(()=>{
     if(!segments.length) return;
-    const legacy=segments.some(s=>s.fittings.length);
-    const migrated=legacy?migrateLegacyFittings(nodes,segments):{nodes,segments,changed:false};
+    const legacy=segments.some(s=>Array.isArray(s.fittings) && s.fittings.length > 0);
+    if (!legacy) return;
+    const migrated=migrateLegacyFittings(nodes,segments);
     const normalized=normalizedGraphPorts(migrated.nodes,migrated.segments);
     if(migrated.changed||normalized.changed){
       historyBusyRef.current=true;

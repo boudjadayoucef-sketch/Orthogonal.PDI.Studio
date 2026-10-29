@@ -241,7 +241,7 @@ export const SketchToIsoModule: React.FC<SketchToIsoModuleProps> = ({
   };
 
   // Compile JSON
-  const handleCompileJson = (): CompiledIsoModel => {
+  const handleCompileJson = (transferId?: string): CompiledIsoModel => {
     const model = compileSketchToIsoModel({
       nodes,
       segments,
@@ -252,7 +252,9 @@ export const SketchToIsoModule: React.FC<SketchToIsoModuleProps> = ({
       paperFormat: format,
       lineReference: projectName,
       service,
-      axisMapping
+      axisMapping,
+      ocrDimensions,
+      transferId
     });
     setCompiledJsonPreview(model);
     return model;
@@ -265,18 +267,24 @@ export const SketchToIsoModule: React.FC<SketchToIsoModuleProps> = ({
       return;
     }
 
-    const model = handleCompileJson();
+    // Identifiant unique et stable généré une seule fois pour cette opération de transfert (SKETCH-ISO-04-FIX-01)
+    const transferId = `xfer_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+
+    const model = handleCompileJson(transferId);
 
     // Auto-save model to local storage & pending injection for the ISO engine
     try {
       const sanitizedName = (projectName || "L-100-PROC-01").replace(/\s+/g, "_");
       const autosaveKey = `isometrie.autosave.${sanitizedName}`;
       const payload = {
+        transferId,
         name: projectName,
         nodes: model.nodes,
         segments: model.segments,
         lines: model.lines,
         dimensions: model.dimensions,
+        ocrAnnotations: model.ocrAnnotations || [],
+        metadata: model.metadata,
         workspace: {
           showDimensions: true,
           showGrid: true,
@@ -295,7 +303,7 @@ export const SketchToIsoModule: React.FC<SketchToIsoModuleProps> = ({
       // 2. Émettre "pdi:active-module-changed" pour alerter tout composant ISO déjà monté
       window.dispatchEvent(
         new CustomEvent("pdi:active-module-changed", {
-          detail: { activeModule: "isometric" }
+          detail: { activeModule: "isometric", transferId }
         })
       );
     } catch (err) {
@@ -317,6 +325,7 @@ export const SketchToIsoModule: React.FC<SketchToIsoModuleProps> = ({
             detail: {
               data: model,
               name: projectName,
+              transferId,
               open3d: true
             }
           })
