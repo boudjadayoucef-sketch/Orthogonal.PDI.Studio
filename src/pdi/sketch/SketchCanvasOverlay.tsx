@@ -15,7 +15,8 @@ import {
   applyImageFilters,
   syncSegmentsOnNodeMove,
   syncSegmentsOnCalibrationChange,
-  applyNodeDragDelta
+  applyNodeDragDelta,
+  pruneSketchGraph
 } from "./sketchRasterEngine";
 import { SketchAxisTriad } from "./SketchAxisTriad";
 import { AxisMappingConfig, DEFAULT_AXIS_MAPPING } from "./sketchAxisConfig";
@@ -721,24 +722,19 @@ export const SketchCanvasOverlay: React.FC<SketchCanvasOverlayProps> = ({
   const deleteSelection = useCallback(() => {
     if (selectedNodeIds.size === 0 && selectedSegmentIds.size === 0) return false;
 
-    const remainingNodes = nodes.filter((n) => !selectedNodeIds.has(n.id));
-    const remainingSegments = segments.filter(
-      (s) =>
-        !selectedSegmentIds.has(s.id) &&
-        !selectedNodeIds.has(s.fromNodeId) &&
-        !selectedNodeIds.has(s.toNodeId)
-    );
-    const remainingNodeIds = new Set(remainingNodes.map((n) => n.id));
-    const remainingSegIds = new Set(remainingSegments.map((s) => s.id));
-    const remainingFittings = fittings.filter(
-      (f) =>
-        (!f.nodeId || remainingNodeIds.has(f.nodeId)) &&
-        (!f.segmentId || remainingSegIds.has(f.segmentId))
-    );
+    const result = pruneSketchGraph(nodes, segments, fittings, {
+      deleteNodeIds: selectedNodeIds,
+      deleteSegmentIds: selectedSegmentIds
+    });
 
-    onNodesChange(remainingNodes);
-    onSegmentsChange(remainingSegments);
-    onFittingsChange(remainingFittings);
+    onNodesChange(result.nodes);
+    onSegmentsChange(result.segments);
+    onFittingsChange(result.fittings);
+
+    if (pipeStartNodeId && !result.nodes.some((n) => n.id === pipeStartNodeId)) {
+      setPipeStartNodeId(null);
+    }
+
     setSelectedNodeIds(new Set());
     setSelectedSegmentIds(new Set());
     return true;
@@ -748,6 +744,7 @@ export const SketchCanvasOverlay: React.FC<SketchCanvasOverlayProps> = ({
     fittings,
     selectedNodeIds,
     selectedSegmentIds,
+    pipeStartNodeId,
     onNodesChange,
     onSegmentsChange,
     onFittingsChange

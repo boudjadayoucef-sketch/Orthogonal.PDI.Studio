@@ -6,7 +6,8 @@ import {
   SketchVectorNode,
   SketchVectorSegment,
   SketchVectorFitting,
-  SketchVectorEquipment
+  SketchVectorEquipment,
+  pruneSketchGraph
 } from "./sketchRasterEngine";
 import {
   isoAngleToAxis,
@@ -139,9 +140,9 @@ export function compileSketchToIsoModel(params: {
   axisMapping?: AxisMappingConfig;
 }): CompiledIsoModel {
   const {
-    nodes,
-    segments,
-    fittings,
+    nodes: rawNodes,
+    segments: rawSegments,
+    fittings: rawFittings,
     equipment = [],
     calibrationScale,
     title = "Ligne Extraite de Croquis",
@@ -150,6 +151,13 @@ export function compileSketchToIsoModel(params: {
     service = "PROC-CHIM",
     axisMapping = DEFAULT_AXIS_MAPPING
   } = params;
+
+  // Defensive sanitization: prune invalid nodes, broken segments, self-loops, and orphan fittings
+  const {
+    nodes,
+    segments,
+    fittings
+  } = pruneSketchGraph(rawNodes || [], rawSegments || [], rawFittings || []);
 
   const scale = calibrationScale > 0 ? calibrationScale : 1;
   const lineId = `line_${Date.now()}`;

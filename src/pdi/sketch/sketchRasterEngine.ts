@@ -357,3 +357,87 @@ export function syncSegmentsOnCalibrationChange(
   });
 }
 
+export interface PruneSketchGraphOptions {
+  deleteNodeIds?: Iterable<string>;
+  deleteSegmentIds?: Iterable<string>;
+  deleteFittingIds?: Iterable<string>;
+}
+
+export interface PrunedSketchGraphResult {
+  nodes: SketchVectorNode[];
+  segments: SketchVectorSegment[];
+  fittings: SketchVectorFitting[];
+}
+
+/**
+ * Pure function that prunes nodes, segments, and fittings from a sketch graph,
+ * enforcing topological and referential consistency:
+ * - Removes nodes targeted in `deleteNodeIds`.
+ * - Removes segments targeted in `deleteSegmentIds`, segments whose `fromNodeId` or `toNodeId`
+ *   are missing from kept nodes, and segments whose endpoints are identical (self-loops).
+ * - Removes fittings targeted in `deleteFittingIds`, fittings whose `nodeId` is missing from kept nodes,
+ *   and fittings whose `segmentId` is missing from kept segments.
+ * - Fittings without nodeId and without segmentId are preserved unless targeted in `deleteFittingIds`.
+ * - Does NOT mutate input arrays or objects.
+ * - Does NOT recalculate lengths or alter properties of preserved items.
+ */
+export function pruneSketchGraph(
+  nodes: readonly SketchVectorNode[],
+  segments: readonly SketchVectorSegment[],
+  fittings: readonly SketchVectorFitting[],
+  options: PruneSketchGraphOptions = {}
+): PrunedSketchGraphResult {
+  const deleteNodeIdsSet = new Set(options.deleteNodeIds || []);
+  const deleteSegmentIdsSet = new Set(options.deleteSegmentIds || []);
+  const deleteFittingIdsSet = new Set(options.deleteFittingIds || []);
+
+  // 1. Filter Nodes
+  const keptNodes: SketchVectorNode[] = [];
+  const keptNodeIds = new Set<string>();
+
+  for (const node of nodes) {
+    if (!deleteNodeIdsSet.has(node.id)) {
+      keptNodes.push(node);
+      keptNodeIds.add(node.id);
+    }
+  }
+
+  // 2. Filter Segments
+  const keptSegments: SketchVectorSegment[] = [];
+  const keptSegmentIds = new Set<string>();
+
+  for (const seg of segments) {
+    if (
+      !deleteSegmentIdsSet.has(seg.id) &&
+      keptNodeIds.has(seg.fromNodeId) &&
+      keptNodeIds.has(seg.toNodeId) &&
+      seg.fromNodeId !== seg.toNodeId
+    ) {
+      keptSegments.push(seg);
+      keptSegmentIds.add(seg.id);
+    }
+  }
+
+  // 3. Filter Fittings
+  const keptFittings: SketchVectorFitting[] = [];
+
+  for (const fit of fittings) {
+    if (deleteFittingIdsSet.has(fit.id)) {
+      continue;
+    }
+    if (fit.nodeId && !keptNodeIds.has(fit.nodeId)) {
+      continue;
+    }
+    if (fit.segmentId && !keptSegmentIds.has(fit.segmentId)) {
+      continue;
+    }
+    keptFittings.push(fit);
+  }
+
+  return {
+    nodes: keptNodes,
+    segments: keptSegments,
+    fittings: keptFittings
+  };
+}
+

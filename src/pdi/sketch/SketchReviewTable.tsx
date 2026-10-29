@@ -6,7 +6,8 @@ import React, { useState } from "react";
 import {
   SketchVectorNode,
   SketchVectorSegment,
-  SketchVectorFitting
+  SketchVectorFitting,
+  pruneSketchGraph
 } from "./sketchRasterEngine";
 import {
   SketchLearningProfile,
@@ -80,7 +81,11 @@ export const SketchReviewTable: React.FC<SketchReviewTableProps> = ({
 
   // Delete segment
   const deleteSegment = (id: string) => {
-    onSegmentsChange(segments.filter((s) => s.id !== id));
+    const result = pruneSketchGraph(nodes, segments, fittings, {
+      deleteSegmentIds: [id],
+    });
+    onSegmentsChange(result.segments);
+    onFittingsChange(result.fittings);
   };
 
   // Update fitting
@@ -92,7 +97,10 @@ export const SketchReviewTable: React.FC<SketchReviewTableProps> = ({
 
   // Delete fitting
   const deleteFitting = (id: string) => {
-    onFittingsChange(fittings.filter((f) => f.id !== id));
+    const result = pruneSketchGraph(nodes, segments, fittings, {
+      deleteFittingIds: [id],
+    });
+    onFittingsChange(result.fittings);
   };
 
   // Update node
@@ -104,9 +112,12 @@ export const SketchReviewTable: React.FC<SketchReviewTableProps> = ({
 
   // Delete node
   const deleteNode = (id: string) => {
-    onNodesChange(nodes.filter((n) => n.id !== id));
-    // Also remove connected segments
-    onSegmentsChange(segments.filter((s) => s.fromNodeId !== id && s.toNodeId !== id));
+    const result = pruneSketchGraph(nodes, segments, fittings, {
+      deleteNodeIds: [id],
+    });
+    onNodesChange(result.nodes);
+    onSegmentsChange(result.segments);
+    onFittingsChange(result.fittings);
   };
 
   // Handle new abbreviation learning
