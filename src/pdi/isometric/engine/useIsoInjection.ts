@@ -88,21 +88,30 @@ export const PDI_ACTIVE_MODULE_KEY = "pdi.activeModule.v1";
 export const EVENT_INJECT_ISO_GRAPH = "pdi:inject-iso-graph";
 export const EVENT_ACTIVE_MODULE_CHANGED = "pdi:active-module-changed";
 
-// Registre des identifiants de transferts déjà traités pour garantir l'idempotence absolue
+// Registre des identifiants de transferts traités (succès validé) et en cours de traitement
 const processedTransferIds = new Set<string>();
+const inProgressTransferIds = new Set<string>();
 
 /**
- * Réinitialise le registre des transferts traités (utilisé principalement pour les tests).
+ * Réinitialise les registres de transferts (utilisé principalement pour les tests).
  */
 export function clearProcessedTransferIds(): void {
   processedTransferIds.clear();
+  inProgressTransferIds.clear();
 }
 
 /**
- * Vérifie si un transfert a déjà été consommé et validé.
+ * Vérifie si un transfert a déjà été consommé et validé avec succès.
  */
 export function isTransferProcessed(transferId: string): boolean {
   return processedTransferIds.has(transferId);
+}
+
+/**
+ * Vérifie si un transfert est actuellement en cours d'exécution (anti-réentrance).
+ */
+export function isTransferInProgress(transferId: string): boolean {
+  return inProgressTransferIds.has(transferId);
 }
 
 /**
@@ -234,36 +243,112 @@ export function prepareInjectedIsoGraph(payload: IsoInjectionPayload): PreparedI
   };
 }
 
+interface StorageReadResult {
+  raw: string | null;
+  payload: IsoInjectionPayload | null;
+  isCorrupt: boolean;
+}
+
+function readAndValidateStorage(storage: Storage | null | undefined): StorageReadResult {
+  if (!storage) {
+    return { raw: null, payload: null, isCorrupt: false };
+  }
+  let raw: string | null = null;
+  try {
+    raw = storage.getItem(PDI_PENDING_INJECTION_KEY);
+  } catch {
+    return { raw: null, payload: null, isCorrupt: false };
+  }
+
+  if (!raw) {
+    return { raw: null, payload: null, isCorrupt: false };
+  }
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      Array.isArray(parsed.nodes) &&
+      parsed.nodes.length > 0
+    ) {
+      return { raw, payload: parsed as IsoInjectionPayload, isCorrupt: false };
+    }
+    return { raw, payload: null, isCorrupt: true };
+  } catch {
+    return { raw, payload: null, isCorrupt: true };
+  }
+}
+
 /**
- * Lit, valide et nettoie immédiatement le storage en attente d'injection.
- * Retourne le payload valide ou `null`.
+ * Lit, valide et nettoie le storage en attente d'injection (Correction B).
+ * - Lecture indépendante de sessionStorage et localStorage.
+ * - Priorité à sessionStorage si les deux contiennent un payload valide.
+ * - Isolation complète des pannes de lecture/JSON/suppression.
+ * - Nettoyage des payloads corrompus sans masquer les payloads valides.
+ * - Retourne le payload valide ou `null`.
  */
 export function consumePendingIsoPayload(): IsoInjectionPayload | null {
   try {
     if (typeof window === "undefined") return null;
 
-    const pendingRaw =
-      window.sessionStorage.getItem(PDI_PENDING_INJECTION_KEY) ||
-      window.localStorage.getItem(PDI_PENDING_INJECTION_KEY);
+    let sessionResult: StorageReadResult = { raw: null, payload: null, isCorrupt: false };
+    let localResult: StorageReadResult = { raw: null, payload: null, isCorrupt: false };
 
-    if (!pendingRaw) return null;
-
-    // Suppression immédiate et synchrone pour garantir l'idempotence au niveau du stockage
+    // 1. Lecture indépendante de sessionStorage
     try {
-      window.sessionStorage.removeItem(PDI_PENDING_INJECTION_KEY);
-      window.localStorage.removeItem(PDI_PENDING_INJECTION_KEY);
-    } catch {}
+      if (window.sessionStorage) {
+        sessionResult = readAndValidateStorage(window.sessionStorage);
+      }
+    } catch {
+      // sessionStorage inaccessible ou désactivé
+    }
 
-    const payload = JSON.parse(pendingRaw);
+    // 2. Lecture indépendante de localStorage
+    try {
+      if (window.localStorage) {
+        localResult = readAndValidateStorage(window.localStorage);
+      }
+    } catch {
+      // localStorage inaccessible ou désactivé
+    }
 
-    // Validation structurelle : doit être un objet non vide contenant au moins 1 nœud
-    if (payload && typeof payload === "object" && Array.isArray(payload.nodes) && payload.nodes.length > 0) {
-      return payload as IsoInjectionPayload;
+    // Purge des entrées corrompues identifiées
+    if (sessionResult.isCorrupt) {
+      try {
+        window.sessionStorage?.removeItem(PDI_PENDING_INJECTION_KEY);
+      } catch {}
+    }
+    if (localResult.isCorrupt) {
+      try {
+        window.localStorage?.removeItem(PDI_PENDING_INJECTION_KEY);
+      } catch {}
+    }
+
+    // 3. Arbitrage avec priorité stricte : sessionStorage > localStorage
+    if (sessionResult.payload) {
+      try {
+        window.sessionStorage?.removeItem(PDI_PENDING_INJECTION_KEY);
+      } catch {}
+      // Si localStorage contenait un résidu, le purger également
+      if (localResult.raw) {
+        try {
+          window.localStorage?.removeItem(PDI_PENDING_INJECTION_KEY);
+        } catch {}
+      }
+      return sessionResult.payload;
+    }
+
+    if (localResult.payload) {
+      try {
+        window.localStorage?.removeItem(PDI_PENDING_INJECTION_KEY);
+      } catch {}
+      return localResult.payload;
     }
 
     return null;
   } catch (err) {
-    console.warn("[useIsoInjection] Error parsing pending ISO payload:", err);
+    console.warn("[useIsoInjection] Error consuming pending ISO payload:", err);
     return null;
   }
 }
@@ -283,16 +368,36 @@ export function useIsoInjection({ onCommit }: UseIsoInjectionOptions): void {
 
       const transferId = payload.transferId;
       if (transferId) {
-        // Déduplication stricte par identifiant stable de transfert
-        if (processedTransferIds.has(transferId)) {
+        // Déduplication stricte et protection anti-réentrance
+        if (processedTransferIds.has(transferId) || inProgressTransferIds.has(transferId)) {
           return;
         }
-        processedTransferIds.add(transferId);
+        inProgressTransferIds.add(transferId);
       }
 
-      // Préparation et normalisation complète du graphe avant tout commit
-      const prepared = prepareInjectedIsoGraph(payload);
-      onCommitRef.current(prepared, sourceName || prepared.name);
+      try {
+        // Préparation et normalisation complète du graphe avant tout commit
+        const prepared = prepareInjectedIsoGraph(payload);
+        if (!prepared.nodes || prepared.nodes.length === 0) {
+          return;
+        }
+
+        // Commit du graphe normalisé vers le consommateur (IsometrieModuleV48d)
+        // Note architecturale : si onCommit lève une exception après mutation partielle de l'état
+        // externe, un rollback transactionnel automatique n'est pas possible au niveau du hook,
+        // mais le transferId reste non-validé et inProgress est purgé dans le `finally` pour permettre
+        // une reprise / réessai.
+        onCommitRef.current(prepared, sourceName || prepared.name);
+
+        // Validation du transfert uniquement après succès réel du commit
+        if (transferId) {
+          processedTransferIds.add(transferId);
+        }
+      } finally {
+        if (transferId) {
+          inProgressTransferIds.delete(transferId);
+        }
+      }
     };
 
     // Canal 1 & Canal 2 (Montage initial)

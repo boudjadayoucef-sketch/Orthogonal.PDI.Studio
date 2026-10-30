@@ -7,7 +7,8 @@ import {
   SketchVectorNode,
   SketchVectorSegment,
   SketchVectorFitting,
-  pruneSketchGraph
+  pruneSketchGraph,
+  resetSegmentToAutoLength
 } from "./sketchRasterEngine";
 import {
   SketchLearningProfile,
@@ -300,9 +301,36 @@ export const SketchReviewTable: React.FC<SketchReviewTableProps> = ({
                         <label style={{ fontSize: 10, color: "#94A3B8" }}>
                           Longueur réelle (mm)
                         </label>
-                        <span style={{ fontSize: 9, fontWeight: 700, color: seg.isManualLength ? "#F59E0B" : "#10B981" }}>
-                          {seg.isManualLength ? "MANUELLE" : "AUTO"}
-                        </span>
+                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          {seg.isManualLength && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const reset = resetSegmentToAutoLength(seg, nodes, calibrationScale);
+                                updateSegment(seg.id, {
+                                  lengthMm: reset.lengthMm,
+                                  isManualLength: false
+                                });
+                              }}
+                              style={{
+                                background: "rgba(16, 185, 129, 0.15)",
+                                border: "1px solid #10B981",
+                                color: "#10B981",
+                                borderRadius: 4,
+                                padding: "1px 5px",
+                                fontSize: 9,
+                                fontWeight: 700,
+                                cursor: "pointer"
+                              }}
+                              title="Réinitialiser la longueur automatique calculée depuis la géométrie"
+                            >
+                              ↺ AUTO
+                            </button>
+                          )}
+                          <span style={{ fontSize: 9, fontWeight: 700, color: seg.isManualLength ? "#F59E0B" : "#10B981" }}>
+                            {seg.isManualLength ? "MANUELLE" : "AUTO"}
+                          </span>
+                        </div>
                       </div>
                       <input
                         type="number"

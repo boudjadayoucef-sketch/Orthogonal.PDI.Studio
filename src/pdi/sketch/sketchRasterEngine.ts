@@ -441,3 +441,153 @@ export function pruneSketchGraph(
   };
 }
 
+/**
+ * Projects a 2D point onto a segment [A, B] bounded by t in [0, 1].
+ * Returns t parameter, projected coordinates on segment, and orthogonal/endpoint distance in pixels.
+ * Handles degenerate segments (A === B) safely without division by zero.
+ */
+export function projectPointOnSegment(
+  p: SketchPoint2D,
+  a: SketchPoint2D,
+  b: SketchPoint2D
+): { t: number; point: SketchPoint2D; distancePx: number } {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const l2 = dx * dx + dy * dy;
+
+  if (l2 === 0) {
+    return {
+      t: 0,
+      point: { x: a.x, y: a.y },
+      distancePx: Math.hypot(p.x - a.x, p.y - a.y)
+    };
+  }
+
+  const rawT = ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2;
+  const t = Math.max(0, Math.min(1, rawT));
+  const qx = a.x + t * dx;
+  const qy = a.y + t * dy;
+
+  return {
+    t,
+    point: { x: qx, y: qy },
+    distancePx: Math.hypot(p.x - qx, p.y - qy)
+  };
+}
+
+export type FittingTargetType = "node" | "segment" | "none";
+
+export interface FittingTargetResolution {
+  targetType: FittingTargetType;
+  nodeId?: string;
+  segmentId?: string;
+  distancePx?: number;
+  projectionPoint?: SketchPoint2D;
+  t?: number;
+}
+
+export interface ResolveFittingPlacementOptions {
+  nodeTolerancePx?: number;
+  segmentTolerancePx?: number;
+}
+
+/**
+ * Resolves the geometric attachment target for a fitting dropped at 2D coordinate `pt`:
+ * Priority 1: Nearest node within `nodeTolerancePx` (default 18px).
+ * Priority 2: Nearest segment via bounded orthogonal projection within `segmentTolerancePx` (default 18px).
+ *             Degenerate segments (same start/end) and segments with missing nodes are skipped safely.
+ * Priority 3: If neither within tolerance, returns { targetType: "none" }.
+ */
+export function resolveFittingPlacementTarget(
+  pt: SketchPoint2D,
+  nodes: readonly SketchVectorNode[],
+  segments: readonly SketchVectorSegment[],
+  options?: ResolveFittingPlacementOptions
+): FittingTargetResolution {
+  const nodeTolerancePx = options?.nodeTolerancePx ?? 18;
+  const segmentTolerancePx = options?.segmentTolerancePx ?? 18;
+
+  // Priority 1: Nearest Node
+  let nearestNode: SketchVectorNode | null = null;
+  let minNodeDist = nodeTolerancePx;
+
+  for (const n of nodes) {
+    const d = Math.hypot(n.x - pt.x, n.y - pt.y);
+    if (d <= minNodeDist) {
+      minNodeDist = d;
+      nearestNode = n;
+    }
+  }
+
+  if (nearestNode) {
+    return {
+      targetType: "node",
+      nodeId: nearestNode.id,
+      distancePx: minNodeDist,
+      projectionPoint: { x: nearestNode.x, y: nearestNode.y }
+    };
+  }
+
+  // Priority 2: Nearest Segment via bounded projection
+  const nodeMap = new Map<string, SketchVectorNode>();
+  for (const n of nodes) {
+    nodeMap.set(n.id, n);
+  }
+
+  let nearestSegment: SketchVectorSegment | null = null;
+  let minSegmentDist = segmentTolerancePx;
+  let bestProj: { t: number; point: SketchPoint2D; distancePx: number } | null = null;
+
+  for (const seg of segments) {
+    const n1 = nodeMap.get(seg.fromNodeId);
+    const n2 = nodeMap.get(seg.toNodeId);
+    // Skip if either endpoint is missing from nodes or endpoints are identical
+    if (!n1 || !n2 || (n1.x === n2.x && n1.y === n2.y)) {
+      continue;
+    }
+
+    const proj = projectPointOnSegment(pt, n1, n2);
+    if (proj.distancePx <= minSegmentDist) {
+      minSegmentDist = proj.distancePx;
+      nearestSegment = seg;
+      bestProj = proj;
+    }
+  }
+
+  if (nearestSegment && bestProj) {
+    return {
+      targetType: "segment",
+      segmentId: nearestSegment.id,
+      distancePx: bestProj.distancePx,
+      projectionPoint: bestProj.point,
+      t: bestProj.t
+    };
+  }
+
+  // Priority 3: Void / None
+  return { targetType: "none" };
+}
+
+/**
+ * Resets a segment from manual length back to automatic calculated length (Correction D).
+ * Sets isManualLength to false and recalculates lengthMm from node coordinates and calibration scale.
+ * If nodes or calibration scale are invalid, lengthMm becomes undefined.
+ */
+export function resetSegmentToAutoLength(
+  seg: SketchVectorSegment,
+  nodes: readonly SketchVectorNode[],
+  calibrationScale: number
+): SketchVectorSegment {
+  const n1 = nodes.find((n) => n.id === seg.fromNodeId);
+  const n2 = nodes.find((n) => n.id === seg.toNodeId);
+  let autoLengthMm: number | undefined = undefined;
+  if (n1 && n2) {
+    autoLengthMm = calculateSegmentLengthMm(n1, n2, calibrationScale);
+  }
+  return {
+    ...seg,
+    lengthMm: autoLengthMm,
+    isManualLength: false
+  };
+}
+

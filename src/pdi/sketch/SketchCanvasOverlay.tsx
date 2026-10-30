@@ -16,7 +16,8 @@ import {
   syncSegmentsOnNodeMove,
   syncSegmentsOnCalibrationChange,
   applyNodeDragDelta,
-  pruneSketchGraph
+  pruneSketchGraph,
+  resolveFittingPlacementTarget
 } from "./sketchRasterEngine";
 import { SketchAxisTriad } from "./SketchAxisTriad";
 import { AxisMappingConfig, DEFAULT_AXIS_MAPPING } from "./sketchAxisConfig";
@@ -848,10 +849,15 @@ export const SketchCanvasOverlay: React.FC<SketchCanvasOverlayProps> = ({
 
     // TOOL: FITTING
     if (activeTool === "fitting") {
-      const clickedNode = findNearestNode(pt);
+      const target = resolveFittingPlacementTarget(pt, nodes, segments);
+      if (target.targetType === "none") {
+        return;
+      }
+
       const newFit: SketchVectorFitting = {
         id: `fit_${Date.now()}`,
-        nodeId: clickedNode?.id,
+        nodeId: target.targetType === "node" ? target.nodeId : undefined,
+        segmentId: target.targetType === "segment" ? target.segmentId : undefined,
         type: selectedFittingType,
         nominalDiameter: 150
       };
