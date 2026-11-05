@@ -540,49 +540,17 @@ export async function loginWithEmailAndPasswordSecure(
   clientInfo?: { userAgent?: string; device?: string }
 ): Promise<{ profile: PdiUserProfile; isSuperAdmin: boolean }> {
   const email = emailInput.trim().toLowerCase();
-  const isSuper = isSuperAdminEmail(email);
 
   if (!email || !passwordInput) {
     throw new Error("Veuillez saisir votre adresse email et votre mot de passe.");
-  }
-
-  // Direct fast-path for designated Super Admin credentials (instant, zero-latency)
-  if (isSuper) {
-    const superProfile: PdiUserProfile = {
-      uid: "superadmin-youcef-boudjada",
-      email: "boudjada.youcef@gmail.com",
-      name: "Youcef Seif Eddine Boudjada",
-      company: "PD&I Vision DZ",
-      role: "super_admin",
-      accountType: "enterprise",
-      subscriptionPlan: "lifetime",
-      status: "active",
-      createdAt: "2026-08-20T00:00:00.000Z",
-      lastLoginAt: new Date().toISOString()
-    };
-
-    // Save profile and log asynchronously in the background so it never blocks UI navigation
-    saveFirebaseProfile(superProfile).catch(() => {});
-    signInWithEmailAndPassword(auth, email, passwordInput).catch(() => {});
-
-    logConnectionToFirebase({
-      userId: superProfile.uid,
-      userEmail: superProfile.email,
-      userName: superProfile.name,
-      userRole: "super_admin",
-      accountType: "enterprise",
-      status: "success",
-      timestamp: new Date().toISOString(),
-      userAgent: clientInfo?.userAgent || (typeof navigator !== "undefined" ? navigator.userAgent : "PDI Desktop/Mobile")
-    }).catch(() => {});
-
-    return { profile: superProfile, isSuperAdmin: true };
   }
 
   try {
     const userCredential = await signInWithEmailAndPassword(auth, email, passwordInput);
     const fbUser = userCredential.user;
     const uid = fbUser.uid;
+    const tokenResult = await fbUser.getIdTokenResult();
+    const isSuperAdminUser = tokenResult.claims.role === "super_admin";
 
     // Regular client user
     let userProfile: PdiUserProfile | null = null;
@@ -651,7 +619,7 @@ export async function loginWithEmailAndPasswordSecure(
       userAgent: clientInfo?.userAgent || navigator.userAgent
     });
 
-    return { profile: updatedProfile, isSuperAdmin: false };
+    return { profile: updatedProfile, isSuperAdmin: isSuperAdminUser || updatedProfile.role === "super_admin" };
   } catch (err: any) {
     if (err.code === "auth/user-not-found" || err.code === "auth/invalid-credential" || err.code === "auth/wrong-password") {
       throw new Error("Identifiants incorrects ou compte inexistant dans Firebase Authentication.");
@@ -790,37 +758,28 @@ export async function loginWithGoogleSecure(): Promise<{ profile: PdiUserProfile
     const result = await signInWithPopup(auth, provider);
     const gUser = result.user;
     const gEmail = gUser.email?.toLowerCase() || "";
-    const isSuper = isSuperAdminEmail(gEmail);
+    const tokenResult = await gUser.getIdTokenResult();
+    const isSuper = tokenResult.claims.role === "super_admin";
 
-    if (isSuper) {
-      const superProfile: PdiUserProfile = {
-        uid: gUser.uid || "superadmin-youcef-boudjada",
-        email: "boudjada.youcef@gmail.com",
-        name: gUser.displayName || "Youcef Seif Eddine Boudjada",
+    // User profile via Google
+    const profiles = await getFirebaseProfiles();
+    let profile = profiles.find((p) => p.email.toLowerCase() === gEmail || p.uid === gUser.uid);
+
+    if (isSuper && !profile) {
+      profile = {
+        uid: gUser.uid,
+        email: gEmail,
+        name: gUser.displayName || "Super Admin",
         company: "PD&I Vision DZ",
         role: "super_admin",
         accountType: "enterprise",
         subscriptionPlan: "lifetime",
         status: "active",
-        createdAt: "2026-08-20T00:00:00.000Z",
+        createdAt: new Date().toISOString(),
         lastLoginAt: new Date().toISOString()
       };
-      await saveFirebaseProfile(superProfile);
-      await logConnectionToFirebase({
-        userId: superProfile.uid,
-        userEmail: superProfile.email,
-        userName: superProfile.name,
-        userRole: "super_admin",
-        accountType: "enterprise",
-        status: "success",
-        timestamp: new Date().toISOString()
-      });
-      return { profile: superProfile, isSuperAdmin: true };
+      await saveFirebaseProfile(profile);
     }
-
-    // Regular user via Google
-    const profiles = await getFirebaseProfiles();
-    let profile = profiles.find((p) => p.email.toLowerCase() === gEmail);
 
     if (!profile) {
       // Must have an active account or activation key
@@ -849,7 +808,7 @@ export async function loginWithGoogleSecure(): Promise<{ profile: PdiUserProfile
       timestamp: new Date().toISOString()
     });
 
-    return { profile, isSuperAdmin: false };
+    return { profile, isSuperAdmin: isSuper || profile.role === "super_admin" };
   } catch (err: any) {
     if (err.code === "auth/popup-closed-by-user") {
       throw new Error("La fenêtre de connexion Google a été fermée.");
@@ -1181,10 +1140,10 @@ const DEFAULT_GATEWAY_CONFIG: PdiPaymentGatewayConfig = {
   slickPayPublicKey: "pub_test_slickpay_pdi_2026_algeria",
   slickPayAccountId: "00799999000123456789", // BaridiMob CCP account number
   slickPayApiUrl: "https://api.slick-pay.com/v1",
-  slickPayWebhookSecret: "whsec_slickpay_baridimob_dz_secret",
+  slickPayWebhookSecret: "", // Server secret, never stored in client bundle
   slickPayEnabled: true,
   paddleVendorId: "pdl_vnd_987654",
-  paddleApiKey: "pdl_api_key_test_international",
+  paddleApiKey: "", // Server secret, never stored in client bundle
   paddleClientToken: "test_token_paddle_pdi_vision",
   paddleSandbox: true,
   paddleEnabled: true

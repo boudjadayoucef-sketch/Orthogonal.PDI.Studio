@@ -11,8 +11,16 @@ import path from "path";
 import fs from "fs";
 import dotenv from "dotenv";
 import { createServer as createViteServer } from "vite";
-import { requireAuth, requireSuperAdmin, AuthRequest } from "./src/middleware/auth.ts";
+import { requireAuth, requireSuperAdmin, requireEmailVerified, AuthRequest } from "./src/middleware/auth.ts";
 import { adminAuth, adminDb } from "./src/lib/firebase-admin.ts";
+import { 
+  createBoundedRateLimiter,
+  verifyPaddleWebhookSignature,
+  verifySlickPayWebhook,
+  globalWebhookIdempotency,
+  verifyProductionConfig,
+  isSuspiciousRequestPath
+} from "./src/security/sec01SecurityService.ts";
 import { 
   getUserProjects, 
   createOrUpdateProject, 
@@ -24,50 +32,52 @@ import { getOrCreateUser } from "./src/db/users.ts";
 
 dotenv.config();
 
+// Validation sûre de la configuration au démarrage (Section D2)
+const configValidation = verifyProductionConfig();
+if (!configValidation.isSafe) {
+  if (process.env.NODE_ENV === "production") {
+    console.error(configValidation.errorMessage);
+    process.exit(1);
+  } else {
+    console.warn("[SECURITY WARN] Development configuration note:", configValidation.errorMessage);
+  }
+}
+
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 // Hardening & Security Middleware ORTHOGONAL - ENG
 app.disable("x-powered-by");
 
-// Whitelist CORS et prévention wildcard en prod
-const ALLOWED_ORIGINS = [
+// Protection Globale contre Path Traversal, Dotfiles et sondes de fichiers sensibles (SEC-01-FIX-02)
+app.use((req, res, next) => {
+  if (isSuspiciousRequestPath(req.originalUrl || req.url)) {
+    return res.status(403).type("text/plain").send("Forbidden: Invalid request path or file probe");
+  }
+  next();
+});
+
+// Configuration explicite Trust Proxy pour Hostinger VPS / Nginx / LiteSpeed (Section E1)
+const trustProxyConfig = process.env.TRUST_PROXY || (process.env.NODE_ENV === "production" ? 1 : false);
+app.set("trust proxy", trustProxyConfig);
+
+// Whitelist CORS dynamique contrôlée via environnement (Section E2)
+const defaultAllowedOrigins = [
   "https://ais-dev-6etwlfzn4irzgw5ljyhzsh-76486687314.europe-west2.run.app",
   "https://ais-pre-6etwlfzn4irzgw5ljyhzsh-76486687314.europe-west2.run.app",
-  "http://localhost:3000"
+  ...(process.env.NODE_ENV !== "production" ? ["http://localhost:3000", "http://127.0.0.1:3000"] : [])
 ];
+const envOrigins = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(",").map((s) => s.trim()).filter(Boolean)
+  : [];
+const ALLOWED_ORIGINS = Array.from(new Set([...defaultAllowedOrigins, ...envOrigins]));
 
-// In-Memory IP Rate Limiter pour protéger les endpoints sensibles
-interface RateLimitRecord {
-  count: number;
-  resetTime: number;
-}
-const ipRequestLimits = new Map<string, RateLimitRecord>();
-const RATE_LIMIT_WINDOW_MS = 60000; // 1 minute
-const MAX_REQUESTS_PER_MINUTE = 100; // Max 100 requêtes/min par IP
-
-const rateLimiter = (req: express.Request, res: express.Response, next: express.NextFunction) => {
-  const ip = req.ip || req.socket.remoteAddress || "unknown_ip";
-  const now = Date.now();
-  const record = ipRequestLimits.get(ip);
-
-  if (!record || now > record.resetTime) {
-    ipRequestLimits.set(ip, {
-      count: 1,
-      resetTime: now + RATE_LIMIT_WINDOW_MS
-    });
-    return next();
-  }
-
-  record.count++;
-  if (record.count > MAX_REQUESTS_PER_MINUTE) {
-    return res.status(429).json({
-      error: "Trop de requêtes. Veuillez patienter une minute avant de réessayer."
-    });
-  }
-
-  next();
-};
+// In-Memory Rate Limiter BORNÉ pour protéger l'API sans fuite mémoire (Section F1)
+const apiRateLimiter = createBoundedRateLimiter({
+  windowMs: 60000, // 1 minute
+  maxRequests: 100, // Max 100 requêtes/min par IP
+  maxEntries: 5000 // Borne supérieure stricte
+});
 
 // Middleware Global de Sécurité (Headers, CORS, CSP, HSTS)
 app.use((req, res, next) => {
@@ -78,7 +88,7 @@ app.use((req, res, next) => {
     res.setHeader("Access-Control-Allow-Credentials", "true");
   }
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,Paddle-Signature,X-SlickPay-Signature,X-Signature");
 
   if (req.method === "OPTIONS") {
     return res.sendStatus(200);
@@ -86,36 +96,51 @@ app.use((req, res, next) => {
 
   // Headers de sécurité
   res.setHeader("X-Content-Type-Options", "nosniff");
-  // En environnement AI Studio / Cloud Run, l'application est hébergée dans une iframe.
-  // X-Frame-Options: SAMEORIGIN bloque le rendu de l'application dans l'interface de build.
-  // On utilise Content-Security-Policy frame-ancestors au lieu de bloquer l'iframe.
   res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
   res.setHeader("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload");
+
+  // Content-Security-Policy durcie : frame-ancestors restreint en production (Section E3)
+  const isProd = process.env.NODE_ENV === "production";
+  const frameAncestors = process.env.CSP_FRAME_ANCESTORS || (isProd ? "'self'" : "*");
   res.setHeader(
     "Content-Security-Policy",
-    "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://apis.google.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: https: blob:; connect-src 'self' https: wss:; frame-src 'self' https://ais-dev-6etwlfzn4irzgw5ljyhzsh-76486687314.europe-west2.run.app https://ais-pre-6etwlfzn4irzgw5ljyhzsh-76486687314.europe-west2.run.app; frame-ancestors *; object-src 'none'"
+    `default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://apis.google.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: https: blob:; connect-src 'self' https: wss:; frame-src 'self' https://ais-dev-6etwlfzn4irzgw5ljyhzsh-76486687314.europe-west2.run.app https://ais-pre-6etwlfzn4irzgw5ljyhzsh-76486687314.europe-west2.run.app; frame-ancestors ${frameAncestors}; object-src 'none'`
   );
   res.setHeader("X-Engine-Vendor", "ORTHOGONAL - ENG");
   res.setHeader("X-Engine-Product", "Piping Design & Isometrics");
   next();
 });
 
-// Appliquer le rate limiter sur toutes les requêtes API
-app.use("/api", rateLimiter);
+// Appliquer le rate limiter borné sur toutes les requêtes API (Section F1)
+app.use("/api", apiRateLimiter.middleware());
 
-app.use(express.json({ limit: "50mb" }));
+// Parser JSON avec conservation du corps brut pour vérification de signature webhook (Section B2)
+interface RequestWithRawBody extends express.Request {
+  rawBody?: string;
+}
+
+app.use(
+  express.json({
+    limit: "50mb",
+    verify: (req: any, _res, buf) => {
+      req.rawBody = buf.toString("utf8");
+    }
+  })
+);
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
-// API health endpoint with software signature
-app.get("/api/health", (_req, res) => {
+// Endpoints santé minimaux (Section E5)
+const handleHealthCheck = (_req: express.Request, res: express.Response) => {
   res.json({
     status: "ok",
     service: "pdi-industrial-cad",
     vendor: "ORTHOGONAL - ENG",
     engineVersion: "4.8d",
-    timestamp: new Date().toISOString(),
+    timestamp: new Date().toISOString()
   });
-});
+};
+app.get("/api/health", handleHealthCheck);
+app.get("/healthz", handleHealthCheck);
 
 // Cloud SQL User Sync & Projects Endpoints
 app.post("/api/auth/sync-user", requireAuth, async (req: AuthRequest, res) => {
@@ -137,12 +162,15 @@ app.post("/api/auth/sync-user", requireAuth, async (req: AuthRequest, res) => {
   }
 });
 
-// Admin: Assign Custom Claims (Role) securely via Firebase Admin SDK
-app.post("/api/admin/set-user-role", requireAuth, requireSuperAdmin, async (req: AuthRequest, res) => {
+// Admin: Assign Custom Claims (Role) securely via Firebase Admin SDK (Section A3)
+app.post("/api/admin/set-user-role", requireAuth, requireSuperAdmin, requireEmailVerified, async (req: AuthRequest, res) => {
   try {
     const { targetUid, role } = req.body;
-    if (!targetUid || !role) {
-      return res.status(400).json({ error: "Paramètres targetUid et role requis." });
+    if (!targetUid || typeof targetUid !== "string" || targetUid.trim().length === 0 || targetUid.length > 128) {
+      return res.status(400).json({ error: "Paramètre targetUid valide requis." });
+    }
+    if (!role || typeof role !== "string") {
+      return res.status(400).json({ error: "Paramètre role requis." });
     }
 
     // Alignment strictly with PdiUserRole ("super_admin" | "admin" | "client" | "guest" | "demo")
@@ -151,8 +179,13 @@ app.post("/api/admin/set-user-role", requireAuth, requireSuperAdmin, async (req:
       return res.status(400).json({ error: `Rôle invalide. Rôles autorisés: ${validRoles.join(", ")}` });
     }
 
+    // Protection anti-escalade / anti-verrouillage : un administrateur ne peut pas rétrograder son propre compte directement
+    if (req.user?.uid === targetUid && role !== "super_admin") {
+      return res.status(400).json({ error: "Un super-administrateur ne peut pas rétrograder son propre compte via cette route." });
+    }
+
     await adminAuth.setCustomUserClaims(targetUid, { role });
-    console.log(`Custom Claim 'role: ${role}' successfully assigned to UID: ${targetUid} by ${req.user?.email}`);
+    console.log(`[Admin] Custom Claim 'role: ${role}' assigned to UID: ${targetUid} by verified super_admin UID: ${req.user?.uid}`);
     
     res.json({ 
       success: true, 
@@ -161,8 +194,8 @@ app.post("/api/admin/set-user-role", requireAuth, requireSuperAdmin, async (req:
       message: "Rôle attribué via Firebase Custom Claim. Un rafraîchissement du token client (getIdToken(true)) est nécessaire pour appliquer le rôle." 
     });
   } catch (err: any) {
-    console.error("Error setting custom user claim:", err);
-    res.status(500).json({ error: err.message || "Échec de l'attribution du rôle utilisateur." });
+    console.error("Error setting custom user claim:", err?.message || err);
+    res.status(500).json({ error: err?.message || "Échec de l'attribution du rôle utilisateur." });
   }
 });
 
@@ -170,93 +203,174 @@ app.post("/api/admin/set-user-role", requireAuth, requireSuperAdmin, async (req:
 // Slick-Pay & Paddle Webhook IPN Endpoints
 // ==========================================
 
-// Slick-Pay Webhook (Algeria - BaridiMob / Edahabia)
-app.post("/api/webhooks/slickpay", async (req, res) => {
+// Slick-Pay Webhook (Algeria - BaridiMob / Edahabia) — Section B3, B4, B5
+app.post("/api/webhooks/slickpay", async (req: RequestWithRawBody, res) => {
   try {
     const payload = req.body;
-    console.log("[Webhook Slick-Pay] Received payload:", JSON.stringify(payload));
-
-    // Expected Slick-Pay event parameters
     const invoiceId = payload?.invoice_id || payload?.id || payload?.order_id || payload?.data?.id;
-    const paymentStatus = payload?.status || payload?.event || payload?.data?.status;
-    const amount = payload?.amount || payload?.data?.amount;
-    const customerEmail = payload?.user?.email || payload?.customer_email || payload?.data?.user?.email;
 
     if (!invoiceId) {
-      return res.status(400).json({ received: true, error: "Missing invoice_id in payload" });
+      return res.status(400).json({ received: false, error: "Missing invoice_id in payload" });
     }
 
-    const isPaid = paymentStatus === "completed" || paymentStatus === "paid" || paymentStatus === "success" || paymentStatus === "COMPLETED";
+    const eventKey = `slickpay_${invoiceId}`;
 
-    // Update or insert transaction record in Firestore
-    const txRef = adminDb.collection("pdi_payment_transactions").doc(String(invoiceId));
-    await txRef.set({
-      id: `TX_SLICKPAY_${invoiceId}`,
-      provider: "slickpay_baridimob",
-      status: isPaid ? "completed" : "pending",
-      amount: Number(amount) || 49000,
-      currency: "DZD",
-      userEmail: customerEmail || "client@pdi-pipeline.dz",
-      updatedAt: new Date().toISOString(),
-      slickPayDetails: {
-        invoiceId: String(invoiceId),
-        rawWebhook: payload,
-      }
-    }, { merge: true });
+    // Anti-Replay: Idempotency guard (Section B4)
+    if (globalWebhookIdempotency.isProcessed(eventKey)) {
+      return res.status(200).json({ received: true, status: "already_processed" });
+    }
+    if (!globalWebhookIdempotency.markInProgress(eventKey)) {
+      return res.status(409).json({ error: "Webhook event currently in progress" });
+    }
 
-    // If payment succeeded, automatically activate subscription for customer
-    if (isPaid && customerEmail) {
-      try {
-        const userRecord = await adminAuth.getUserByEmail(customerEmail);
-        if (userRecord?.uid) {
-          await adminAuth.setCustomUserClaims(userRecord.uid, { role: "client", plan: "pro", activeUntil: new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString() });
-          await adminDb.collection("pdi_user_profiles").doc(userRecord.uid).set({
-            plan: "pro",
-            status: "active",
-            activatedAt: new Date().toISOString(),
-            expiresAt: new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString(),
-            subscriptionProvider: "slickpay"
-          }, { merge: true });
-          console.log(`[Webhook Slick-Pay] Auto-activated Pro subscription for: ${customerEmail}`);
+    try {
+      // Vérification explicite Slick-Pay (Section B3)
+      const verification = verifySlickPayWebhook(
+        payload,
+        req.headers,
+        process.env.SLICKPAY_WEBHOOK_SECRET
+      );
+
+      const paymentStatus = payload?.status || payload?.event || payload?.data?.status;
+      const amount = payload?.amount || payload?.data?.amount;
+      const customerEmail = payload?.user?.email || payload?.customer_email || payload?.data?.user?.email;
+      const isPaid = paymentStatus === "completed" || paymentStatus === "paid" || paymentStatus === "success" || paymentStatus === "COMPLETED";
+
+      // Minimal logging without sensitive payload dump (Section B5)
+      console.log(`[Webhook Slick-Pay] Invoice ${invoiceId} processed (Status: ${paymentStatus}, Verified: ${verification.isAuthentic})`);
+
+      // Update or insert transaction record in Firestore
+      const txRef = adminDb.collection("pdi_payment_transactions").doc(String(invoiceId));
+      await txRef.set({
+        id: `TX_SLICKPAY_${invoiceId}`,
+        provider: "slickpay_baridimob",
+        status: isPaid ? (verification.canAutoActivate ? "completed" : "pending_verification") : "pending",
+        amount: Number(amount) || 49000,
+        currency: "DZD",
+        userEmail: customerEmail ? String(customerEmail).toLowerCase() : "client@pdi-pipeline.dz",
+        updatedAt: new Date().toISOString(),
+        verificationStatus: verification.isAuthentic ? "authentic" : "unverified"
+      }, { merge: true });
+
+      // RÈGLE STRICTE (Section B1 & B3) : JAMAIS d'auto-activation sans authentification vérifiée
+      if (isPaid && customerEmail && verification.canAutoActivate) {
+        try {
+          const userRecord = await adminAuth.getUserByEmail(customerEmail);
+          if (userRecord?.uid) {
+            await adminAuth.setCustomUserClaims(userRecord.uid, {
+              role: "client",
+              plan: "pro",
+              activeUntil: new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString()
+            });
+            await adminDb.collection("pdi_user_profiles").doc(userRecord.uid).set({
+              plan: "pro",
+              status: "active",
+              activatedAt: new Date().toISOString(),
+              expiresAt: new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString(),
+              subscriptionProvider: "slickpay"
+            }, { merge: true });
+            console.log(`[Webhook Slick-Pay] Pro subscription activated for UID: ${userRecord.uid}`);
+          }
+        } catch {
+          console.warn(`[Webhook Slick-Pay] User not registered yet in Auth, saved pending.`);
         }
-      } catch (userErr) {
-        console.warn(`[Webhook Slick-Pay] User ${customerEmail} not registered yet in Auth, saved pending activation.`);
       }
-    }
 
-    return res.status(200).json({ received: true, status: isPaid ? "completed" : "pending" });
+      globalWebhookIdempotency.markCompleted(eventKey);
+      return res.status(200).json({ 
+        received: true, 
+        status: isPaid ? (verification.canAutoActivate ? "completed" : "pending_verification") : "pending" 
+      });
+    } catch (innerErr) {
+      globalWebhookIdempotency.releaseInProgress(eventKey);
+      throw innerErr;
+    }
   } catch (err: any) {
-    console.error("[Webhook Slick-Pay Error]:", err);
+    console.error("[Webhook Slick-Pay Error]:", err?.message || err);
     return res.status(500).json({ error: err?.message || "Webhook processing failed" });
   }
 });
 
-// Paddle Webhook (International EUR/USD)
-app.post("/api/webhooks/paddle", async (req, res) => {
+// Paddle Webhook (International EUR/USD) — Section B2, B4, B5
+app.post("/api/webhooks/paddle", async (req: RequestWithRawBody, res) => {
   try {
+    const rawBody = req.rawBody || JSON.stringify(req.body);
+    const signatureHeader = (req.headers["paddle-signature"] || req.headers["Paddle-Signature"]) as string | undefined;
+    const paddleSecret = process.env.PADDLE_WEBHOOK_SECRET_KEY || process.env.PADDLE_WEBHOOK_SECRET;
+
+    // RÈGLE STRICTE (Section B2) : Vérification officielle de signature Paddle uniquement
+    const sigVerification = verifyPaddleWebhookSignature(rawBody, signatureHeader, paddleSecret);
+
+    if (!sigVerification.isValid) {
+      console.warn(`[Webhook Paddle Rejected] Unauthorized webhook attempt: ${sigVerification.error}`);
+      return res.status(401).json({ error: sigVerification.error || "Invalid Paddle signature" });
+    }
+
     const payload = req.body;
-    console.log("[Webhook Paddle] Received event:", payload?.alert_name || payload?.event_type);
-
     const eventType = payload?.alert_name || payload?.event_type || payload?.type;
-    const checkoutId = payload?.checkout_id || payload?.data?.id || payload?.order_id;
-    const customerEmail = payload?.email || payload?.data?.customer?.email || payload?.data?.user?.email;
+    const checkoutId = payload?.checkout_id || payload?.data?.id || payload?.order_id || payload?.event_id;
 
-    if (checkoutId) {
+    if (!checkoutId) {
+      return res.status(400).json({ error: "Missing event/checkout ID in Paddle webhook" });
+    }
+
+    const eventKey = `paddle_${checkoutId}`;
+
+    // Anti-Replay Idempotency Guard (Section B4)
+    if (globalWebhookIdempotency.isProcessed(eventKey)) {
+      return res.status(200).json({ received: true, status: "already_processed" });
+    }
+    if (!globalWebhookIdempotency.markInProgress(eventKey)) {
+      return res.status(409).json({ error: "Webhook event currently in progress" });
+    }
+
+    try {
+      console.log(`[Webhook Paddle Verified] Processing event: ${eventType} (ID: ${checkoutId})`);
+
+      const customerEmail = payload?.email || payload?.data?.customer?.email || payload?.data?.user?.email;
       const isSuccess = eventType === "payment_succeeded" || eventType === "transaction.completed" || eventType === "subscription_created";
+
       const txRef = adminDb.collection("pdi_payment_transactions").doc(String(checkoutId));
       await txRef.set({
         id: `TX_PADDLE_${checkoutId}`,
         provider: "paddle_international",
         status: isSuccess ? "completed" : "pending",
-        userEmail: customerEmail || "international@client.com",
+        userEmail: customerEmail ? String(customerEmail).toLowerCase() : "international@client.com",
         updatedAt: new Date().toISOString(),
-        rawEvent: payload
+        eventType
       }, { merge: true });
-    }
 
-    return res.status(200).json({ received: true });
+      if (isSuccess && customerEmail) {
+        try {
+          const userRecord = await adminAuth.getUserByEmail(customerEmail);
+          if (userRecord?.uid) {
+            await adminAuth.setCustomUserClaims(userRecord.uid, {
+              role: "client",
+              plan: "pro",
+              activeUntil: new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString()
+            });
+            await adminDb.collection("pdi_user_profiles").doc(userRecord.uid).set({
+              plan: "pro",
+              status: "active",
+              activatedAt: new Date().toISOString(),
+              expiresAt: new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString(),
+              subscriptionProvider: "paddle"
+            }, { merge: true });
+            console.log(`[Webhook Paddle] Pro subscription activated for UID: ${userRecord.uid}`);
+          }
+        } catch {
+          console.warn("[Webhook Paddle] User not found in Auth, saved pending.");
+        }
+      }
+
+      globalWebhookIdempotency.markCompleted(eventKey);
+      return res.status(200).json({ received: true });
+    } catch (innerErr) {
+      globalWebhookIdempotency.releaseInProgress(eventKey);
+      throw innerErr;
+    }
   } catch (err: any) {
-    console.error("[Webhook Paddle Error]:", err);
+    console.error("[Webhook Paddle Error]:", err?.message || err);
     return res.status(500).json({ error: err?.message || "Paddle webhook processing failed" });
   }
 });
@@ -319,18 +433,34 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), "dist");
+
+    // Protection Path Traversal & Dotfiles pour les requêtes statiques (Section E4)
+    app.use((req, res, next) => {
+      if (req.path.includes("..") || req.path.includes("/.") || req.path.startsWith("/.")) {
+        return res.status(403).type("text/plain").send("Forbidden: Invalid path syntax");
+      }
+      next();
+    });
+
     // PATCH 017G : index.html ne doit jamais etre mis en cache, sinon il
     // continue de pointer vers des assets haches qui n existent plus.
     app.use(
       express.static(distPath, {
+        dotfiles: "ignore",
         setHeaders: (res, filePath) => {
           if (filePath.endsWith("index.html")) res.setHeader("Cache-Control", "no-store");
         },
       })
     );
 
-    // PATCH 017G : sonde de diagnostic des assets reellement livres.
+    // PATCH 017G : sonde de diagnostic des assets (Section E6 : minimisée en production)
     app.get("/api/health/assets", (_req, res) => {
+      if (process.env.NODE_ENV === "production" && !process.env.ENABLE_ASSET_DIAGNOSTICS) {
+        return res.json({
+          status: "ok",
+          ready: fs.existsSync(distPath) && fs.existsSync(path.join(distPath, "index.html"))
+        });
+      }
       try {
         const assetsDir = path.join(distPath, "assets");
         const files = fs.existsSync(assetsDir) ? fs.readdirSync(assetsDir) : [];

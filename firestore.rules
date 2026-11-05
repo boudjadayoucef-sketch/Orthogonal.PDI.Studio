@@ -3,22 +3,47 @@ service cloud.firestore {
   match /databases/{database}/documents {
 
     // =========================================================================
-    // FONCTIONS D'AUTORISATION STRICTES
+    // FONCTIONS D'AUTORISATION STRICTES (ZERO-TRUST)
     // =========================================================================
     function isAuthenticated() {
       return request.auth != null;
     }
 
+    function isEmailVerified() {
+      return isAuthenticated() &&
+             ('email_verified' in request.auth.token) &&
+             request.auth.token.email_verified is bool &&
+             request.auth.token.email_verified == true;
+    }
+
     function isSuperAdmin() {
-      return isAuthenticated() && (
-        request.auth.token.role == "super_admin" ||
-        request.auth.token.email == "boudjada.youcef@gmail.com" ||
-        request.auth.token.email == "superadmin@pdi-vision.dz"
-      );
+      return isAuthenticated() &&
+             ('role' in request.auth.token) &&
+             request.auth.token.role is string &&
+             request.auth.token.role == "super_admin" &&
+             ('email_verified' in request.auth.token) &&
+             request.auth.token.email_verified is bool &&
+             request.auth.token.email_verified == true;
     }
 
     function isOwnerByUid(uid) {
       return isAuthenticated() && request.auth.uid == uid;
+    }
+
+    // FR-14 : Validation stricte et unifiée de la propriété d'un document Projet
+    // Rejette formellement toute divergence (ex: { ownerId: "user_a", uid: "user_b" })
+    function isOwnerOfProjectData(data) {
+      let hasOwnerId = 'ownerId' in data;
+      let hasUid = 'uid' in data;
+      return (hasOwnerId || hasUid) &&
+             (!hasOwnerId || data.ownerId == request.auth.uid) &&
+             (!hasUid || data.uid == request.auth.uid) &&
+             (!hasOwnerId || !hasUid || data.ownerId == data.uid);
+    }
+
+    function isProjectOwner(projectId) {
+      return exists(/databases/$(database)/documents/projects/$(projectId)) &&
+             isOwnerOfProjectData(get(/databases/$(database)/documents/projects/$(projectId)).data);
     }
 
     // =========================================================================
@@ -28,138 +53,332 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
-    // 1. PROFILES : Isolation stricte par UID + Immuabilité des rôles par le client
+    // =========================================================================
+    // 1. PROFILES (FR-08 & FR-09)
+    // =========================================================================
+    function isValidProfileCreation(profileId) {
+      let allowedKeys = [
+        'uid', 'email', 'name', 'company', 'country', 'countryCode',
+        'city', 'paymentGateway', 'currency', 'accountType',
+        'subscriptionPlan', 'status', 'createdAt', 'lastLoginAt',
+        'loginCount', 'projectsCount', 'storageUsedKb'
+      ];
+      let data = request.resource.data;
+      return isAuthenticated() &&
+             request.auth.uid == profileId &&
+             data.uid == profileId &&
+             data.keys().hasOnly(allowedKeys) &&
+             !data.keys().hasAny(['role', 'isAdmin', 'isSuperAdmin', 'permissions', 'isActivated', 'admin']) &&
+             (!('status' in data) || data.status == "pending_activation") &&
+             (!('accountType' in data) || data.accountType == "basic") &&
+             (!('subscriptionPlan' in data) || data.subscriptionPlan == "monthly");
+    }
+
+    function isValidProfileUpdate(profileId) {
+      let allowedUpdateKeys = [
+        'name', 'company', 'country', 'countryCode', 'city',
+        'lastLoginAt', 'loginCount', 'projectsCount', 'storageUsedKb',
+        'paymentGateway', 'currency'
+      ];
+      return isAuthenticated() &&
+             request.auth.uid == profileId &&
+             request.resource.data.uid == resource.data.uid &&
+             request.resource.data.diff(resource.data).affectedKeys().hasOnly(allowedUpdateKeys);
+    }
+
     match /profiles/{profileId} {
       allow read: if isAuthenticated() && (request.auth.uid == profileId || isSuperAdmin());
-      allow create: if isAuthenticated() && (
-        (request.auth.uid == profileId && request.resource.data.role != "super_admin" && request.resource.data.role != "admin") ||
-        isSuperAdmin()
-      );
-      allow update: if isAuthenticated() && (
-        (request.auth.uid == profileId && 
-         !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'isSuperAdmin', 'permissions', 'isActivated'])) ||
-        isSuperAdmin()
-      );
+      allow create: if isValidProfileCreation(profileId) || isSuperAdmin();
+      allow update: if isValidProfileUpdate(profileId) || isSuperAdmin();
       allow delete: if isSuperAdmin();
     }
 
-    // 2. AUTH_CREDENTIALS : Totalement inaccessible au client (Server / Superadmin via SDK uniquement)
+    // =========================================================================
+    // 2. AUTH_CREDENTIALS : Totalement inaccessible au client (Server Admin SDK)
+    // =========================================================================
     match /auth_credentials/{credId} {
       allow read, write: if false;
     }
 
-    // 3. PROJECTS & SOUS-COLLECTION ISOMETRICS : Isolation par UID + Immuabilité d'owner
+    // =========================================================================
+    // 3. PROJECTS (FR-10, FR-14) & SOUS-COLLECTION ISOMETRICS (FR-13, FR-16)
+    // =========================================================================
+    function isValidProjectCreation() {
+      let data = request.resource.data;
+      let hasTenantId = 'tenantId' in data;
+      return isAuthenticated() &&
+             request.auth.token.email_verified == true &&
+             isOwnerOfProjectData(data) &&
+             (!hasTenantId || data.tenantId == request.auth.uid ||
+              (('tenantId' in request.auth.token) && data.tenantId == request.auth.token.tenantId));
+    }
+
+    function isValidIsometricCreation(projectId) {
+      let allowedKeys = [
+        'id', 'title', 'projectId', 'drawingNumber', 'linePid',
+        'fluidCode', 'status', 'dataJson', 'createdAt', 'updatedAt'
+      ];
+      let data = request.resource.data;
+      return isAuthenticated() &&
+             isProjectOwner(projectId) &&
+             data.keys().hasOnly(allowedKeys) &&
+             !data.keys().hasAny(['ownerId', 'uid', 'tenantId']) &&
+             data.projectId == projectId &&
+             (data.title is string && data.title.size() > 0 && data.title.size() <= 200) &&
+             (!('status' in data) || data.status in ['draft', 'approved', 'as_built']) &&
+             (!('drawingNumber' in data) || (data.drawingNumber is string && data.drawingNumber.size() <= 100)) &&
+             (!('linePid' in data) || (data.linePid is string && data.linePid.size() <= 100)) &&
+             (!('fluidCode' in data) || (data.fluidCode is string && data.fluidCode.size() <= 50)) &&
+             // Note: dataJson.size() contrôle le nombre de caractères de la chaîne (max 1 000 000 caractères)
+             (!('dataJson' in data) || (data.dataJson is string && data.dataJson.size() <= 1000000)) &&
+             (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 50)) &&
+             (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 50));
+    }
+
+    function isValidIsometricUpdate(projectId) {
+      let allowedUpdateKeys = [
+        'title', 'drawingNumber', 'linePid', 'fluidCode', 'status', 'dataJson', 'updatedAt'
+      ];
+      let diff = request.resource.data.diff(resource.data);
+      let data = request.resource.data;
+      return isAuthenticated() &&
+             isProjectOwner(projectId) &&
+             diff.affectedKeys().hasOnly(allowedUpdateKeys) &&
+             (!diff.affectedKeys().hasAny(['title']) || (data.title is string && data.title.size() > 0 && data.title.size() <= 200)) &&
+             (!diff.affectedKeys().hasAny(['status']) || data.status in ['draft', 'approved', 'as_built']) &&
+             (!diff.affectedKeys().hasAny(['drawingNumber']) || (data.drawingNumber is string && data.drawingNumber.size() <= 100)) &&
+             (!diff.affectedKeys().hasAny(['linePid']) || (data.linePid is string && data.linePid.size() <= 100)) &&
+             (!diff.affectedKeys().hasAny(['fluidCode']) || (data.fluidCode is string && data.fluidCode.size() <= 50)) &&
+             (!diff.affectedKeys().hasAny(['dataJson']) || (data.dataJson is string && data.dataJson.size() <= 1000000)) &&
+             (!diff.affectedKeys().hasAny(['updatedAt']) || (data.updatedAt is string && data.updatedAt.size() <= 50));
+    }
+
     match /projects/{projectId} {
       allow read: if isAuthenticated() && (
-        resource.data.ownerId == request.auth.uid ||
-        resource.data.uid == request.auth.uid ||
+        isOwnerOfProjectData(resource.data) ||
         isSuperAdmin()
       );
-      allow create: if isAuthenticated() && (
-        (request.resource.data.ownerId == request.auth.uid || request.resource.data.uid == request.auth.uid)
-      );
+      // FR-14 : Suppression stricte du contournement Super Admin à la création cliente
+      allow create: if isValidProjectCreation();
+      // FR-14 : Immuabilité de ownerId, uid et tenantId s'appliquant obligatoirement à tous les clients (y compris Super Admin)
       allow update: if isAuthenticated() && (
-        (
-          (resource.data.ownerId == request.auth.uid || resource.data.uid == request.auth.uid) &&
-          (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['ownerId', 'uid']) ||
-           request.resource.data.ownerId == resource.data.ownerId)
-        ) ||
-        isSuperAdmin()
-      );
+        isOwnerOfProjectData(resource.data) || isSuperAdmin()
+      ) &&
+      !request.resource.data.diff(resource.data).affectedKeys().hasAny(['ownerId', 'uid', 'tenantId']);
       allow delete: if isAuthenticated() && (
-        resource.data.ownerId == request.auth.uid ||
-        resource.data.uid == request.auth.uid ||
-        isSuperAdmin()
+        isOwnerOfProjectData(resource.data) || isSuperAdmin()
       );
 
       match /isometrics/{isoId} {
-        allow read, write: if isAuthenticated() && (
-          get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid ||
-          get(/databases/$(database)/documents/projects/$(projectId)).data.uid == request.auth.uid ||
-          isSuperAdmin()
-        );
+        allow read: if isAuthenticated() && (isProjectOwner(projectId) || isSuperAdmin());
+        allow create: if isValidIsometricCreation(projectId);
+        // FR-16 : Suppression stricte du contournement Super Admin à la modification cliente
+        allow update: if isValidIsometricUpdate(projectId);
+        allow delete: if isAuthenticated() && (isProjectOwner(projectId) || isSuperAdmin());
       }
     }
 
-    // 4. PAYMENT_TRANSACTIONS : Interdiction de fabriquer des paiements validés
+    // =========================================================================
+    // 4. TRANSACTIONS FINANCIÈRES : ZERO-TRUST (FR-15 & FR-17)
+    // Aucun client ne peut créer, modifier ou supprimer une transaction.
+    // Les écritures comptables sont réservées exclusivement au backend Firebase Admin SDK.
+    // =========================================================================
     match /payment_transactions/{txId} {
       allow read: if isAuthenticated() && (
         resource.data.userId == request.auth.uid ||
         isSuperAdmin()
       );
-      allow create: if isAuthenticated() && (
-        request.resource.data.userId == request.auth.uid &&
-        request.resource.data.status == "pending"
-      );
-      allow update, delete: if isSuperAdmin();
+      allow create, update, delete: if false;
     }
 
-    // 5. LICENSE_KEYS : Aucun listage global client. Lecture/activation unitaire sécurisée
+    match /pdi_payment_transactions/{txId} {
+      allow read: if isAuthenticated() && (
+        (resource.data.keys().hasAny(['userId']) && resource.data.userId == request.auth.uid) ||
+        (resource.data.keys().hasAny(['userEmail']) && ('email' in request.auth.token) && resource.data.userEmail == request.auth.token.email) ||
+        isSuperAdmin()
+      );
+      allow create, update, delete: if false;
+    }
+
+    // =========================================================================
+    // 5. LICENSE_KEYS : Exclusif Serveur Firebase Admin SDK (Lecture Super Admin)
+    // =========================================================================
     match /license_keys/{keyId} {
-      allow get: if isAuthenticated() && (
-        resource.data.usedBy == request.auth.uid ||
-        resource.data.status == "available" ||
-        isSuperAdmin()
-      );
-      allow list: if isSuperAdmin();
-      allow create, delete: if isSuperAdmin();
-      allow update: if isAuthenticated() && (
-        (resource.data.status == "available" &&
-         request.resource.data.status == "active" &&
-         request.resource.data.usedBy == request.auth.uid) ||
-        isSuperAdmin()
-      );
+      allow read: if isSuperAdmin();
+      allow write: if false;
     }
 
-    // 6. NOTIFICATIONS : Isolation des destinataires et broadcasts
+    // =========================================================================
+    // 6. NOTIFICATIONS : Isolation par destinataire et Super Admin
+    // =========================================================================
     match /notifications/{notifId} {
       allow read: if isAuthenticated() && (
         resource.data.recipientId == request.auth.uid ||
-        resource.data.recipientEmail == request.auth.token.email ||
         resource.data.isBroadcast == true ||
         isSuperAdmin()
       );
       allow create, update, delete: if isSuperAdmin();
     }
 
-    // 7. LOGS & AUDIT (Append-only strict, aucune lecture publique)
+    // =========================================================================
+    // 7. LOGS & AUDIT (FR-18)
+    // =========================================================================
+    function isValidConnectionLogCreation() {
+      let data = request.resource.data;
+      let allowedKeys = [
+        'id', 'userId', 'userEmail', 'userName', 'userRole', 'accountType',
+        'ip', 'userAgent', 'device', 'timestamp', 'status'
+      ];
+      return isAuthenticated() &&
+             data.keys().hasOnly(allowedKeys) &&
+             !data.keys().hasAny(['isServerAudit', 'serverVerified', 'auditVerified', 'serverTimestamp', 'adminCertified']) &&
+             // Identité obligatoire et vérifiée avec le jeton
+             ('userId' in data) && data.userId == request.auth.uid &&
+             ('userEmail' in data) && ('email' in request.auth.token) && data.userEmail == request.auth.token.email &&
+             ('status' in data) && data.status in ['success', 'failed'] &&
+             ('timestamp' in data) && data.timestamp is string && data.timestamp.size() <= 50 &&
+             (!('ip' in data) || (data.ip is string && data.ip.size() <= 64)) &&
+             (!('userName' in data) || (data.userName is string && data.userName.size() <= 100)) &&
+             (!('userRole' in data) || data.userRole == 'client' || (
+               ('role' in request.auth.token) &&
+               request.auth.token.role is string &&
+               request.auth.token.role != '' &&
+               data.userRole == request.auth.token.role
+             )) &&
+             (!('userRole' in data) || (data.userRole is string && data.userRole.size() <= 50)) &&
+             (!('accountType' in data) || data.accountType == 'basic' || (
+               ('accountType' in request.auth.token) &&
+               request.auth.token.accountType is string &&
+               request.auth.token.accountType != '' &&
+               data.accountType == request.auth.token.accountType
+             )) &&
+             (!('accountType' in data) || (data.accountType is string && data.accountType.size() <= 50)) &&
+             (!('userAgent' in data) || (data.userAgent is string && data.userAgent.size() <= 500)) &&
+             (!('device' in data) || (data.device is string && data.device.size() <= 100)) &&
+             (!('id' in data) || (data.id is string && data.id.size() <= 128));
+    }
+
     match /connection_logs/{logId} {
-      allow create: if true;
-      allow read, delete: if isSuperAdmin();
+      allow read: if isSuperAdmin();
       allow update: if false;
+      allow delete: if false;
+      allow create: if isValidConnectionLogCreation();
+    }
+
+    function isValidSubscriberUsageCreation() {
+      let data = request.resource.data;
+      let allowedKeys = [
+        'id', 'userId', 'userEmail', 'action', 'module', 'details', 'timestamp'
+      ];
+      return isAuthenticated() &&
+             isEmailVerified() &&
+             data.keys().hasOnly(allowedKeys) &&
+             !data.keys().hasAny(['billed', 'cost', 'units', 'invoiceId', 'serverVerified', 'auditCertified', 'serverTimestamp']) &&
+             // Identité obligatoire et vérifiée avec le jeton
+             ('userId' in data) && data.userId == request.auth.uid &&
+             ('userEmail' in data) && ('email' in request.auth.token) && data.userEmail == request.auth.token.email &&
+             ('action' in data) && data.action is string && data.action.size() > 0 && data.action.size() <= 128 &&
+             ('module' in data) && data.module is string && data.module.size() > 0 && data.module.size() <= 64 &&
+             ('timestamp' in data) && data.timestamp is string && data.timestamp.size() <= 50 &&
+             (!('details' in data) || (data.details is string && data.details.size() <= 1000)) &&
+             (!('id' in data) || (data.id is string && data.id.size() <= 128));
     }
 
     match /subscriber_usage/{usageId} {
-      allow create: if isAuthenticated() && request.resource.data.userId == request.auth.uid;
-      allow read, delete: if isSuperAdmin();
+      allow read: if isSuperAdmin();
       allow update: if false;
+      allow delete: if false;
+      allow create: if isValidSubscriberUsageCreation();
     }
 
     match /commercial_visits/{visitId} {
-      allow create: if true;
-      allow read, delete: if isSuperAdmin();
-      allow update: if false;
+      allow read, write: if isSuperAdmin();
+    }
+
+    function isValidFeedbackCreation() {
+      let data = request.resource.data;
+      let allowedKeys = [
+        'id', 'userId', 'userEmail', 'userName', 'category', 'rating',
+        'title', 'message', 'status', 'createdAt'
+      ];
+      return isAuthenticated() &&
+             isEmailVerified() &&
+             data.keys().hasOnly(allowedKeys) &&
+             !data.keys().hasAny([
+               'adminNotes',
+               'serverVerified',
+               'isServerAudit',
+               'auditCertified',
+               'serverTimestamp',
+               'adminCertified'
+             ]) &&
+             // Identité obligatoire et vérifiée avec le jeton
+             ('userId' in data) && data.userId == request.auth.uid &&
+             ('userEmail' in data) && ('email' in request.auth.token) && data.userEmail == request.auth.token.email &&
+             ('title' in data) && data.title is string && data.title.size() > 0 && data.title.size() <= 200 &&
+             ('message' in data) && data.message is string && data.message.size() > 0 && data.message.size() <= 4000 &&
+             ('status' in data) && data.status == "new" &&
+             ('category' in data) && data.category is string && data.category.size() <= 64 &&
+             data.category in ['feature_request', 'bug_report', 'general_feedback', 'satisfaction'] &&
+             ('rating' in data) && data.rating is int && data.rating >= 1 && data.rating <= 5 &&
+             (!('userName' in data) || (data.userName is string && data.userName.size() <= 100)) &&
+             (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 50)) &&
+             (!('id' in data) || (data.id is string && data.id.size() <= 128));
+    }
+
+    function isValidFeedbackUpdate() {
+      return isSuperAdmin()
+        && request.resource.data.diff(resource.data)
+          .affectedKeys()
+          .hasOnly(['status', 'adminNotes'])
+        && (
+          !request.resource.data.diff(resource.data)
+            .affectedKeys()
+            .hasAny(['status'])
+          || (
+            request.resource.data.status is string
+            && request.resource.data.status in [
+              'new',
+              'reviewed',
+              'in_progress',
+              'resolved'
+            ]
+          )
+        )
+        && (
+          !request.resource.data.diff(resource.data)
+            .affectedKeys()
+            .hasAny(['adminNotes'])
+          || (
+            request.resource.data.adminNotes is string
+            && request.resource.data.adminNotes.size() <= 2000
+          )
+        );
     }
 
     match /user_feedbacks/{feedId} {
-      allow create: if isAuthenticated();
-      allow read, update, delete: if isSuperAdmin();
+      allow read, delete: if isSuperAdmin();
+      allow update: if isValidFeedbackUpdate();
+      allow create: if isValidFeedbackCreation();
     }
 
     match /feedbacks/{feedId} {
-      allow create: if isAuthenticated();
-      allow read, update, delete: if isSuperAdmin();
+      allow read, delete: if isSuperAdmin();
+      allow update: if isValidFeedbackUpdate();
+      allow create: if isValidFeedbackCreation();
     }
 
     match /password_requests/{reqId} {
-      allow create: if true;
-      allow read, update, delete: if isSuperAdmin();
+      allow read, write: if false;
     }
 
-    // 8. CONFIGURATION & CATALOGUES (Lecture contrôlée, écriture Super-Admin)
+    // =========================================================================
+    // 8. CONFIGURATION & CATALOGUES (FR-11)
+    // =========================================================================
     match /system_config/{configId} {
-      allow read: if true;
-      allow write: if isSuperAdmin();
+      // Les configs sensibles (payment_gateways_v1, secrets) sont strictement interdites en lecture client (même pour Super Admin)
+      allow read: if configId == "country_restrictions_v1" && isAuthenticated();
+      allow write: if isSuperAdmin() && configId == "country_restrictions_v1";
     }
 
     match /plans/{planId} {
@@ -168,20 +387,21 @@ service cloud.firestore {
     }
 
     match /settings/{settingId} {
-      allow read: if true;
+      allow read: if isAuthenticated();
       allow write: if isSuperAdmin();
     }
 
     match /slides/{slideId} {
-      allow read: if true;
+      allow read: if isAuthenticated();
       allow write: if isSuperAdmin();
     }
 
-    // 9. HEALTHCHECK CONNECTION
+    // =========================================================================
+    // 9. HEALTHCHECK CONNECTION (Accès authentifié uniquement)
+    // =========================================================================
     match /test/{docId} {
-      allow read: if true;
+      allow read: if isAuthenticated();
       allow write: if false;
     }
   }
 }
-

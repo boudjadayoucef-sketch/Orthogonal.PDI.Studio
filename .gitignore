@@ -9,6 +9,22 @@ coverage/
 firebase-applet-config.json
 firebase_applet_config.xml
 *.secret.json
+service-account*.json
+*service_account*.json
+credentials.json
+client_secrets.json
+
+# Private keys, certificates, credentials & secrets (SEC-01 Section D3)
+*.pem
+*.key
+*.pkcs12
+*.pfx
+*.p12
+*.crt
+*.cert
+.env.production
+.env.local
+.env.staging
 
 # PD&I patch backups / temporary files
 *.bak
@@ -18,5 +34,3 @@ firebase_applet_config.xml
 *.tmp
 .patch_backups/
 _archive/isometrie_backups/
-# PD&I generated backups / temporary patch files
-# PD&I patch backups

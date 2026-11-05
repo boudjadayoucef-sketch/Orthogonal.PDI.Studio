@@ -237,26 +237,29 @@ async function extractDimensionsWithOcr(
   try {
     const { createWorker } = await import("tesseract.js");
     const worker = await createWorker("eng");
-    await worker.setParameters({
-      tessedit_char_whitelist: "0123456789DNdnMm.- ",
-    });
+    try {
+      await worker.setParameters({
+        tessedit_char_whitelist: "0123456789DNdnMm.- ",
+      });
 
-    const ret = await worker.recognize(canvas);
-    await worker.terminate();
+      const ret = await worker.recognize(canvas);
 
-    const text = ret.data.text;
-    const matches = text.match(/\b\d{2,5}\b/g) || [];
+      const text = ret.data.text;
+      const matches = text.match(/\b\d{2,5}\b/g) || [];
 
-    const seenValues = new Set<number>();
-    for (const m of matches) {
-      const val = parseInt(m, 10);
-      if (val >= 25 && val <= 25000 && !seenValues.has(val)) {
-        seenValues.add(val);
-        ocrResults.push({
-          text: `${val} mm`,
-          valueMm: val,
-        });
+      const seenValues = new Set<number>();
+      for (const m of matches) {
+        const val = parseInt(m, 10);
+        if (val >= 25 && val <= 25000 && !seenValues.has(val)) {
+          seenValues.add(val);
+          ocrResults.push({
+            text: `${val} mm`,
+            valueMm: val,
+          });
+        }
       }
+    } finally {
+      await worker.terminate();
     }
   } catch (err) {
     console.warn("[Tesseract OCR] Analyse OCR ignorée ou non disponible :", err);

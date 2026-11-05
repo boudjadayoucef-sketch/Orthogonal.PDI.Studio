@@ -3,22 +3,33 @@ import { getAuth } from 'firebase-admin/auth';
 import { getFirestore } from 'firebase-admin/firestore';
 
 const metaEnv = (typeof import.meta !== 'undefined' && (import.meta as any)?.env) || {};
-const envProjectId = metaEnv.VITE_FIREBASE_PROJECT_ID || (typeof process !== 'undefined' ? (process.env?.VITE_FIREBASE_PROJECT_ID || process.env?.FIREBASE_PROJECT_ID || process.env?.GCLOUD_PROJECT) : '') || 'graphical-router-x18qq';
+const isProd = typeof process !== 'undefined' && process.env?.NODE_ENV === 'production';
 
-// PATCH 009b — Vercel-safe Firebase config.
-// Ne jamais dépendre d'un JSON local absent du build.
-// Config publique Firebase via variables Vercel VITE_FIREBASE_* ; fallback demo non secret pour build.
+// Preference order:
+// 1. Server env vars (FIREBASE_PROJECT_ID, GOOGLE_CLOUD_PROJECT, GCLOUD_PROJECT)
+// 2. Client env var VITE_FIREBASE_PROJECT_ID
+// 3. Current Cloud Run / Applet Google Cloud project ID ('graphical-router-x18qq')
+const envProjectId =
+  (typeof process !== 'undefined' && (
+    process.env?.FIREBASE_PROJECT_ID ||
+    process.env?.GOOGLE_CLOUD_PROJECT ||
+    process.env?.GCLOUD_PROJECT ||
+    process.env?.VITE_FIREBASE_PROJECT_ID
+  )) ||
+  metaEnv.VITE_FIREBASE_PROJECT_ID ||
+  'graphical-router-x18qq';
+
+// In production, reject explicit demo project placeholders (e.g. 'demo-app-id', 'demo-project')
+if (isProd && envProjectId.startsWith('demo-') && !process.env?.ALLOW_DEMO_PROJECT_IN_PROD) {
+  throw new Error('[FATAL] Production startup error: Cannot use demo project ID in production.');
+}
+
+// Configuration Firebase Admin (SDK Serveur)
 const firebaseConfig = {
-  apiKey: metaEnv.VITE_FIREBASE_API_KEY || 'demo-api-key',
-  authDomain: metaEnv.VITE_FIREBASE_AUTH_DOMAIN || 'graphical-router-x18qq.firebaseapp.com',
   projectId: envProjectId,
-  storageBucket: metaEnv.VITE_FIREBASE_STORAGE_BUCKET || 'graphical-router-x18qq.firebasestorage.app',
-  messagingSenderId: metaEnv.VITE_FIREBASE_MESSAGING_SENDER_ID || '757027531011',
-  appId: metaEnv.VITE_FIREBASE_APP_ID || 'demo-app-id',
 };
 
 if (!getApps().length) {
-  // Read the projectId directly from firebase-applet-config.json
   initializeApp({
     projectId: firebaseConfig.projectId,
   });

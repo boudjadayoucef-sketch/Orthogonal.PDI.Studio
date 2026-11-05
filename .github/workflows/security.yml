@@ -1,0 +1,50 @@
+name: Security Scan & Secret Leak Detection
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  secret-scan:
+    name: Public Repository Secret Scanner
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Run Secret Leak Guard
+        run: |
+          echo "Scanning recent commits for exposed credentials and private keys..."
+          
+          # Check for private keys, AWS tokens, Google API keys, Stripe/Paddle secret tokens
+          LEAKS_FOUND=0
+          
+          PATTERNS=(
+            "-----BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"
+            "AIzaSy[0-9A-Za-z_-]{33}"
+            "sk_live_[0-9a-zA-Z]{24,}"
+            "ghp_[0-9a-zA-Z]{36}"
+            "xox[baprs]-[0-9a-zA-Z]{10,48}"
+            "AKIA[0-9A-Z]{16}"
+          )
+          
+          for PATTERN in "${PATTERNS[@]}"; do
+            MATCHES=$(git grep -E -I -n "$PATTERN" -- ':!*.example' ':!*Security.spec.ts' ':!*.md' ':!src/lib/firebase.ts' ':!dist/**' || true)
+            if [ -n "$MATCHES" ]; then
+              echo "::error::Potential secret leak detected matching pattern: $PATTERN"
+              echo "$MATCHES"
+              LEAKS_FOUND=1
+            fi
+          done
+          
+          if [ $LEAKS_FOUND -ne 0 ]; then
+            echo "Security scan FAILED: Secrets detected in public repository!"
+            exit 1
+          fi
+          
+          echo "Security scan PASSED: No exposed secrets detected."

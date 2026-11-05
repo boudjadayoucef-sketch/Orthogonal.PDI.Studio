@@ -47,28 +47,58 @@ export const requireAuth = async (
 };
 
 /**
+ * Verifies if user has a verified email address on their Firebase ID token.
+ */
+export const isEmailVerified = (user?: DecodedIdToken): boolean => {
+  return user?.email_verified === true;
+};
+
+/**
+ * Middleware: Requires the authenticated user to have a verified email address (email_verified === true).
+ * Mandatory for sensitive administrative and identity operations (Section A2).
+ */
+export const requireEmailVerified = (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+) => {
+  const user = req.user;
+  if (!user) {
+    return res.status(401).json({
+      error: 'Unauthorized: User authentication required',
+      code: 'auth/unauthorized'
+    });
+  }
+
+  if (!isEmailVerified(user)) {
+    return res.status(403).json({
+      error: 'Forbidden: Email verification required for this operation',
+      code: 'auth/unverified-email'
+    });
+  }
+
+  next();
+};
+
+/**
  * Ensures the authenticated user has one of the allowed roles.
- * Order of authority:
- * 1. Custom Claim `role` from verified Firebase ID token (req.user.role)
- * 2. Fallback to historical Super Admin email list ONLY if no custom claim role is set.
+ * Source of Authority: STRICTLY verified Firebase ID Token Custom Claims (`user.role`).
+ * Hardcoded email address authorization is strictly forbidden (SEC-01-FIX-01 Section A1).
  */
 export const requireRole = (allowedRoles: string[]) => {
   return (req: AuthRequest, res: Response, next: NextFunction) => {
     const user = req.user;
     if (!user) {
-      return res.status(401).json({ error: 'Unauthorized: User authentication required' });
+      return res.status(401).json({
+        error: 'Unauthorized: User authentication required',
+        code: 'auth/unauthorized'
+      });
     }
 
-    const email = user.email?.toLowerCase();
-    const isSuperAdminEmail = email === 'boudjada.youcef@gmail.com' || email === 'superadmin@pdi-vision.dz';
-    
-    // 1. Primary Authority: Custom Claim role from verified ID token
-    const customClaimRole = typeof user.role === 'string' ? user.role : undefined;
-    
-    // 2. Fallback: Super admin email compatibility fallback ONLY when custom claim is absent
-    const effectiveRole = customClaimRole || (isSuperAdminEmail ? 'super_admin' : 'client');
+    // Source of Authority: Custom Claim role from verified ID token ONLY
+    const effectiveRole = typeof user.role === 'string' ? user.role : 'client';
 
-    if (allowedRoles.includes(effectiveRole) || (!customClaimRole && isSuperAdminEmail)) {
+    if (allowedRoles.includes(effectiveRole)) {
       return next();
     }
 
@@ -80,4 +110,5 @@ export const requireRole = (allowedRoles: string[]) => {
 };
 
 export const requireSuperAdmin = requireRole(['super_admin']);
+
 
