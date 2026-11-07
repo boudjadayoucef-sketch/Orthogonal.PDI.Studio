@@ -88,8 +88,8 @@ service cloud.firestore {
 
     match /profiles/{profileId} {
       allow read: if isAuthenticated() && (request.auth.uid == profileId || isSuperAdmin());
-      allow create: if isValidProfileCreation(profileId) || isSuperAdmin();
-      allow update: if isValidProfileUpdate(profileId) || isSuperAdmin();
+      allow create: if isValidProfileCreation(profileId);
+      allow update: if isValidProfileUpdate(profileId);
       allow delete: if isSuperAdmin();
     }
 
@@ -230,6 +230,7 @@ service cloud.firestore {
         'ip', 'userAgent', 'device', 'timestamp', 'status'
       ];
       return isAuthenticated() &&
+             isEmailVerified() &&
              data.keys().hasOnly(allowedKeys) &&
              !data.keys().hasAny(['isServerAudit', 'serverVerified', 'auditVerified', 'serverTimestamp', 'adminCertified']) &&
              // Identité obligatoire et vérifiée avec le jeton
@@ -239,14 +240,14 @@ service cloud.firestore {
              ('timestamp' in data) && data.timestamp is string && data.timestamp.size() <= 50 &&
              (!('ip' in data) || (data.ip is string && data.ip.size() <= 64)) &&
              (!('userName' in data) || (data.userName is string && data.userName.size() <= 100)) &&
-             (!('userRole' in data) || data.userRole == 'client' || (
+             (!('userRole' in data) || (
                ('role' in request.auth.token) &&
                request.auth.token.role is string &&
                request.auth.token.role != '' &&
                data.userRole == request.auth.token.role
              )) &&
              (!('userRole' in data) || (data.userRole is string && data.userRole.size() <= 50)) &&
-             (!('accountType' in data) || data.accountType == 'basic' || (
+             (!('accountType' in data) || (
                ('accountType' in request.auth.token) &&
                request.auth.token.accountType is string &&
                request.auth.token.accountType != '' &&
@@ -292,7 +293,8 @@ service cloud.firestore {
     }
 
     match /commercial_visits/{visitId} {
-      allow read, write: if isSuperAdmin();
+      allow read: if isSuperAdmin();
+      allow write: if false;
     }
 
     function isValidFeedbackCreation() {
@@ -357,14 +359,16 @@ service cloud.firestore {
     }
 
     match /user_feedbacks/{feedId} {
-      allow read, delete: if isSuperAdmin();
+      allow read: if isSuperAdmin();
       allow update: if isValidFeedbackUpdate();
+      allow delete: if false;
       allow create: if isValidFeedbackCreation();
     }
 
     match /feedbacks/{feedId} {
-      allow read, delete: if isSuperAdmin();
+      allow read: if isSuperAdmin();
       allow update: if isValidFeedbackUpdate();
+      allow delete: if false;
       allow create: if isValidFeedbackCreation();
     }
 

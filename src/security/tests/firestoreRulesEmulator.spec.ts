@@ -328,7 +328,7 @@ describe("SEC-01-FIX-02A & FIX-01 : Firestore Security Rules Emulator Test Suite
     await assertFails(setDoc(doc(unverifiedAdminDb, "system_config", "country_restrictions_v1"), { countries: ["DZ"] }));
   });
 
-  it("17. Super Admin avec Custom Claim et e-mail vérifié : opérations administratives autorisées", async () => {
+  it("17. Super Admin avec Custom Claim et e-mail vérifié : opérations administratives autorisées mais élévation de rôle et création arbitraire refusées", async () => {
     await testEnv.withSecurityRulesDisabled(async (adminContext) => {
       await setDoc(doc(adminContext.firestore(), "system_config", "country_restrictions_v1"), {
         countries: ["DZ"]
@@ -345,10 +345,29 @@ describe("SEC-01-FIX-02A & FIX-01 : Firestore Security Rules Emulator Test Suite
       email_verified: true
     }).firestore();
 
+    // Lecture administrative autorisée au Super Admin vérifié
     await assertSucceeds(getDoc(doc(verifiedAdminDb, "system_config", "country_restrictions_v1")));
     await assertSucceeds(getDoc(doc(verifiedAdminDb, "profiles", "user_a")));
-    await assertSucceeds(updateDoc(doc(verifiedAdminDb, "profiles", "user_a"), {
+
+    // R1-01 : Refus d'une modification directe de role par un Super Admin client (élévation interdite côté client)
+    await assertFails(updateDoc(doc(verifiedAdminDb, "profiles", "user_a"), {
       role: "admin"
+    }));
+
+    // R1-01 : Refus d'une création arbitraire de profil par un Super Admin client
+    await assertFails(setDoc(doc(verifiedAdminDb, "profiles", "arbitrary_user"), {
+      uid: "arbitrary_user",
+      email: "arb@pdi.dz",
+      role: "super_admin"
+    }));
+
+    // R1-01 : La création normale du profil par son propriétaire continue de réussir
+    const userBDb = testEnv.authenticatedContext("user_b", { email: "user_b@domain.com", email_verified: true }).firestore();
+    await assertSucceeds(setDoc(doc(userBDb, "profiles", "user_b"), {
+      uid: "user_b",
+      email: "user_b@domain.com",
+      name: "User B",
+      status: "pending_activation"
     }));
   });
 
@@ -1083,11 +1102,53 @@ describe("SEC-01-FIX-02A & FIX-01 : Firestore Security Rules Emulator Test Suite
     });
 
     const userADb = testEnv.authenticatedContext("user_a", { email: "user_a@domain.com", email_verified: true }).firestore();
+
+    // 1. drawingNumber trop long (> 100 caractères)
+    await assertFails(setDoc(doc(userADb, "projects", "proj_iso_16", "isometrics", "iso_dn_long"), {
+      id: "iso_dn_long",
+      title: "Iso Test DN Long",
+      projectId: "proj_iso_16",
+      drawingNumber: "D".repeat(105)
+    }));
+
+    // 2. drawingNumber non-string
+    await assertFails(setDoc(doc(userADb, "projects", "proj_iso_16", "isometrics", "iso_dn_nonstring"), {
+      id: "iso_dn_nonstring",
+      title: "Iso Test DN Type",
+      projectId: "proj_iso_16",
+      drawingNumber: 99999 as any
+    }));
+
+    // 3. linePid trop long (> 100 caractères)
+    await assertFails(setDoc(doc(userADb, "projects", "proj_iso_16", "isometrics", "iso_lp_long"), {
+      id: "iso_lp_long",
+      title: "Iso Test LP Long",
+      projectId: "proj_iso_16",
+      linePid: "L".repeat(105)
+    }));
+
+    // 4. linePid non-string
+    await assertFails(setDoc(doc(userADb, "projects", "proj_iso_16", "isometrics", "iso_lp_nonstring"), {
+      id: "iso_lp_nonstring",
+      title: "Iso Test LP Type",
+      projectId: "proj_iso_16",
+      linePid: true as any
+    }));
+
+    // 5. fluidCode invalide (trop long > 50 caractères)
     await assertFails(setDoc(doc(userADb, "projects", "proj_iso_16", "isometrics", "iso_bad_fluid"), {
       id: "iso_bad_fluid",
       title: "Iso Test Fluide",
       projectId: "proj_iso_16",
-      fluidCode: "F".repeat(55) // Limite 50 caractères
+      fluidCode: "F".repeat(55)
+    }));
+
+    // 6. fluidCode non-string
+    await assertFails(setDoc(doc(userADb, "projects", "proj_iso_16", "isometrics", "iso_bad_fluid_type"), {
+      id: "iso_bad_fluid_type",
+      title: "Iso Test Fluide Type",
+      projectId: "proj_iso_16",
+      fluidCode: 12345 as any
     }));
   });
 
@@ -1326,13 +1387,33 @@ describe("SEC-01-FIX-02A & FIX-01 : Firestore Security Rules Emulator Test Suite
     }));
   });
 
-  it("FR-18.9 : Création de connection_log avec timestamp manquant ou trop long : refusée", async () => {
+  it("FR-18.9 : Création de connection_log avec timestamp manquant, trop long ou non-string : refusée", async () => {
     const userADb = testEnv.authenticatedContext("user_a", { email: "user_a@domain.com", email_verified: true }).firestore();
+
+    // 1. timestamp manquant
     await assertFails(setDoc(doc(userADb, "connection_logs", "log_no_timestamp"), {
       id: "log_no_timestamp",
       userId: "user_a",
       userEmail: "user_a@domain.com",
       status: "success"
+    }));
+
+    // 2. timestamp trop long (> 50 caractères)
+    await assertFails(setDoc(doc(userADb, "connection_logs", "log_long_timestamp"), {
+      id: "log_long_timestamp",
+      userId: "user_a",
+      userEmail: "user_a@domain.com",
+      status: "success",
+      timestamp: "2026-11-05T12:00:00.000Z-extra-excessive-timestamp-padding-exceeding-fifty"
+    }));
+
+    // 3. timestamp non-string
+    await assertFails(setDoc(doc(userADb, "connection_logs", "log_numeric_timestamp"), {
+      id: "log_numeric_timestamp",
+      userId: "user_a",
+      userEmail: "user_a@domain.com",
+      status: "success",
+      timestamp: 1730811600000 as any
     }));
   });
 
@@ -1455,12 +1536,26 @@ describe("SEC-01-FIX-02A & FIX-01 : Firestore Security Rules Emulator Test Suite
 
   it("FR-18.18 : Création de feedback avec titre vide ou trop long (>200 chars) : refusée", async () => {
     const userADb = testEnv.authenticatedContext("user_a", { email: "user_a@domain.com", email_verified: true }).firestore();
+
+    // 1. titre vide
     await assertFails(setDoc(doc(userADb, "feedbacks", "feed_empty_title"), {
       id: "feed_empty_title",
       userId: "user_a",
       userEmail: "user_a@domain.com",
       category: "bug_report",
       title: "",
+      message: "Description du bug",
+      rating: 3,
+      status: "new"
+    }));
+
+    // 2. titre trop long (> 200 caractères)
+    await assertFails(setDoc(doc(userADb, "feedbacks", "feed_oversized_title"), {
+      id: "feed_oversized_title",
+      userId: "user_a",
+      userEmail: "user_a@domain.com",
+      category: "bug_report",
+      title: "T".repeat(205),
       message: "Description du bug",
       rating: 3,
       status: "new"
@@ -1708,13 +1803,13 @@ describe("SEC-01-FIX-02A & FIX-01 : Firestore Security Rules Emulator Test Suite
     }));
   });
 
-  it("FR-18.33 : Vérification que les écritures backend Admin SDK restent autorisées via withSecurityRulesDisabled : acceptée", async () => {
+  it("FR-18.33 : Documents sensibles préinsérés par le backend : lecture Super Admin autorisée, lecture client ordinaire refusée, modification et suppression client refusées", async () => {
+    // Préinsertion exclusive sans aucune assertion à l'intérieur du callback
     await testEnv.withSecurityRulesDisabled(async (adminContext) => {
       const adminDb = adminContext.firestore();
 
-      // Écriture d'un journal d'audit serveur certifié dans connection_logs
-      await assertSucceeds(setDoc(doc(adminDb, "connection_logs", "server_certified_audit_log"), {
-        id: "server_certified_audit_log",
+      await setDoc(doc(adminDb, "connection_logs", "srv_cert_log"), {
+        id: "srv_cert_log",
         userId: "user_a",
         userEmail: "user_a@domain.com",
         status: "success",
@@ -1722,11 +1817,10 @@ describe("SEC-01-FIX-02A & FIX-01 : Firestore Security Rules Emulator Test Suite
         serverVerified: true,
         auditVerified: true,
         timestamp: new Date().toISOString()
-      }));
+      });
 
-      // Écriture d'un usage facturé par le backend Admin SDK
-      await assertSucceeds(setDoc(doc(adminDb, "subscriber_usage", "server_billed_usage"), {
-        id: "server_billed_usage",
+      await setDoc(doc(adminDb, "subscriber_usage", "srv_billed_usage"), {
+        id: "srv_billed_usage",
         userId: "user_a",
         userEmail: "user_a@domain.com",
         action: "cloud_pipeline_stress_calculation",
@@ -1735,11 +1829,10 @@ describe("SEC-01-FIX-02A & FIX-01 : Firestore Security Rules Emulator Test Suite
         cost: 25.5,
         invoiceId: "INV-2026-9999",
         timestamp: new Date().toISOString()
-      }));
+      });
 
-      // Mise à jour d'un feedback avec les notes administratives du Super Admin
-      await assertSucceeds(setDoc(doc(adminDb, "feedbacks", "feed_with_server_notes"), {
-        id: "feed_with_server_notes",
+      await setDoc(doc(adminDb, "feedbacks", "srv_admin_feed"), {
+        id: "srv_admin_feed",
         userId: "user_a",
         userEmail: "user_a@domain.com",
         category: "bug_report",
@@ -1748,8 +1841,41 @@ describe("SEC-01-FIX-02A & FIX-01 : Firestore Security Rules Emulator Test Suite
         rating: 5,
         status: "resolved",
         adminNotes: "Bug reproduit et corrigé en version 4.8e"
-      }));
+      });
     });
+
+    const verifiedAdminDb = testEnv.authenticatedContext("admin_verified", {
+      email: "superadmin@pdi.dz",
+      role: "super_admin",
+      email_verified: true
+    }).firestore();
+
+    const userADb = testEnv.authenticatedContext("user_a", {
+      email: "user_a@domain.com",
+      email_verified: true
+    }).firestore();
+
+    // 1. Lecture Super Admin autorisée
+    await assertSucceeds(getDoc(doc(verifiedAdminDb, "connection_logs", "srv_cert_log")));
+    await assertSucceeds(getDoc(doc(verifiedAdminDb, "subscriber_usage", "srv_billed_usage")));
+    await assertSucceeds(getDoc(doc(verifiedAdminDb, "feedbacks", "srv_admin_feed")));
+
+    // 2. Lecture utilisateur standard refusée
+    await assertFails(getDoc(doc(userADb, "connection_logs", "srv_cert_log")));
+    await assertFails(getDoc(doc(userADb, "subscriber_usage", "srv_billed_usage")));
+    await assertFails(getDoc(doc(userADb, "feedbacks", "srv_admin_feed")));
+
+    // 3. Modification cliente refusée
+    await assertFails(updateDoc(doc(userADb, "connection_logs", "srv_cert_log"), { status: "failed" }));
+    await assertFails(updateDoc(doc(userADb, "subscriber_usage", "srv_billed_usage"), { action: "hacked" }));
+
+    // 4. Suppression cliente refusée (y compris Super Admin client)
+    await assertFails(deleteDoc(doc(userADb, "connection_logs", "srv_cert_log")));
+    await assertFails(deleteDoc(doc(userADb, "subscriber_usage", "srv_billed_usage")));
+    await assertFails(deleteDoc(doc(userADb, "feedbacks", "srv_admin_feed")));
+    await assertFails(deleteDoc(doc(verifiedAdminDb, "connection_logs", "srv_cert_log")));
+    await assertFails(deleteDoc(doc(verifiedAdminDb, "subscriber_usage", "srv_billed_usage")));
+    await assertFails(deleteDoc(doc(verifiedAdminDb, "feedbacks", "srv_admin_feed")));
   });
 
   // =========================================================================
@@ -1824,7 +1950,12 @@ describe("SEC-01-FIX-02A & FIX-01 : Firestore Security Rules Emulator Test Suite
   });
 
   it("FR18-R1.04 : journal client avec status: success non considéré comme preuve serveur : acceptée comme déclaration mais rejetée si falsifiée en preuve serveur", async () => {
-    const userADb = testEnv.authenticatedContext("user_a", { email: "user_a@domain.com", email_verified: true }).firestore();
+    const userADb = testEnv.authenticatedContext("user_a", {
+      email: "user_a@domain.com",
+      email_verified: true,
+      role: "client",
+      accountType: "basic"
+    }).firestore();
     
     // Événement déclaratif valide avec status: 'success'
     await assertSucceeds(setDoc(doc(userADb, "connection_logs", "log_r1_declarative_success"), {
@@ -2164,5 +2295,347 @@ describe("SEC-01-FIX-02A & FIX-01 : Firestore Security Rules Emulator Test Suite
     await assertFails(setDoc(doc(userADb, "unknown_audit_collection", "bypass_doc"), {
       dummy: true
     }));
+  });
+
+  it("FR18-R1.18 : connection_logs exige email_verified : absent, false, mauvais type refusés, vérifié accepté", async () => {
+    // 1. email_verified absent -> refusé
+    const userNoEvDb = testEnv.authenticatedContext("user_cl_no_ev", {
+      email: "cl_no_ev@domain.com"
+    }).firestore();
+    await assertFails(setDoc(doc(userNoEvDb, "connection_logs", "log_r1_no_ev"), {
+      id: "log_r1_no_ev",
+      userId: "user_cl_no_ev",
+      userEmail: "cl_no_ev@domain.com",
+      status: "success",
+      timestamp: new Date().toISOString()
+    }));
+
+    // 2. email_verified: false -> refusé
+    const userFalseEvDb = testEnv.authenticatedContext("user_cl_false_ev", {
+      email: "cl_false_ev@domain.com",
+      email_verified: false
+    }).firestore();
+    await assertFails(setDoc(doc(userFalseEvDb, "connection_logs", "log_r1_false_ev"), {
+      id: "log_r1_false_ev",
+      userId: "user_cl_false_ev",
+      userEmail: "cl_false_ev@domain.com",
+      status: "success",
+      timestamp: new Date().toISOString()
+    }));
+
+    // 3. email_verified de mauvais type (ex: string "true") -> refusé
+    const userStrEvDb = testEnv.authenticatedContext("user_cl_str_ev", {
+      email: "cl_str_ev@domain.com",
+      email_verified: "true" as any
+    }).firestore();
+    await assertFails(setDoc(doc(userStrEvDb, "connection_logs", "log_r1_str_ev"), {
+      id: "log_r1_str_ev",
+      userId: "user_cl_str_ev",
+      userEmail: "cl_str_ev@domain.com",
+      status: "success",
+      timestamp: new Date().toISOString()
+    }));
+
+    // 4. email_verified: true -> accepté
+    const userValidEvDb = testEnv.authenticatedContext("user_cl_valid_ev", {
+      email: "cl_valid_ev@domain.com",
+      email_verified: true
+    }).firestore();
+    await assertSucceeds(setDoc(doc(userValidEvDb, "connection_logs", "log_r1_valid_ev"), {
+      id: "log_r1_valid_ev",
+      userId: "user_cl_valid_ev",
+      userEmail: "cl_valid_ev@domain.com",
+      status: "success",
+      timestamp: new Date().toISOString()
+    }));
+  });
+
+  it("FR18-R1.19 : feedbacks et user_feedbacks : refus individuel de modification de title, message, rating, userId, userEmail", async () => {
+    await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+      const db = adminContext.firestore();
+      await setDoc(doc(db, "feedbacks", "feed_r1_immutability"), {
+        id: "feed_r1_immutability",
+        userId: "user_a",
+        userEmail: "user_a@domain.com",
+        category: "bug_report",
+        title: "Titre Original",
+        message: "Message Original",
+        rating: 4,
+        status: "new"
+      });
+      await setDoc(doc(db, "user_feedbacks", "ufeed_r1_immutability"), {
+        id: "ufeed_r1_immutability",
+        userId: "user_a",
+        userEmail: "user_a@domain.com",
+        category: "bug_report",
+        title: "Titre Original UserFeed",
+        message: "Message Original UserFeed",
+        rating: 4,
+        status: "new"
+      });
+    });
+
+    const verifiedAdminDb = testEnv.authenticatedContext("admin_verified", {
+      email: "superadmin@pdi.dz",
+      role: "super_admin",
+      email_verified: true
+    }).firestore();
+
+    for (const coll of ["feedbacks", "user_feedbacks"]) {
+      const docId = coll === "feedbacks" ? "feed_r1_immutability" : "ufeed_r1_immutability";
+
+      // 1. Refus de modification de title
+      await assertFails(updateDoc(doc(verifiedAdminDb, coll, docId), {
+        title: "Titre Falsifié"
+      }));
+
+      // 2. Refus de modification de message
+      await assertFails(updateDoc(doc(verifiedAdminDb, coll, docId), {
+        message: "Message Falsifié"
+      }));
+
+      // 3. Refus de modification de rating
+      await assertFails(updateDoc(doc(verifiedAdminDb, coll, docId), {
+        rating: 1
+      }));
+
+      // 4. Refus de modification de userId
+      await assertFails(updateDoc(doc(verifiedAdminDb, coll, docId), {
+        userId: "autre_user"
+      }));
+
+      // 5. Refus de modification de userEmail
+      await assertFails(updateDoc(doc(verifiedAdminDb, coll, docId), {
+        userEmail: "falsified@domain.com"
+      }));
+    }
+  });
+
+  it("FR18-R1.20 : feedbacks et user_feedbacks : suppression refusée pour utilisateur client et Super Admin client", async () => {
+    await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+      const db = adminContext.firestore();
+      await setDoc(doc(db, "feedbacks", "feed_r1_nodelete"), {
+        id: "feed_r1_nodelete",
+        userId: "user_a",
+        userEmail: "user_a@domain.com",
+        category: "general_feedback",
+        title: "Feedback Test No Delete",
+        message: "Message persistant",
+        rating: 5,
+        status: "new"
+      });
+      await setDoc(doc(db, "user_feedbacks", "ufeed_r1_nodelete"), {
+        id: "ufeed_r1_nodelete",
+        userId: "user_a",
+        userEmail: "user_a@domain.com",
+        category: "general_feedback",
+        title: "User Feedback Test No Delete",
+        message: "Message persistant",
+        rating: 5,
+        status: "new"
+      });
+    });
+
+    const userADb = testEnv.authenticatedContext("user_a", { email: "user_a@domain.com", email_verified: true }).firestore();
+    const verifiedAdminDb = testEnv.authenticatedContext("admin_verified", {
+      email: "superadmin@pdi.dz",
+      role: "super_admin",
+      email_verified: true
+    }).firestore();
+
+    for (const coll of ["feedbacks", "user_feedbacks"]) {
+      const docId = coll === "feedbacks" ? "feed_r1_nodelete" : "ufeed_r1_nodelete";
+
+      // Suppression refusée pour utilisateur standard
+      await assertFails(deleteDoc(doc(userADb, coll, docId)));
+
+      // Suppression refusée pour Super Admin client (allow delete: if false)
+      await assertFails(deleteDoc(doc(verifiedAdminDb, coll, docId)));
+    }
+  });
+
+  it("FR18-R1.21 : commercial_visits : lecture Super Admin autorisée, lecture client refusée, toute écriture/suppression cliente interdite", async () => {
+    await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+      await setDoc(doc(adminContext.firestore(), "commercial_visits", "visit_r1_sample"), {
+        id: "visit_r1_sample",
+        visitorEmail: "prospect@industry.dz",
+        targetModule: "stress_analysis",
+        timestamp: new Date().toISOString()
+      });
+    });
+
+    const verifiedAdminDb = testEnv.authenticatedContext("admin_verified", {
+      email: "superadmin@pdi.dz",
+      role: "super_admin",
+      email_verified: true
+    }).firestore();
+
+    const userADb = testEnv.authenticatedContext("user_a", { email: "user_a@domain.com", email_verified: true }).firestore();
+
+    // 1. Lecture Super Admin autorisée
+    await assertSucceeds(getDoc(doc(verifiedAdminDb, "commercial_visits", "visit_r1_sample")));
+
+    // 2. Lecture utilisateur standard refusée
+    await assertFails(getDoc(doc(userADb, "commercial_visits", "visit_r1_sample")));
+
+    // 3. Création cliente refusée (standard et Super Admin)
+    await assertFails(setDoc(doc(userADb, "commercial_visits", "visit_r1_user_created"), {
+      id: "visit_r1_user_created",
+      visitorEmail: "hacker@evil.com"
+    }));
+    await assertFails(setDoc(doc(verifiedAdminDb, "commercial_visits", "visit_r1_admin_created"), {
+      id: "visit_r1_admin_created",
+      visitorEmail: "admin_client@pdi.dz"
+    }));
+
+    // 4. Modification cliente refusée (standard et Super Admin)
+    await assertFails(updateDoc(doc(userADb, "commercial_visits", "visit_r1_sample"), {
+      targetModule: "tampered"
+    }));
+    await assertFails(updateDoc(doc(verifiedAdminDb, "commercial_visits", "visit_r1_sample"), {
+      targetModule: "tampered"
+    }));
+
+    // 5. Suppression cliente refusée (standard et Super Admin)
+    await assertFails(deleteDoc(doc(userADb, "commercial_visits", "visit_r1_sample")));
+    await assertFails(deleteDoc(doc(verifiedAdminDb, "commercial_visits", "visit_r1_sample")));
+  });
+
+  it("FR18-R1.22 : userRole dans connection_logs : claim absent -> refusé, claim différent -> refusé, claim correspondant -> accepté", async () => {
+    // 1. Champ userRole présent avec claim role absent -> refusé
+    const userNoRoleDb = testEnv.authenticatedContext("user_no_role_ctx", {
+      email: "no_role@domain.com",
+      email_verified: true
+    }).firestore();
+    await assertFails(setDoc(doc(userNoRoleDb, "connection_logs", "log_role_absent_claim"), {
+      id: "log_role_absent_claim",
+      userId: "user_no_role_ctx",
+      userEmail: "no_role@domain.com",
+      userRole: "client",
+      status: "success",
+      timestamp: new Date().toISOString()
+    }));
+
+    // 2. Champ userRole présent avec claim role différent -> refusé
+    const userDiffRoleDb = testEnv.authenticatedContext("user_diff_role_ctx", {
+      email: "diff_role@domain.com",
+      email_verified: true,
+      role: "auditor"
+    }).firestore();
+    await assertFails(setDoc(doc(userDiffRoleDb, "connection_logs", "log_role_diff_claim"), {
+      id: "log_role_diff_claim",
+      userId: "user_diff_role_ctx",
+      userEmail: "diff_role@domain.com",
+      userRole: "client", // "client" != "auditor"
+      status: "success",
+      timestamp: new Date().toISOString()
+    }));
+
+    // 3. Champ userRole présent avec claim role correspondant exactement -> accepté
+    const userMatchRoleDb = testEnv.authenticatedContext("user_match_role_ctx", {
+      email: "match_role@domain.com",
+      email_verified: true,
+      role: "client"
+    }).firestore();
+    await assertSucceeds(setDoc(doc(userMatchRoleDb, "connection_logs", "log_role_match_claim"), {
+      id: "log_role_match_claim",
+      userId: "user_match_role_ctx",
+      userEmail: "match_role@domain.com",
+      userRole: "client",
+      status: "success",
+      timestamp: new Date().toISOString()
+    }));
+  });
+
+  it("FR18-R1.23 : accountType dans connection_logs : claim absent -> refusé, claim différent -> refusé, claim correspondant -> accepté", async () => {
+    // 1. Champ accountType présent avec claim accountType absent -> refusé
+    const userNoAccDb = testEnv.authenticatedContext("user_no_acc_ctx", {
+      email: "no_acc@domain.com",
+      email_verified: true
+    }).firestore();
+    await assertFails(setDoc(doc(userNoAccDb, "connection_logs", "log_acc_absent_claim"), {
+      id: "log_acc_absent_claim",
+      userId: "user_no_acc_ctx",
+      userEmail: "no_acc@domain.com",
+      accountType: "basic",
+      status: "success",
+      timestamp: new Date().toISOString()
+    }));
+
+    // 2. Champ accountType présent avec claim accountType différent -> refusé
+    const userDiffAccDb = testEnv.authenticatedContext("user_diff_acc_ctx", {
+      email: "diff_acc@domain.com",
+      email_verified: true,
+      accountType: "pro"
+    }).firestore();
+    await assertFails(setDoc(doc(userDiffAccDb, "connection_logs", "log_acc_diff_claim"), {
+      id: "log_acc_diff_claim",
+      userId: "user_diff_acc_ctx",
+      userEmail: "diff_acc@domain.com",
+      accountType: "basic", // "basic" != "pro"
+      status: "success",
+      timestamp: new Date().toISOString()
+    }));
+
+    // 3. Champ accountType présent avec claim accountType correspondant exactement -> accepté
+    const userMatchAccDb = testEnv.authenticatedContext("user_match_acc_ctx", {
+      email: "match_acc@domain.com",
+      email_verified: true,
+      accountType: "basic"
+    }).firestore();
+    await assertSucceeds(setDoc(doc(userMatchAccDb, "connection_logs", "log_acc_match_claim"), {
+      id: "log_acc_match_claim",
+      userId: "user_match_acc_ctx",
+      userEmail: "match_acc@domain.com",
+      accountType: "basic",
+      status: "success",
+      timestamp: new Date().toISOString()
+    }));
+  });
+
+  it("R1-01 : Test isolé — Super Admin interdit de créer le profil d'un autre utilisateur, même avec des champs par ailleurs autorisés", async () => {
+    const verifiedAdminDb = testEnv.authenticatedContext("admin_verified", {
+      email: "superadmin@pdi.dz",
+      role: "super_admin",
+      email_verified: true
+    }).firestore();
+
+    const targetUserDb = testEnv.authenticatedContext("user_target", {
+      email: "user_target@domain.com",
+      email_verified: true
+    }).firestore();
+
+    const profileData = {
+      uid: "user_target",
+      email: "user_target@domain.com",
+      name: "Utilisateur Cible",
+      company: "Orthogonal Test SARL",
+      country: "Algeria",
+      countryCode: "DZ",
+      city: "Algiers",
+      paymentGateway: "slickpay",
+      currency: "DZD",
+      accountType: "basic",
+      subscriptionPlan: "monthly",
+      status: "pending_activation",
+      createdAt: new Date().toISOString(),
+      lastLoginAt: new Date().toISOString(),
+      loginCount: 1,
+      projectsCount: 0,
+      storageUsedKb: 0
+    };
+
+    // 1. Contre-épreuve d'intégrité : le propriétaire "user_target" crée exactement ce profil avec succès.
+    // Cela prouve à 100% que TOUS les champs et valeurs respectent isValidProfileCreation.
+    await assertSucceeds(setDoc(doc(targetUserDb, "profiles", "user_target"), profileData));
+
+    // Réinitialisation du document pour isoler le test d'attaque Super Admin
+    await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+      await deleteDoc(doc(adminContext.firestore(), "profiles", "user_target"));
+    });
+
+    // 2. Le Super Admin tente de créer exactement ce même profil valide pour "user_target".
+    // La SEULE raison de l'échec est la divergence request.auth.uid ("admin_verified") != profileId ("user_target").
+    await assertFails(setDoc(doc(verifiedAdminDb, "profiles", "user_target"), profileData));
   });
 });
