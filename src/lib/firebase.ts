@@ -758,27 +758,21 @@ export async function loginWithGoogleSecure(): Promise<{ profile: PdiUserProfile
     const result = await signInWithPopup(auth, provider);
     const gUser = result.user;
     const gEmail = gUser.email?.toLowerCase() || "";
-    const tokenResult = await gUser.getIdTokenResult();
+    const tokenResult = await gUser.getIdTokenResult(true);
     const isSuper = tokenResult.claims.role === "super_admin";
 
-    // User profile via Google
-    const profiles = await getFirebaseProfiles();
-    let profile = profiles.find((p) => p.email.toLowerCase() === gEmail || p.uid === gUser.uid);
-
-    if (isSuper && !profile) {
-      profile = {
-        uid: gUser.uid,
-        email: gEmail,
-        name: gUser.displayName || "Super Admin",
-        company: "PD&I Vision DZ",
-        role: "super_admin",
-        accountType: "enterprise",
-        subscriptionPlan: "lifetime",
-        status: "active",
-        createdAt: new Date().toISOString(),
-        lastLoginAt: new Date().toISOString()
-      };
-      await saveFirebaseProfile(profile);
+    // Direct profile retrieval by UID adhering to Firestore security rules
+    let profile: PdiUserProfile | null = null;
+    try {
+      const profileSnap = await getDoc(doc(db, "profiles", gUser.uid));
+      if (profileSnap.exists()) {
+        profile = {
+          ...profileSnap.data(),
+          uid: gUser.uid
+        } as PdiUserProfile;
+      }
+    } catch (e) {
+      console.warn("Direct profile read fallback:", e);
     }
 
     if (!profile) {

@@ -29,11 +29,22 @@ const firebaseConfig = {
   projectId: envProjectId,
 };
 
-if (!getApps().length) {
-  initializeApp({
-    projectId: firebaseConfig.projectId,
+const app = !getApps().length
+  ? initializeApp({
+      projectId: firebaseConfig.projectId,
+    })
+  : getApps()[0];
+
+export const adminApp = app;
+export const adminAuth = getAuth(app);
+export const adminDb = getFirestore(app);
+
+// Exposer l'application Admin réelle sur adminDb pour permettre la vérification du projet
+if (!(adminDb as any).app) {
+  Object.defineProperty(adminDb, 'app', {
+    value: app,
+    writable: false,
+    enumerable: true
   });
 }
 
-export const adminAuth = getAuth();
-export const adminDb = getFirestore();
