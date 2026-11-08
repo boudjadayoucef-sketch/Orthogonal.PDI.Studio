@@ -1,21 +1,24 @@
 /**
- * ORTHOGONAL PD&I STUDIO — SEC-01 / AUTH-ADMIN-05-FIX-07
+ * ORTHOGONAL PD&I STUDIO — SEC-01 / AUTH-ADMIN-05-FIX-08
  * Script de Bootstrap Super Admin sécurisé (Firebase Admin SDK).
  * 
  * Ce script est autonome, idempotent et strictement sécurisé :
  * - Cible exclusivement le projet Firebase 'graphical-router-x18qq' via adminAuth.app.options.projectId et getFirestoreProjectId(db).
  * - Autorise exclusivement l'adresse 'boudjada.youcef@gmail.com'.
  * - Contrôle le compte : existence, activation stricte (disabled === false), vérification email (emailVerified === true), fournisseur 'google.com'.
+ * - FIX-08-A : Suppression totale des valeurs sensibles, dates, timestamps et données brutes dans compareClaimsStructural et deepCompareFirestoreData.
+ * - FIX-08-B : Remplacement strict de l'opérateur 'in' par Object.prototype.hasOwnProperty.call() pour n'évaluer que les propriétés propres.
+ * - FIX-08-C : Détection exacte de isDangerousKey sans rejeter les propriétés légitimes cibles (constructorName, prototypeVersion),
+ *   safeDefineProperty sécurisée avec Object.defineProperty, préservation des propriétés propres cibles (y compris constructor et __proto__ en données propres).
+ * - FIX-08-D : Retrait d'email et uid de BootstrapReport et des logs de sortie (traitement mémoire interne préservé).
  * - FIX-07-A : Échec ambigu de l'écriture Firestore : encadrement spécifique, relecture diagnostique, comparaison intégrale,
  *   signalement partialState: true, refus de retry automatique, interdiction stricte de poursuivre vers les Custom Claims.
  * - FIX-07-B & FIX-07-G : Vérification structurelle récursive des Custom Claims (compareClaimsStructural) : indépendante de l'ordre JSON,
- *   détection des clés manquantes, valeurs différentes et clés supplémentaires inattendues. Préservation de tous les claims existants.
+ *   détection des clés manquantes, types différents et clés supplémentaires inattendues. Préservation de tous les claims existants.
  * - FIX-07-C : Exclusion absolue des champs d'autorisation historiques (role, roles, admin, isAdmin, isSuperAdmin, permissions,
  *   customClaims, accessLevel, privileges, authorization, authorizations, securityRole, adminRole) à tous les niveaux.
  * - FIX-07-D : Validation stricte du compte désactivé (userRecord.disabled === false impératif, fail-closed).
- * - FIX-07-E : Réduction des données exposées dans les rapports : finalProfileToSave retiré du rapport, conflits sans valeurs brutes
- *   (uniquement field, valuesDiffer, conflictCategory), claim keys sans valeurs brutes.
- * - FIX-07-F : Protection contre la pollution de prototype (__proto__, constructor, prototype) via safeDefineProperty et createSafePlainObject.
+ * - FIX-07-E : Réduction des données exposées dans les rapports : finalProfileToSave retiré du rapport, conflits sans valeurs brutes.
  * - FIX-06 B1 : Extraction temporelle stricte avec fuseau obligatoire, calendrier réel, fraction 1..9 chiffres max, décalages UTC validés.
  * - FIX-06 B2 : Filtrage récursif des données commerciales dans les tableaux historiques imbriqués (filterHistoricalValue).
  * - FIX-06 B3 : Validation stricte et croisée du projet Firestore (getFirestoreProjectId) et du projet Auth avant toute lecture.
@@ -31,19 +34,20 @@ export const ALLOWED_SUPER_ADMIN_EMAIL = 'boudjada.youcef@gmail.com';
 export const HISTORICAL_PROFILE_DOC_ID = 'superadmin-youcef-boudjada';
 
 /**
- * FIX-07-F — Clés interdites pour prévenir la pollution de prototype.
+ * FIX-08-C — Liste exacte des clés dangereuses pour prévenir la pollution de prototype.
  */
-export const DANGEROUS_OBJECT_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+export const DANGEROUS_OBJECT_KEYS = new Set([
+  '__proto__',
+  'constructor',
+  'prototype'
+]);
 
+/**
+ * FIX-08-C — Détection exacte des clés interdites d'importation historique.
+ */
 export function isDangerousKey(key: string): boolean {
   if (typeof key !== 'string') return true;
-  const lower = key.trim().toLowerCase();
-  return (
-    DANGEROUS_OBJECT_KEYS.has(lower) ||
-    lower.startsWith('__proto__') ||
-    lower.startsWith('constructor') ||
-    lower.startsWith('prototype')
-  );
+  return DANGEROUS_OBJECT_KEYS.has(key);
 }
 
 /**
@@ -54,10 +58,15 @@ export function createSafePlainObject(): Record<string, any> {
 }
 
 /**
- * FIX-07-F — Affectation sécurisée sans déclencher de setter prototype.
+ * FIX-08-C — Affectation sécurisée sans déclencher de setter prototype.
  */
-export function safeDefineProperty(target: Record<string, any>, key: string, value: any): void {
-  if (isDangerousKey(key)) return;
+export function safeDefineProperty(
+  target: Record<string, any>,
+  key: string,
+  value: any
+): void {
+  if (typeof key !== 'string') return;
+
   Object.defineProperty(target, key, {
     value,
     writable: true,
@@ -239,14 +248,12 @@ export interface ConflictSummary {
 }
 
 /**
- * FIX-07-E — Rapport de bootstrap assaini, sans données personnelles ni commerciales brutes.
+ * FIX-08-D — Rapport de bootstrap assaini, sans email ni uid ni données sensibles.
  */
 export interface BootstrapReport {
   mode: 'dry-run' | 'execute';
   timestamp: string;
   projectId: string;
-  email: string;
-  uid?: string;
   emailVerified?: boolean;
   disabled?: boolean;
   hasGoogleProvider?: boolean;
@@ -433,13 +440,11 @@ export function isPlainObject(item: any): item is Record<string, any> {
 }
 
 /**
- * FIX-07-B & FIX-07-G — Comparaison structurelle récursive des Custom Claims :
- * - Mêmes clés.
- * - Mêmes valeurs scalaires et types stricts.
- * - Mêmes tableaux et positions d'éléments.
- * - Indépendante de l'ordre des propriétés JSON des objets.
- * - Détection obligatoire des clés manquantes et des clés supplémentaires non autorisées.
- * - Distinction stricte entre null, undefined, booléen, nombre et chaîne.
+ * FIX-08-A & FIX-08-B — Comparaison structurelle récursive des Custom Claims :
+ * - Aucune valeur sensible brute dans les messages de diagnostic.
+ * - Utilisation stricte de Object.prototype.hasOwnProperty.call() pour ignorer les propriétés de prototype.
+ * - Mêmes clés propres, mêmes types et valeurs, positions de tableau ordonnées.
+ * - Indépendante de l'ordre d'énumération des clés d'objets.
  */
 export function compareClaimsStructural(expected: any, actual: any, path = ''): string[] {
   const diffs: string[] = [];
@@ -452,9 +457,7 @@ export function compareClaimsStructural(expected: any, actual: any, path = ''): 
   const isActNullOrUndef = actual === null || actual === undefined;
   if (isExpNullOrUndef || isActNullOrUndef) {
     if (expected !== actual) {
-      const expDesc = expected === undefined ? 'absent/undefined' : JSON.stringify(expected);
-      const actDesc = actual === undefined ? 'absent/undefined' : JSON.stringify(actual);
-      diffs.push(`Claim '${path || 'root'}' non conforme (attendu: ${expDesc}, obtenu: ${actDesc})`);
+      diffs.push(`Claim non conforme au chemin '${path || 'root'}' : valeur absente ou différente.`);
     }
     return diffs;
   }
@@ -462,7 +465,7 @@ export function compareClaimsStructural(expected: any, actual: any, path = ''): 
   const expType = typeof expected;
   const actType = typeof actual;
   if (expType !== actType) {
-    diffs.push(`Type de claim non conforme pour '${path || 'root'}' (attendu: ${expType}, obtenu: ${actType})`);
+    diffs.push(`Type de claim non conforme au chemin '${path || 'root'}'.`);
     return diffs;
   }
 
@@ -470,11 +473,11 @@ export function compareClaimsStructural(expected: any, actual: any, path = ''): 
   const isActArr = Array.isArray(actual);
   if (isExpArr || isActArr) {
     if (!isExpArr || !isActArr) {
-      diffs.push(`Type de claim non conforme pour '${path || 'root'}' (attendu: ${isExpArr ? 'tableau' : expType}, obtenu: ${isActArr ? 'tableau' : actType})`);
+      diffs.push(`Type de claim non conforme au chemin '${path || 'root'}'.`);
       return diffs;
     }
     if (expected.length !== actual.length) {
-      diffs.push(`Longueur de tableau de claims non conforme pour '${path || 'root'}' (attendu: ${expected.length}, obtenu: ${actual.length})`);
+      diffs.push(`Longueur de tableau de claims non conforme au chemin '${path || 'root'}'.`);
       return diffs;
     }
     for (let i = 0; i < expected.length; i++) {
@@ -488,10 +491,11 @@ export function compareClaimsStructural(expected: any, actual: any, path = ''): 
     const expectedKeys = Object.keys(expected);
     const actualKeys = Object.keys(actual);
 
+    // FIX-08-B : Vérification stricte via hasOwnProperty (aucune propriété de prototype admise)
     for (const key of expectedKeys) {
       const subPath = path ? `${path}.${key}` : key;
-      if (!(key in actual)) {
-        diffs.push(`Claim attendu manquant '${subPath}' (valeur: ${JSON.stringify(expected[key])})`);
+      if (!Object.prototype.hasOwnProperty.call(actual, key)) {
+        diffs.push(`Claim attendu manquant au chemin '${subPath}'.`);
       } else {
         diffs.push(...compareClaimsStructural(expected[key], actual[key], subPath));
       }
@@ -499,8 +503,8 @@ export function compareClaimsStructural(expected: any, actual: any, path = ''): 
 
     for (const key of actualKeys) {
       const subPath = path ? `${path}.${key}` : key;
-      if (!(key in expected)) {
-        diffs.push(`Claim supplémentaire inattendu '${subPath}' (valeur non sollicitée: ${JSON.stringify(actual[key])})`);
+      if (!Object.prototype.hasOwnProperty.call(expected, key)) {
+        diffs.push(`Claim supplémentaire inattendu au chemin '${subPath}'.`);
       }
     }
 
@@ -508,14 +512,16 @@ export function compareClaimsStructural(expected: any, actual: any, path = ''): 
   }
 
   if (expected !== actual) {
-    diffs.push(`Valeur discordante pour claim '${path || 'root'}' (attendu: ${JSON.stringify(expected)}, obtenu: ${JSON.stringify(actual)})`);
+    diffs.push(`Claim non conforme au chemin '${path || 'root'}' : valeur différente.`);
   }
 
   return diffs;
 }
 
 /**
- * Comparaison intégrale récursive stricte pour documents Firestore.
+ * FIX-08-A & FIX-08-B — Comparaison intégrale récursive stricte pour documents Firestore :
+ * - Aucune valeur sensible brute, ni date, ni timestamp interpolé dans les messages d'erreur.
+ * - Utilisation stricte de Object.prototype.hasOwnProperty.call() pour les propriétés propres.
  */
 export function deepCompareFirestoreData(expected: any, actual: any, path = ''): string[] {
   const diffs: string[] = [];
@@ -531,30 +537,24 @@ export function deepCompareFirestoreData(expected: any, actual: any, path = ''):
     if (isExpectedTime && isActualTime && areDatesOrTimestampsEqual(expected, actual)) {
       return diffs;
     }
-    const t1 = extractExactTime(expected);
-    const t2 = extractExactTime(actual);
-    const descExp = t1 ? (t1.valid ? `${t1.type}(s=${t1.seconds}, ns=${t1.nanoseconds})` : `invalide(${t1.error})`) : JSON.stringify(expected);
-    const descAct = t2 ? (t2.valid ? `${t2.type}(s=${t2.seconds}, ns=${t2.nanoseconds})` : `invalide(${t2.error})`) : JSON.stringify(actual);
-    diffs.push(`Horodatage '${path || 'root'}' non conforme (attendu: ${descExp}, obtenu: ${descAct})`);
+    diffs.push(`Horodatage non conforme au chemin '${path || 'root'}' : instant divergent ou format invalide.`);
     return diffs;
   }
 
   if (expected === null || expected === undefined || actual === null || actual === undefined) {
     if (expected !== actual) {
-      const expDesc = expected === undefined ? 'absent' : JSON.stringify(expected);
-      const actDesc = actual === undefined ? 'absent' : JSON.stringify(actual);
-      diffs.push(`Champ '${path || 'root'}' non conforme (attendu: ${expDesc}, obtenu: ${actDesc})`);
+      diffs.push(`Champ non conforme au chemin '${path || 'root'}' : valeur absente ou différente.`);
     }
     return diffs;
   }
 
   if (Array.isArray(expected)) {
     if (!Array.isArray(actual)) {
-      diffs.push(`Type non conforme pour '${path || 'root'}' (attendu: tableau, obtenu: ${typeof actual})`);
+      diffs.push(`Type non conforme au chemin '${path || 'root'}'.`);
       return diffs;
     }
     if (expected.length !== actual.length) {
-      diffs.push(`Tableau '${path || 'root'}' de taille différente (attendu: ${expected.length}, obtenu: ${actual.length})`);
+      diffs.push(`Tableau de taille différente au chemin '${path || 'root'}'.`);
       return diffs;
     }
     for (let i = 0; i < expected.length; i++) {
@@ -566,7 +566,7 @@ export function deepCompareFirestoreData(expected: any, actual: any, path = ''):
   }
 
   if (Array.isArray(actual)) {
-    diffs.push(`Type non conforme pour '${path || 'root'}' (attendu: ${typeof expected}, obtenu: tableau)`);
+    diffs.push(`Type non conforme au chemin '${path || 'root'}'.`);
     return diffs;
   }
 
@@ -574,10 +574,11 @@ export function deepCompareFirestoreData(expected: any, actual: any, path = ''):
     const expectedKeys = Object.keys(expected);
     const actualKeys = Object.keys(actual);
 
+    // FIX-08-B : Vérification des propriétés propres uniquement
     for (const key of expectedKeys) {
       const subPath = path ? `${path}.${key}` : key;
-      if (!(key in actual)) {
-        diffs.push(`Champ attendu manquant '${subPath}' (valeur attendue: ${JSON.stringify(expected[key])})`);
+      if (!Object.prototype.hasOwnProperty.call(actual, key)) {
+        diffs.push(`Champ attendu manquant au chemin '${subPath}'.`);
       } else {
         const subDiffs = deepCompareFirestoreData(expected[key], actual[key], subPath);
         diffs.push(...subDiffs);
@@ -586,8 +587,8 @@ export function deepCompareFirestoreData(expected: any, actual: any, path = ''):
 
     for (const key of actualKeys) {
       const subPath = path ? `${path}.${key}` : key;
-      if (!(key in expected)) {
-        diffs.push(`Champ supplémentaire inattendu '${subPath}' (valeur non sollicitée: ${JSON.stringify(actual[key])})`);
+      if (!Object.prototype.hasOwnProperty.call(expected, key)) {
+        diffs.push(`Champ supplémentaire inattendu au chemin '${subPath}'.`);
       }
     }
 
@@ -595,26 +596,25 @@ export function deepCompareFirestoreData(expected: any, actual: any, path = ''):
   }
 
   if (isPlainObject(expected) || isPlainObject(actual)) {
-    diffs.push(`Type non conforme pour '${path || 'root'}' (attendu: ${typeof expected}, obtenu: ${typeof actual})`);
+    diffs.push(`Type non conforme au chemin '${path || 'root'}'.`);
     return diffs;
   }
 
   if (expected !== actual) {
-    diffs.push(`Champ '${path || 'root'}' différent (attendu: ${JSON.stringify(expected)}, obtenu: ${JSON.stringify(actual)})`);
+    diffs.push(`Champ non conforme au chemin '${path || 'root'}' : valeur différente.`);
   }
 
   return diffs;
 }
 
 /**
- * FIX-07-C & FIX-07-F : Fusion récursive non destructive protégée :
+ * FIX-08-C : Fusion récursive non destructive protégée :
  * - Priorité absolue aux champs, objets imbriqués et tableaux de targetData.
- * - Récupération des champs absents autorisés depuis historicalData.
- * - Protection commerciale récursive absolue (isProtectedCommercialField).
- * - Exclusion absolue des champs d'autorisation historiques (isProtectedAuthorizationField).
- * - Protection contre la pollution de prototype (__proto__, constructor, prototype) via safeDefineProperty.
- * - Les valeurs déjà présentes dans le document cible sont strictement préservées.
- * - Résumé des conflits sans exposition des valeurs brutes sensibles (ConflictSummary).
+ * - Les propriétés propres déjà présentes dans la cible (y compris constructor, __proto__, constructorName, etc.)
+ *   sont intégralement préservées sans déclencher de setter de prototype.
+ * - Les clés dangereuses provenant du profil historique restent strictement exclues.
+ * - Exclusion absolue des champs d'autorisation et des données commerciales depuis l'historique.
+ * - Résumé non sensible des conflits (ConflictSummary sans valeurs brutes).
  */
 export function mergeProfileDataNonDestructive(
   realUid: string,
@@ -642,6 +642,7 @@ export function mergeProfileDataNonDestructive(
     if (isPlainObject(value)) {
       const filtered: Record<string, any> = createSafePlainObject();
       for (const [nestedKey, nestedValue] of Object.entries(value)) {
+        // FIX-08-C : Exclusion stricte des clés dangereuses historiques
         if (isDangerousKey(nestedKey)) continue;
         if (isForbiddenHistoricalField(nestedKey, path)) continue;
 
@@ -664,15 +665,16 @@ export function mergeProfileDataNonDestructive(
   ): Record<string, any> {
     const result: Record<string, any> = createSafePlainObject();
 
+    // FIX-08-C : Copier toutes les propriétés propres de target sans en exclure arbitrairement
     if (target && isPlainObject(target)) {
-      for (const [tKey, tVal] of Object.entries(target)) {
-        if (isDangerousKey(tKey)) continue;
-        safeDefineProperty(result, tKey, tVal);
+      for (const tKey of Object.getOwnPropertyNames(target)) {
+        safeDefineProperty(result, tKey, target[tKey]);
       }
     }
 
     if (history && isPlainObject(history)) {
       for (const [key, histValue] of Object.entries(history)) {
+        // FIX-08-C : Rejet strict des clés dangereuses historiques
         if (isDangerousKey(key)) continue;
         if (pathPrefix === '' && key === 'uid') continue;
 
@@ -826,11 +828,11 @@ export async function runSuperAdminBootstrap(options: BootstrapOptions = {}): Pr
   const authProjectId = authSdk?.app?.options?.projectId;
   const firestoreProjectId = getFirestoreProjectId(dbSdk);
 
+  // FIX-08-D : Ni email ni uid dans le rapport final exposé
   const report: BootstrapReport = {
     mode: isExecute ? 'execute' : 'dry-run',
     timestamp: new Date().toISOString(),
     projectId: authProjectId || firestoreProjectId || '',
-    email: targetEmail,
     historicalProfileFound: false,
     targetProfileFound: false,
     conflictsDetected: [],
@@ -859,7 +861,7 @@ export async function runSuperAdminBootstrap(options: BootstrapOptions = {}): Pr
 
     // 2. Contrôle strict de l'adresse email autorisée
     if (targetEmail !== ALLOWED_SUPER_ADMIN_EMAIL) {
-      throw new Error(`[BLOCAGE EMAIL] Seule l'adresse '${ALLOWED_SUPER_ADMIN_EMAIL}' est autorisée au bootstrap Super Admin.`);
+      throw new Error(`[BLOCAGE EMAIL] L'adresse email fournie n'est pas autorisée pour le bootstrap Super Admin.`);
     }
 
     // 3. Récupération et contrôle strict du compte Firebase Auth (Lecture seule)
@@ -867,16 +869,14 @@ export async function runSuperAdminBootstrap(options: BootstrapOptions = {}): Pr
     try {
       userRecord = await authSdk.getUserByEmail(targetEmail);
     } catch (err: any) {
-      throw new Error(`[COMPTE INTROUVABLE] Aucun utilisateur Firebase Auth pour ${targetEmail} : ${err?.message || err}`);
+      throw new Error(`[COMPTE INTROUVABLE] Aucun utilisateur Firebase Auth pour le compte cible : ${err?.message || err}`);
     }
-
-    report.uid = userRecord.uid;
 
     // FIX-07-D : Validation stricte du compte désactivé (userRecord.disabled === false impératif, fail-closed)
     if (userRecord.disabled !== false) {
       report.disabled = userRecord.disabled === true ? true : undefined;
       throw new Error(
-        `[COMPTE DÉSACTIVÉ] Le compte Firebase Auth pour ${targetEmail} n'est pas explicitement actif (userRecord.disabled attendu strictement à false, obtenu : ${JSON.stringify(userRecord.disabled)}).`
+        `[COMPTE DÉSACTIVÉ] Le compte Firebase Auth cible n'est pas explicitement actif (disabled attendu strictement à false).`
       );
     }
     report.disabled = false;
@@ -885,7 +885,7 @@ export async function runSuperAdminBootstrap(options: BootstrapOptions = {}): Pr
     if (userRecord.emailVerified !== true) {
       report.emailVerified = userRecord.emailVerified === true;
       throw new Error(
-        `[EMAIL NON VÉRIFIÉ] Le compte Firebase Auth pour ${targetEmail} n'a pas son email vérifié (userRecord.emailVerified attendu strictement à true, obtenu : ${JSON.stringify(userRecord.emailVerified)}).`
+        `[EMAIL NON VÉRIFIÉ] Le compte Firebase Auth cible n'a pas son email vérifié (emailVerified attendu strictement à true).`
       );
     }
     report.emailVerified = true;
@@ -893,7 +893,7 @@ export async function runSuperAdminBootstrap(options: BootstrapOptions = {}): Pr
     const providerIds = (userRecord.providerData || []).map((p: any) => p.providerId);
     report.hasGoogleProvider = providerIds.includes('google.com');
     if (!report.hasGoogleProvider) {
-      throw new Error(`[FOURNISSEUR INVALIDE] Le compte ${targetEmail} n'est pas associé au fournisseur d'identité 'google.com' (providers: ${providerIds.join(', ')}).`);
+      throw new Error(`[FOURNISSEUR INVALIDE] Le compte cible n'est pas associé au fournisseur d'identité 'google.com'.`);
     }
 
     // Préparation sécurisée des Custom Claims en préservant l'existant
@@ -921,7 +921,7 @@ export async function runSuperAdminBootstrap(options: BootstrapOptions = {}): Pr
         report.historicalProfileFound = true;
       }
     } catch (err: any) {
-      throw new Error(`[ERREUR LECTURE FIRESTORE] Échec de la lecture du profil historique '${HISTORICAL_PROFILE_DOC_ID}' : ${err?.message || err}`);
+      throw new Error(`[ERREUR LECTURE FIRESTORE] Échec de la lecture du profil historique : ${err?.message || err}`);
     }
 
     try {
@@ -931,10 +931,10 @@ export async function runSuperAdminBootstrap(options: BootstrapOptions = {}): Pr
         report.targetProfileFound = true;
       }
     } catch (err: any) {
-      throw new Error(`[ERREUR LECTURE FIRESTORE] Échec de la lecture du profil cible '${userRecord.uid}' : ${err?.message || err}`);
+      throw new Error(`[ERREUR LECTURE FIRESTORE] Échec de la lecture du profil cible : ${err?.message || err}`);
     }
 
-    // 5. Construction et validation de la fusion non destructive protégée (FIX-07-C & FIX-07-F)
+    // 5. Construction et validation de la fusion non destructive protégée (FIX-07-C & FIX-08-C)
     const mergeResult = mergeProfileDataNonDestructive(userRecord.uid, targetData, historicalData);
     report.conflictsDetected = mergeResult.conflicts;
     report.fieldsRecoveredFromHistory = mergeResult.recoveredFields;
@@ -949,7 +949,6 @@ export async function runSuperAdminBootstrap(options: BootstrapOptions = {}): Pr
         await targetDocRef.set(finalProfileToSave, { merge: true });
         report.profileWritten = true;
       } catch (writeErr: any) {
-        // Relecture diagnostique immédiate pour lever l'ambiguïté réseau/serveur
         let diagnosticDataPresent = false;
         let diagnosticReadPossible = false;
         try {
@@ -988,7 +987,7 @@ export async function runSuperAdminBootstrap(options: BootstrapOptions = {}): Pr
         }
         const reloadedData = reloadedDoc.data();
         if (reloadedData?.uid !== userRecord.uid) {
-          throw new Error(`L'UID du profil relu ('${reloadedData?.uid}') ne correspond pas à l'UID réel ('${userRecord.uid}').`);
+          throw new Error("L'UID du profil relu ne correspond pas à l'UID réel attendu.");
         }
 
         const diffs = deepCompareFirestoreData(finalProfileToSave, reloadedData);
@@ -1011,7 +1010,7 @@ export async function runSuperAdminBootstrap(options: BootstrapOptions = {}): Pr
         throw new Error(`[ÉTAT PARTIEL] Profil Firestore écrit et vérifié, MAIS échec de l'attribution des Custom Claims : ${err?.message || err}`);
       }
 
-      // Étape 6.4 : Relire et vérifier intégralement les Custom Claims (FIX-07-B & FIX-07-G)
+      // Étape 6.4 : Relire et vérifier intégralement les Custom Claims (FIX-07-B, FIX-07-G & FIX-08-A)
       try {
         const reloadedUser = await authSdk.getUser(userRecord.uid);
         const actualClaims = reloadedUser?.customClaims || {};

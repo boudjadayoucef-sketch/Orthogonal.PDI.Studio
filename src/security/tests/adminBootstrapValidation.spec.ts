@@ -240,7 +240,7 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
     expect(areDatesOrTimestampsEqual(ts1, ts2)).toBe(false);
     const diffs = deepCompareFirestoreData({ time: ts1 }, { time: ts2 });
     expect(diffs.length).toBe(1);
-    expect(diffs[0]).toContain("Horodatage 'time' non conforme");
+    expect(diffs[0]).toContain("Horodatage non conforme au chemin 'time'");
   });
 
   it('9. B1 — Deux Timestamps différant de 500 000 nanosecondes (même milliseconde) sont rejetés', () => {
@@ -249,7 +249,7 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
     expect(areDatesOrTimestampsEqual(ts1, ts2)).toBe(false);
     const diffs = deepCompareFirestoreData({ time: ts1 }, { time: ts2 });
     expect(diffs.length).toBe(1);
-    expect(diffs[0]).toContain("Horodatage 'time' non conforme");
+    expect(diffs[0]).toContain("Horodatage non conforme au chemin 'time'");
   });
 
   it('10. B1 — Date égale à Timestamp exactement représentable est acceptée', () => {
@@ -265,7 +265,7 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
     expect(areDatesOrTimestampsEqual(date, tsExtraPrecision)).toBe(false);
     const diffs = deepCompareFirestoreData({ createdAt: date }, { createdAt: tsExtraPrecision });
     expect(diffs.length).toBe(1);
-    expect(diffs[0]).toContain("Horodatage 'createdAt' non conforme");
+    expect(diffs[0]).toContain("Horodatage non conforme au chemin 'createdAt'");
   });
 
   it('12. B1 — Timestamp comparé à chaîne ISO : accepté si instant exact, rejeté si précision masquée', () => {
@@ -292,7 +292,7 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
 
     const diffs = deepCompareFirestoreData({ d: invalidDate }, { d: validTs });
     expect(diffs.length).toBe(1);
-    expect(diffs[0]).toContain("Horodatage 'd' non conforme");
+    expect(diffs[0]).toContain("Horodatage non conforme au chemin 'd'");
   });
 
   it('14. B1 — Rejet des Timestamps malformés (nanosecondes négatives, non entières, hors limites)', () => {
@@ -563,7 +563,7 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
     const actualWithExtra = { uid: 'user_1', name: 'Youcef', unexpectedField: 'ghost' };
     const diffs = deepCompareFirestoreData(expected, actualWithExtra);
     expect(diffs.length).toBe(1);
-    expect(diffs[0]).toContain("Champ supplémentaire inattendu 'unexpectedField'");
+    expect(diffs[0]).toContain("Champ supplémentaire inattendu au chemin 'unexpectedField'");
   });
 
   it('18. Rejet en cas de champ inattendu après écriture (profileVerified = false, partialState = true)', async () => {
@@ -602,7 +602,7 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
     expect(report.profileVerified).toBe(false);
     expect(report.partialState).toBe(true);
     expect(report.error).toContain('[ÉTAT PARTIEL]');
-    expect(report.error).toContain("Champ supplémentaire inattendu 'rogueField'");
+    expect(report.error).toContain("Champ supplémentaire inattendu au chemin 'rogueField'");
     expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
   });
 
@@ -854,7 +854,7 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
 
       const diffs = compareClaimsStructural(expected, actual);
       expect(diffs.length).toBe(1);
-      expect(diffs[0]).toContain("Claim attendu manquant 'legacyClaim'");
+      expect(diffs[0]).toContain("Claim attendu manquant au chemin 'legacyClaim'");
     });
 
     it('détecte impérativement un claim supplémentaire inattendu', () => {
@@ -863,7 +863,7 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
 
       const diffs = compareClaimsStructural(expected, actual);
       expect(diffs.length).toBe(1);
-      expect(diffs[0]).toContain("Claim supplémentaire inattendu 'rogueClaim'");
+      expect(diffs[0]).toContain("Claim supplémentaire inattendu au chemin 'rogueClaim'");
     });
 
     it('distingue strictement les types et ne confond pas null avec undefined', () => {
@@ -909,7 +909,7 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
       expect(report.claimsVerified).toBe(false);
       expect(report.partialState).toBe(true);
       expect(report.error).toContain('Divergence structurelle des Custom Claims relus');
-      expect(report.error).toContain("Claim supplémentaire inattendu 'unexpectedBackendClaim'");
+      expect(report.error).toContain("Claim supplémentaire inattendu au chemin 'unexpectedBackendClaim'");
     });
   });
 
@@ -1162,9 +1162,156 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
       expect(isDangerousKey('__proto__')).toBe(true);
       expect(isDangerousKey('constructor')).toBe(true);
       expect(isDangerousKey('prototype')).toBe(true);
-      expect(isDangerousKey('__proto__.polluted')).toBe(true);
+      expect(isDangerousKey('constructorName')).toBe(false);
+      expect(isDangerousKey('prototypeVersion')).toBe(false);
       expect(isDangerousKey('safeField')).toBe(false);
     });
   });
+
+  // =========================================================================
+  // 8. AUTH-ADMIN-05-FIX-08 : TESTS UNITAIRES DES CORRECTIFS FINAUX A À H
+  // =========================================================================
+
+  describe('AUTH-ADMIN-05-FIX-08 : Non-divulgation, propriétés propres et préservation cible', () => {
+    it('FIX-08-A : aucune valeur brute dans les messages de compareClaimsStructural', () => {
+      const secret = 'FIX08_PRIVATE_VALUE_9f71';
+      const diffs = compareClaimsStructural(
+        { privateField: secret },
+        { privateField: 'different-value' }
+      );
+      expect(diffs.length).toBeGreaterThan(0);
+      expect(diffs.join(' ')).not.toContain(secret);
+      expect(diffs.join(' ')).not.toContain('different-value');
+      expect(diffs[0]).toContain("Claim non conforme au chemin 'privateField' : valeur différente.");
+    });
+
+    it('FIX-08-B : aucune valeur brute dans les messages de deepCompareFirestoreData', () => {
+      const secret = 'FIX08_SECRET_FIRESTORE_DATA_a78c';
+      const diffs = deepCompareFirestoreData(
+        { secretField: secret, ts: new Date(1785571200000) },
+        { secretField: 'different-data', ts: new Date(1785571300000) }
+      );
+      expect(diffs.length).toBeGreaterThan(0);
+      expect(diffs.join(' ')).not.toContain(secret);
+      expect(diffs.join(' ')).not.toContain('different-data');
+      expect(diffs.join(' ')).not.toContain('1785571200000');
+      expect(diffs.join(' ')).not.toContain('1785571300000');
+    });
+
+    it('FIX-08-C : les propriétés héritées ne satisfont pas les comparaisons dans compareClaimsStructural et deepCompareFirestoreData', () => {
+      const proto = { inheritedClaim: 'secret_val', inheritedField: 'proto_field' };
+      const actualClaim = Object.create(proto);
+      actualClaim.role = 'super_admin';
+
+      const claimDiffs = compareClaimsStructural(
+        { role: 'super_admin', inheritedClaim: 'secret_val' },
+        actualClaim
+      );
+      expect(claimDiffs.length).toBe(1);
+      expect(claimDiffs[0]).toContain("Claim attendu manquant au chemin 'inheritedClaim'");
+
+      const actualDoc = Object.create(proto);
+      actualDoc.name = 'target_user';
+
+      const docDiffs = deepCompareFirestoreData(
+        { name: 'target_user', inheritedField: 'proto_field' },
+        actualDoc
+      );
+      expect(docDiffs.length).toBe(1);
+      expect(docDiffs[0]).toContain("Champ attendu manquant au chemin 'inheritedField'");
+    });
+
+    it('FIX-08-D : les clés historiques dangereuses restent exclues lors de la fusion', () => {
+      const historicalData = JSON.parse(
+        '{"__proto__":{"polluted":"hist"},"constructor":{"bad":true},"prototype":{"bad":true},"safeField":"kept"}'
+      );
+      const result = mergeProfileDataNonDestructive(validUid, { uid: validUid }, historicalData);
+      expect((Object.prototype as any).polluted).toBeUndefined();
+      expect(result.mergedData.safeField).toBe('kept');
+      expect(Object.prototype.hasOwnProperty.call(result.mergedData, '__proto__')).toBe(false);
+    });
+
+    it('FIX-08-E : les propriétés propres légitimes de la cible sont préservées (constructorName, prototypeVersion, constructor, __proto__)', () => {
+      const targetData: Record<string, any> = {
+        uid: validUid,
+        constructorName: 'CustomCivilPipelineBuilder',
+        prototypeVersion: 'v2.4.1'
+      };
+      Object.defineProperty(targetData, 'constructor', {
+        value: 'ChiefPdiArchitect',
+        writable: true,
+        enumerable: true,
+        configurable: true
+      });
+      Object.defineProperty(targetData, '__proto__', {
+        value: 'legitimate_own_proto_data',
+        writable: true,
+        enumerable: true,
+        configurable: true
+      });
+
+      const result = mergeProfileDataNonDestructive(validUid, targetData, null);
+
+      expect(result.mergedData.constructorName).toBe('CustomCivilPipelineBuilder');
+      expect(result.mergedData.prototypeVersion).toBe('v2.4.1');
+      expect(result.mergedData.constructor).toBe('ChiefPdiArchitect');
+      expect(Object.prototype.hasOwnProperty.call(result.mergedData, '__proto__')).toBe(true);
+      expect(result.mergedData.__proto__).toBe('legitimate_own_proto_data');
+      expect(Object.getPrototypeOf(result.mergedData)).toBe(Object.prototype);
+    });
+
+    it('FIX-08-F : absence absolue de pollution de prototype sur Object.prototype', () => {
+      expect((Object.prototype as any).polluted).toBeUndefined();
+      expect((Object.prototype as any).bad).toBeUndefined();
+    });
+
+    it('FIX-08-G : absence d’email et d’UID dans le rapport final', async () => {
+      store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
+        uid: HISTORICAL_PROFILE_DOC_ID,
+        company: 'PD&I Tech'
+      });
+
+      const report = await runSuperAdminBootstrap({
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect((report as any).email).toBeUndefined();
+      expect((report as any).uid).toBeUndefined();
+
+      const reportJson = JSON.stringify(report);
+      expect(reportJson).not.toContain(ALLOWED_SUPER_ADMIN_EMAIL);
+      expect(reportJson).not.toContain(validUid);
+    });
+
+    it('FIX-08-H : les erreurs remontées dans report.error ne divulguent aucune valeur brute ni secret', async () => {
+      store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
+        uid: HISTORICAL_PROFILE_DOC_ID
+      });
+
+      mockAuth.getUser = vi.fn(async () => {
+        return {
+          ...userRecordState,
+          customClaims: {
+            ...userRecordState.customClaims,
+            role: 'super_admin',
+            rogueKeySecret: 'SUPER_SECRET_PAYMENT_DATA_TOKEN_999'
+          }
+        };
+      });
+
+      const report = await runSuperAdminBootstrap({
+        execute: true,
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(report.success).toBe(false);
+      expect(report.error).toBeDefined();
+      expect(report.error).not.toContain('SUPER_SECRET_PAYMENT_DATA_TOKEN_999');
+      expect(report.error).toContain("Claim supplémentaire inattendu au chemin 'rogueKeySecret'");
+    });
+  });
 });
+
 
