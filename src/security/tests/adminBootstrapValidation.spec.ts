@@ -24,10 +24,17 @@ import {
   parseCliArgs,
   isDirectCliExecution,
   isProtectedCommercialField,
+  isProtectedAuthorizationField,
+  isForbiddenHistoricalField,
+  compareClaimsStructural,
+  isDangerousKey,
+  createSafePlainObject,
+  safeDefineProperty,
   runSuperAdminBootstrap,
   EXPECTED_PROJECT_ID,
   ALLOWED_SUPER_ADMIN_EMAIL,
-  HISTORICAL_PROFILE_DOC_ID
+  HISTORICAL_PROFILE_DOC_ID,
+  FORBIDDEN_HISTORICAL_AUTH_LEAF_KEYS
 } from '../../../scripts/bootstrapSuperAdmin.ts';
 
 describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super Admin', () => {
@@ -746,4 +753,418 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
     expect(isDirectCliExecution(fakeScriptUrl, 'node_modules/vitest/dist/cli.js')).toBe(false);
     expect(isDirectCliExecution(fakeScriptUrl, undefined)).toBe(false);
   });
+
+  // =========================================================================
+  // 7. AUTH-ADMIN-05-FIX-07 : TESTS UNITAIRES DES CORRECTIFS A À G
+  // =========================================================================
+
+  // FIX-07-A : Échec ambigu de l'écriture Firestore et relecture diagnostique
+  describe('FIX-07-A : Échec ambigu de l’écriture Firestore', () => {
+    it('signale partialState: true et requiert intervention si targetDocRef.set() échoue mais que les données sont constatées', async () => {
+      store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
+        uid: HISTORICAL_PROFILE_DOC_ID,
+        company: 'PD&I Vision DZ'
+      });
+
+      // Simuler une exception sur targetDocRef.set(), mais le document est tout de même écrit sur le store
+      const originalCol = mockDb.collection.bind(mockDb);
+      mockDb.collection = (colName: string) => {
+        const col = originalCol(colName);
+        const originalDoc = col.doc.bind(col);
+        col.doc = (docId: string) => {
+          const docObj = originalDoc(docId);
+          if (docId === validUid) {
+            docObj.set = vi.fn(async (data: any, options: any) => {
+              // Écrit quand même les données attendues (effet de bord serveur)
+              store.set(`profiles/${validUid}`, JSON.parse(JSON.stringify(data)));
+              throw new Error('DEADLINE_EXCEEDED : Timeout de confirmation Firestore');
+            });
+          }
+          return docObj;
+        };
+        return col;
+      };
+
+      const report = await runSuperAdminBootstrap({
+        execute: true,
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(report.success).toBe(false);
+      expect(report.partialState).toBe(true);
+      expect(report.profileWritten).toBe(true);
+      expect(report.claimsUpdated).toBe(false);
+      expect(report.claimsVerified).toBe(false);
+      expect(report.error).toContain('[ÉTAT PARTIEL - INTERVENTION REQUISE]');
+      // Ne doit JAMAIS continuer vers setCustomUserClaims
+      expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
+    });
+
+    it('signale partialState: true et échec ambigu si targetDocRef.set() échoue et que les données ne sont pas présentes', async () => {
+      store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
+        uid: HISTORICAL_PROFILE_DOC_ID,
+        company: 'PD&I Vision DZ'
+      });
+
+      const originalCol = mockDb.collection.bind(mockDb);
+      mockDb.collection = (colName: string) => {
+        const col = originalCol(colName);
+        const originalDoc = col.doc.bind(col);
+        col.doc = (docId: string) => {
+          const docObj = originalDoc(docId);
+          if (docId === validUid) {
+            docObj.set = vi.fn(async () => {
+              throw new Error('UNAVAILABLE : Service Firestore inaccessible');
+            });
+          }
+          return docObj;
+        };
+        return col;
+      };
+
+      const report = await runSuperAdminBootstrap({
+        execute: true,
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(report.success).toBe(false);
+      expect(report.partialState).toBe(true);
+      expect(report.profileWritten).toBe(false);
+      expect(report.claimsUpdated).toBe(false);
+      expect(report.error).toContain('[ÉTAT PARTIEL - ÉCHEC ÉCRITURE AMBIGU]');
+      expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
+    });
+  });
+
+  // FIX-07-B & FIX-07-G : Comparaison structurelle des custom claims
+  describe('FIX-07-B & FIX-07-G : Comparaison structurelle des Custom Claims', () => {
+    it('accepte deux objets de claims ayant les mêmes propriétés dans un ordre différent', () => {
+      const expected = { role: 'super_admin', tier: 4, isStaff: true };
+      const actual = { isStaff: true, role: 'super_admin', tier: 4 };
+
+      const diffs = compareClaimsStructural(expected, actual);
+      expect(diffs).toEqual([]);
+    });
+
+    it('détecte un claim attendu manquant', () => {
+      const expected = { role: 'super_admin', legacyClaim: 'keep_me' };
+      const actual = { role: 'super_admin' };
+
+      const diffs = compareClaimsStructural(expected, actual);
+      expect(diffs.length).toBe(1);
+      expect(diffs[0]).toContain("Claim attendu manquant 'legacyClaim'");
+    });
+
+    it('détecte impérativement un claim supplémentaire inattendu', () => {
+      const expected = { role: 'super_admin' };
+      const actual = { role: 'super_admin', rogueClaim: 'infiltrated' };
+
+      const diffs = compareClaimsStructural(expected, actual);
+      expect(diffs.length).toBe(1);
+      expect(diffs[0]).toContain("Claim supplémentaire inattendu 'rogueClaim'");
+    });
+
+    it('distingue strictement les types et ne confond pas null avec undefined', () => {
+      expect(compareClaimsStructural({ flag: 1 }, { flag: '1' }).length).toBeGreaterThan(0);
+      expect(compareClaimsStructural({ flag: true }, { flag: 1 }).length).toBeGreaterThan(0);
+      expect(compareClaimsStructural({ flag: null }, { flag: undefined }).length).toBeGreaterThan(0);
+    });
+
+    it('compare strictement les éléments et positions des tableaux de claims', () => {
+      const expected = { permissions: ['read', 'write'] };
+      const actualInverted = { permissions: ['write', 'read'] };
+
+      const diffs = compareClaimsStructural(expected, actualInverted);
+      expect(diffs.length).toBeGreaterThan(0);
+    });
+
+    it('arrête avec partialState: true si la relecture des Custom Claims après mutation révèle un claim inattendu', async () => {
+      store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
+        uid: HISTORICAL_PROFILE_DOC_ID
+      });
+
+      mockAuth.getUser = vi.fn(async () => {
+        return {
+          ...userRecordState,
+          customClaims: {
+            ...userRecordState.customClaims,
+            role: 'super_admin',
+            unexpectedBackendClaim: 'rogue'
+          }
+        };
+      });
+
+      const report = await runSuperAdminBootstrap({
+        execute: true,
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(report.success).toBe(false);
+      expect(report.profileWritten).toBe(true);
+      expect(report.profileVerified).toBe(true);
+      expect(report.claimsUpdated).toBe(true);
+      expect(report.claimsVerified).toBe(false);
+      expect(report.partialState).toBe(true);
+      expect(report.error).toContain('Divergence structurelle des Custom Claims relus');
+      expect(report.error).toContain("Claim supplémentaire inattendu 'unexpectedBackendClaim'");
+    });
+  });
+
+  // FIX-07-C : Protection des champs d'autorisation historiques
+  describe('FIX-07-C : Protection des champs d’autorisation historiques', () => {
+    it('identifie tous les champs d’autorisation historiques protégés de la liste', () => {
+      const requiredAuthFields = [
+        'role',
+        'roles',
+        'admin',
+        'isAdmin',
+        'isSuperAdmin',
+        'permissions',
+        'customClaims',
+        'accessLevel',
+        'privileges',
+        'authorization',
+        'authorizations',
+        'securityRole',
+        'adminRole'
+      ];
+
+      for (const field of requiredAuthFields) {
+        expect(isProtectedAuthorizationField(field)).toBe(true);
+        expect(isForbiddenHistoricalField(field)).toBe(true);
+      }
+    });
+
+    it('n’importe aucun champ d’autorisation depuis l’historique si la cible ne les possède pas', () => {
+      const targetData = {
+        uid: validUid,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        company: 'PD&I Tech'
+      };
+
+      const historicalData = {
+        uid: HISTORICAL_PROFILE_DOC_ID,
+        role: 'super_admin',
+        roles: ['admin', 'owner'],
+        admin: true,
+        isAdmin: true,
+        isSuperAdmin: true,
+        permissions: ['all', 'root'],
+        customClaims: { role: 'super_admin' },
+        accessLevel: 'level_5',
+        privileges: ['grant_roles'],
+        authorization: { scope: 'full' },
+        authorizations: ['billing_admin'],
+        securityRole: 'sec_officer',
+        adminRole: 'super_user',
+        projectContext: 'pipeline_b31'
+      };
+
+      const result = mergeProfileDataNonDestructive(validUid, targetData, historicalData);
+
+      expect(result.mergedData.role).toBeUndefined();
+      expect(result.mergedData.roles).toBeUndefined();
+      expect(result.mergedData.admin).toBeUndefined();
+      expect(result.mergedData.isAdmin).toBeUndefined();
+      expect(result.mergedData.isSuperAdmin).toBeUndefined();
+      expect(result.mergedData.permissions).toBeUndefined();
+      expect(result.mergedData.customClaims).toBeUndefined();
+      expect(result.mergedData.accessLevel).toBeUndefined();
+      expect(result.mergedData.privileges).toBeUndefined();
+      expect(result.mergedData.authorization).toBeUndefined();
+      expect(result.mergedData.authorizations).toBeUndefined();
+      expect(result.mergedData.securityRole).toBeUndefined();
+      expect(result.mergedData.adminRole).toBeUndefined();
+
+      // Le champ non sensible est bien récupéré
+      expect(result.mergedData.projectContext).toBe('pipeline_b31');
+    });
+
+    it('préserve strictement les autorisations déjà présentes dans le document cible et consigne un conflit', () => {
+      const targetData = {
+        uid: validUid,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        role: 'field_inspector',
+        permissions: ['read_pipe']
+      };
+
+      const historicalData = {
+        uid: HISTORICAL_PROFILE_DOC_ID,
+        role: 'super_admin',
+        permissions: ['all_access']
+      };
+
+      const result = mergeProfileDataNonDestructive(validUid, targetData, historicalData);
+
+      expect(result.mergedData.role).toBe('field_inspector');
+      expect(result.mergedData.permissions).toEqual(['read_pipe']);
+      expect(result.conflicts).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ field: 'role', valuesDiffer: true, conflictCategory: 'authorization' }),
+          expect.objectContaining({ field: 'permissions', valuesDiffer: true, conflictCategory: 'authorization' })
+        ])
+      );
+    });
+
+    it('filtre les champs d’autorisation au sein des tableaux et objets contenus dans les tableaux', () => {
+      const result = mergeProfileDataNonDestructive(
+        validUid,
+        { uid: validUid },
+        {
+          teamMembers: [
+            { name: 'Youcef', role: 'super_admin', permissions: ['all'], department: 'Pipelines' }
+          ]
+        }
+      );
+
+      expect(result.mergedData.teamMembers).toEqual([
+        { name: 'Youcef', department: 'Pipelines' }
+      ]);
+    });
+  });
+
+  // FIX-07-D : Validation stricte du compte désactivé (disabled === false)
+  describe('FIX-07-D : Validation stricte du compte désactivé', () => {
+    it('refuse un compte dont la propriété disabled est undefined', async () => {
+      userRecordState.disabled = undefined;
+      const report = await runSuperAdminBootstrap({
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(report.success).toBe(false);
+      expect(report.error).toContain('[COMPTE DÉSACTIVÉ]');
+    });
+
+    it('refuse un compte dont la propriété disabled est null', async () => {
+      userRecordState.disabled = null;
+      const report = await runSuperAdminBootstrap({
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(report.success).toBe(false);
+      expect(report.error).toContain('[COMPTE DÉSACTIVÉ]');
+    });
+
+    it('refuse un compte dont la propriété disabled est une chaîne de caractères', async () => {
+      userRecordState.disabled = 'false' as any;
+      const report = await runSuperAdminBootstrap({
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(report.success).toBe(false);
+      expect(report.error).toContain('[COMPTE DÉSACTIVÉ]');
+    });
+
+    it('accepte uniquement lorsque disabled vaut strictement false (booléen)', async () => {
+      userRecordState.disabled = false;
+      const report = await runSuperAdminBootstrap({
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(report.disabled).toBe(false);
+    });
+  });
+
+  // FIX-07-E : Réduction des données exposées dans les rapports
+  describe('FIX-07-E : Réduction des données exposées dans les rapports', () => {
+    it('ne contient jamais finalProfileToSave dans le rapport', async () => {
+      store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
+        uid: HISTORICAL_PROFILE_DOC_ID,
+        secretNote: 'TopSecretHistoricalData'
+      });
+
+      const report = await runSuperAdminBootstrap({
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect((report as any).finalProfileToSave).toBeUndefined();
+    });
+
+    it('ne contient aucune valeur brute cible ou historique dans conflictsDetected', async () => {
+      const targetData = {
+        uid: validUid,
+        secretField: 'TargetSecretValue123'
+      };
+      const historicalData = {
+        uid: HISTORICAL_PROFILE_DOC_ID,
+        secretField: 'HistoricalSecretValue999'
+      };
+
+      const result = mergeProfileDataNonDestructive(validUid, targetData, historicalData);
+
+      expect(result.conflicts.length).toBe(1);
+      const conflict = result.conflicts[0];
+      expect(conflict.field).toBe('secretField');
+      expect(conflict.valuesDiffer).toBe(true);
+      expect((conflict as any).targetValue).toBeUndefined();
+      expect((conflict as any).historicalValue).toBeUndefined();
+    });
+
+    it('expose uniquement les noms des clés de claims (existingClaimKeys, updatedClaimKeys)', async () => {
+      userRecordState.customClaims = {
+        tenantId: 'algeria_hub',
+        confidentialData: 'private'
+      };
+
+      const report = await runSuperAdminBootstrap({
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(report.existingClaimKeys).toEqual(['tenantId', 'confidentialData']);
+      expect(report.updatedClaimKeys).toEqual(['tenantId', 'confidentialData', 'role']);
+      expect((report as any).existingClaims).toBeUndefined();
+      expect((report as any).updatedClaims).toBeUndefined();
+    });
+  });
+
+  // FIX-07-F : Protection contre la pollution de prototype
+  describe('FIX-07-F : Protection contre la pollution de prototype', () => {
+    it('ignore récursivement __proto__, constructor et prototype lors de la fusion', () => {
+      const maliciousData = JSON.parse(
+        '{"__proto__":{"polluted":"yes"},"constructor":{"prototype":{"polluted":"yes"}},"prototype":{"polluted":"yes"},"safeProp":"valid"}'
+      );
+
+      const result = mergeProfileDataNonDestructive(validUid, null, maliciousData);
+
+      expect((Object.prototype as any).polluted).toBeUndefined();
+      expect(result.mergedData.safeProp).toBe('valid');
+      expect(result.mergedData.__proto__).toBe(Object.prototype);
+      expect(Object.keys(result.mergedData)).not.toContain('__proto__');
+      expect(Object.keys(result.mergedData)).not.toContain('constructor');
+      expect(Object.keys(result.mergedData)).not.toContain('prototype');
+    });
+
+    it('filtre les clés malveillantes au sein des objets contenus dans les tableaux', () => {
+      const maliciousArray = [
+        JSON.parse('{"__proto__":{"polluted":"array"},"constructor":{"bad":true},"title":"Valid Title"}')
+      ];
+
+      const result = mergeProfileDataNonDestructive(
+        validUid,
+        { uid: validUid },
+        { items: maliciousArray }
+      );
+
+      expect((Object.prototype as any).polluted).toBeUndefined();
+      expect(result.mergedData.items).toEqual([{ title: 'Valid Title' }]);
+    });
+
+    it('détecte correctement toutes les clés dangereuses avec isDangerousKey', () => {
+      expect(isDangerousKey('__proto__')).toBe(true);
+      expect(isDangerousKey('constructor')).toBe(true);
+      expect(isDangerousKey('prototype')).toBe(true);
+      expect(isDangerousKey('__proto__.polluted')).toBe(true);
+      expect(isDangerousKey('safeField')).toBe(false);
+    });
+  });
 });
+
