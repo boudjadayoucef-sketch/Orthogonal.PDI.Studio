@@ -222,19 +222,101 @@ export async function getFirebaseProfiles(): Promise<PdiUserProfile[]> {
   }
 }
 
-export async function saveFirebaseProfile(profile: PdiUserProfile): Promise<void> {
-  // Always update local cache for resilience
+export function saveProfileToLocalCache(profile: PdiUserProfile): void {
   try {
     localStorage.setItem("pdi_user_profile", JSON.stringify(profile));
   } catch {
     // Ignore storage limits
   }
+}
 
-  try {
-    await setDoc(doc(db, "profiles", profile.uid), profile, { merge: true });
-  } catch (err) {
-    console.warn("Could not save profile to Firestore (using local session fallback):", err);
+/**
+ * SEC-01-FIX-04 : Construit le payload strict de création initiale d'un profil dans Firestore.
+ * Exclut formellement :
+ * - les compteurs serveur : loginCount, projectsCount, storageUsedKb
+ * - les champs de gestion serveur : lastLoginAt
+ * - les champs de privilèges : role, isAdmin, isSuperAdmin, permissions, isActivated, admin
+ */
+export function buildFirestoreProfileCreatePayload(
+  profile: PdiUserProfile,
+  authenticatedUid: string,
+  authenticatedEmail: string
+): Record<string, string> {
+  if (!authenticatedUid || profile.uid !== authenticatedUid) {
+    throw new Error("Intégrité du profil refusée : l'UID du profil ne correspond pas à l'utilisateur authentifié.");
   }
+  if (!authenticatedEmail || profile.email !== authenticatedEmail) {
+    throw new Error("Intégrité du profil refusée : l'email du profil ne correspond pas au claim Firebase Authentication.");
+  }
+
+  const payload: Record<string, string> = {
+    uid: authenticatedUid,
+    email: authenticatedEmail,
+    name: profile.name || "",
+    accountType: "basic",
+    subscriptionPlan: "monthly",
+    status: "pending_activation",
+    createdAt: profile.createdAt || new Date().toISOString()
+  };
+
+  if (typeof profile.company === "string") payload.company = profile.company;
+  if (typeof profile.country === "string") payload.country = profile.country;
+  if (typeof profile.countryCode === "string") payload.countryCode = profile.countryCode;
+  if (typeof profile.city === "string") payload.city = profile.city;
+  if (typeof profile.paymentGateway === "string") payload.paymentGateway = profile.paymentGateway;
+  if (typeof profile.currency === "string") payload.currency = profile.currency;
+
+  return payload;
+}
+
+/**
+ * SEC-01-FIX-04 : Construit le payload strict de mise à jour cliente d'un profil dans Firestore.
+ * Seuls les champs de présentation sont autorisés.
+ * Exclut formellement : uid, email, role, status, accountType, subscriptionPlan,
+ * loginCount, projectsCount, storageUsedKb, createdAt, lastLoginAt, paymentGateway, currency.
+ */
+export function buildFirestoreProfileUpdatePayload(
+  profile: Partial<PdiUserProfile>
+): Record<string, string> {
+  const payload: Record<string, string> = {};
+  if (typeof profile.name === "string") payload.name = profile.name;
+  if (typeof profile.company === "string") payload.company = profile.company;
+  if (typeof profile.country === "string") payload.country = profile.country;
+  if (typeof profile.countryCode === "string") payload.countryCode = profile.countryCode;
+  if (typeof profile.city === "string") payload.city = profile.city;
+  return payload;
+}
+
+export async function saveFirebaseProfile(profile: PdiUserProfile): Promise<void> {
+  const currentUser = auth.currentUser;
+  if (!currentUser || currentUser.uid !== profile.uid) {
+    throw new Error("Sauvegarde Firestore refusée : l'UID du profil ne correspond pas à l'utilisateur authentifié.");
+  }
+
+  const profileRef = doc(db, "profiles", currentUser.uid);
+  const existingSnap = await getDoc(profileRef);
+
+  if (existingSnap.exists()) {
+    const existingData = existingSnap.data();
+    if (existingData.uid && existingData.uid !== profile.uid) {
+      throw new Error("Sauvegarde Firestore refusée : l'UID d'un profil ne peut pas être modifié.");
+    }
+    if (existingData.email && profile.email && existingData.email !== profile.email) {
+      throw new Error("Sauvegarde Firestore refusée : l'email d'un profil ne peut pas être modifié après création.");
+    }
+
+    const updatePayload = buildFirestoreProfileUpdatePayload(profile);
+    if (Object.keys(updatePayload).length > 0) {
+      await updateDoc(profileRef, updatePayload);
+    }
+  } else {
+    const tokenEmail = currentUser.email || "";
+    const createPayload = buildFirestoreProfileCreatePayload(profile, currentUser.uid, tokenEmail);
+    await setDoc(profileRef, createPayload);
+  }
+
+  // Mise à jour du cache local uniquement lorsque la persistance Firestore a réellement abouti
+  saveProfileToLocalCache(profile);
 }
 
 export async function deleteFirebaseProfile(uid: string): Promise<void> {
@@ -561,17 +643,14 @@ export async function loginWithEmailAndPasswordSecure(
     if (!userProfile) {
       userProfile = {
         uid,
-        email,
+        email: fbUser.email || email,
         name: fbUser.displayName || email.split("@")[0],
         role: "client",
         accountType: "basic",
         subscriptionPlan: "monthly",
         status: "active",
-        createdAt: new Date().toISOString(),
-        lastLoginAt: new Date().toISOString(),
-        loginCount: 1
+        createdAt: new Date().toISOString()
       };
-      await saveFirebaseProfile(userProfile);
     }
 
     if (userProfile.status === "suspended") {
@@ -591,12 +670,9 @@ export async function loginWithEmailAndPasswordSecure(
       throw new Error("Votre compte est en attente d'activation. Veuillez saisir votre clé d'activation PD&I.");
     }
 
-    const updatedProfile: PdiUserProfile = {
-      ...userProfile,
-      lastLoginAt: new Date().toISOString(),
-      loginCount: (userProfile.loginCount || 0) + 1
-    };
-    await saveFirebaseProfile(updatedProfile);
+    // SEC-01-FIX-04 : Ne jamais tenter de modifier lastLoginAt ni loginCount dans Firestore depuis le client.
+    // Seul le cache local de session est mis à jour côté client ; la trace de connexion est enregistrée dans connection_logs.
+    saveProfileToLocalCache(userProfile);
 
     await logConnectionToFirebase({
       userId: userProfile.uid,
@@ -609,7 +685,7 @@ export async function loginWithEmailAndPasswordSecure(
       userAgent: clientInfo?.userAgent || navigator.userAgent
     });
 
-    return { profile: updatedProfile, isSuperAdmin: isSuperAdminUser };
+    return { profile: userProfile, isSuperAdmin: isSuperAdminUser };
   } catch (err: any) {
     if (err.code === "auth/user-not-found" || err.code === "auth/invalid-credential" || err.code === "auth/wrong-password") {
       throw new Error("Identifiants incorrects ou compte inexistant dans Firebase Authentication.");
@@ -676,9 +752,10 @@ export async function registerWithEmailAndPasswordSecure(data: {
     const paymentGateway = isAlgeria ? "slickpay_baridimob" : "paddle";
     const currency = isAlgeria ? "DZD" : "EUR";
 
+    const canonicalEmail = fbUser.email || email;
     const profile: PdiUserProfile = {
       uid,
-      email,
+      email: canonicalEmail,
       name: data.name,
       company: data.company || "",
       country: data.country || (isAlgeria ? "Algérie" : "International"),
@@ -690,10 +767,7 @@ export async function registerWithEmailAndPasswordSecure(data: {
       accountType: assignedPlan,
       subscriptionPlan: "monthly",
       status: initialStatus,
-      createdAt: new Date().toISOString(),
-      lastLoginAt: initialStatus === "active" ? new Date().toISOString() : undefined,
-      loginCount: initialStatus === "active" ? 1 : 0,
-      projectsCount: 0
+      createdAt: new Date().toISOString()
     };
 
     await saveFirebaseProfile(profile);
@@ -776,9 +850,8 @@ export async function loginWithGoogleSecure(): Promise<{ profile: PdiUserProfile
       throw new Error("Ce compte est en attente d'activation par clé de licence.");
     }
 
-    profile.lastLoginAt = new Date().toISOString();
-    profile.loginCount = (profile.loginCount || 0) + 1;
-    await saveFirebaseProfile(profile);
+    // SEC-01-FIX-04 : Ne pas écrire lastLoginAt ni loginCount dans Firestore depuis le client
+    saveProfileToLocalCache(profile);
 
     await logConnectionToFirebase({
       userId: profile.uid,

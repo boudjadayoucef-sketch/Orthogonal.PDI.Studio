@@ -2618,11 +2618,7 @@ describe("SEC-01-FIX-02A & FIX-01 : Firestore Security Rules Emulator Test Suite
       accountType: "basic",
       subscriptionPlan: "monthly",
       status: "pending_activation",
-      createdAt: new Date().toISOString(),
-      lastLoginAt: new Date().toISOString(),
-      loginCount: 1,
-      projectsCount: 0,
-      storageUsedKb: 0
+      createdAt: new Date().toISOString()
     };
 
     // 1. Contre-épreuve d'intégrité : le propriétaire "user_target" crée exactement ce profil avec succès.
@@ -2638,4 +2634,567 @@ describe("SEC-01-FIX-02A & FIX-01 : Firestore Security Rules Emulator Test Suite
     // La SEULE raison de l'échec est la divergence request.auth.uid ("admin_verified") != profileId ("user_target").
     await assertFails(setDoc(doc(verifiedAdminDb, "profiles", "user_target"), profileData));
   });
+
+  // =========================================================================
+  // SUITE 4 : SEC-01-FIX-04 — FIRESTORE PROFILE INTEGRITY (24 SCÉNARIOS OBLIGATOIRES)
+  // =========================================================================
+
+  // --- CRÉATION (1 à 8) ---
+
+  it("SEC-01-FIX-04-01 : Création d'un profil par son propriétaire avec des champs légitimes : autorisée", async () => {
+    const ownerDb = testEnv.authenticatedContext("user_fix04_1", {
+      email: "user_fix04_1@domain.com",
+      email_verified: true
+    }).firestore();
+
+    await assertSucceeds(setDoc(doc(ownerDb, "profiles", "user_fix04_1"), {
+      uid: "user_fix04_1",
+      email: "user_fix04_1@domain.com",
+      name: "Utilisateur Intègre",
+      company: "Orthogonal Industrie",
+      country: "Algeria",
+      countryCode: "DZ",
+      city: "Algiers",
+      paymentGateway: "slickpay",
+      currency: "DZD",
+      accountType: "basic",
+      subscriptionPlan: "monthly",
+      status: "pending_activation",
+      createdAt: "2026-04-12T10:00:00.000Z"
+    }));
+  });
+
+  it("SEC-01-FIX-04-02 : Création d'un profil avec un UID différent : refusée", async () => {
+    const ownerDb = testEnv.authenticatedContext("user_fix04_2", {
+      email: "user_fix04_2@domain.com",
+      email_verified: true
+    }).firestore();
+
+    // Cas 2a : data.uid différent de profileId et de request.auth.uid
+    await assertFails(setDoc(doc(ownerDb, "profiles", "user_fix04_2"), {
+      uid: "spoofed_uid",
+      email: "user_fix04_2@domain.com",
+      name: "Utilisateur Spoof UID",
+      status: "pending_activation"
+    }));
+
+    // Cas 2b : profileId différent de request.auth.uid
+    await assertFails(setDoc(doc(ownerDb, "profiles", "other_user_id"), {
+      uid: "other_user_id",
+      email: "user_fix04_2@domain.com",
+      name: "Utilisateur Cible Externe",
+      status: "pending_activation"
+    }));
+
+    // Cas 2c : champ uid absent du document
+    await assertFails(setDoc(doc(ownerDb, "profiles", "user_fix04_2"), {
+      email: "user_fix04_2@domain.com",
+      name: "Utilisateur Sans UID",
+      status: "pending_activation"
+    }));
+  });
+
+  it("SEC-01-FIX-04-03 : Création avec un email différent du claim : refusée", async () => {
+    const ownerDb = testEnv.authenticatedContext("user_fix04_3", {
+      email: "real_claim@domain.com",
+      email_verified: true
+    }).firestore();
+
+    await assertFails(setDoc(doc(ownerDb, "profiles", "user_fix04_3"), {
+      uid: "user_fix04_3",
+      email: "spoofed_email@domain.com",
+      name: "Utilisateur Email Falsifié",
+      status: "pending_activation"
+    }));
+  });
+
+  it("SEC-01-FIX-04-04 : Création sans email correspondant au claim : refusée", async () => {
+    const ownerDbWithEmailClaim = testEnv.authenticatedContext("user_fix04_4a", {
+      email: "user_fix04_4a@domain.com",
+      email_verified: true
+    }).firestore();
+
+    // Cas 4a : champ email omis dans le document alors que le claim email est présent
+    await assertFails(setDoc(doc(ownerDbWithEmailClaim, "profiles", "user_fix04_4a"), {
+      uid: "user_fix04_4a",
+      name: "Utilisateur Sans Champ Email",
+      status: "pending_activation"
+    }));
+
+    // Cas 4b : token d'authentification dépourvu de claim email
+    const ownerDbWithoutEmailClaim = testEnv.authenticatedContext("user_fix04_4b", {
+      email_verified: true
+    }).firestore();
+
+    await assertFails(setDoc(doc(ownerDbWithoutEmailClaim, "profiles", "user_fix04_4b"), {
+      uid: "user_fix04_4b",
+      email: "user_fix04_4b@domain.com",
+      name: "Utilisateur Sans Claim Email",
+      status: "pending_activation"
+    }));
+  });
+
+  it("SEC-01-FIX-04-05 : Création contenant loginCount : refusée", async () => {
+    const ownerDb = testEnv.authenticatedContext("user_fix04_5", {
+      email: "user_fix04_5@domain.com",
+      email_verified: true
+    }).firestore();
+
+    await assertFails(setDoc(doc(ownerDb, "profiles", "user_fix04_5"), {
+      uid: "user_fix04_5",
+      email: "user_fix04_5@domain.com",
+      name: "Utilisateur LoginCount",
+      status: "pending_activation",
+      loginCount: 1
+    }));
+  });
+
+  it("SEC-01-FIX-04-06 : Création contenant projectsCount : refusée", async () => {
+    const ownerDb = testEnv.authenticatedContext("user_fix04_6", {
+      email: "user_fix04_6@domain.com",
+      email_verified: true
+    }).firestore();
+
+    await assertFails(setDoc(doc(ownerDb, "profiles", "user_fix04_6"), {
+      uid: "user_fix04_6",
+      email: "user_fix04_6@domain.com",
+      name: "Utilisateur ProjectsCount",
+      status: "pending_activation",
+      projectsCount: 0
+    }));
+  });
+
+  it("SEC-01-FIX-04-07 : Création contenant storageUsedKb : refusée", async () => {
+    const ownerDb = testEnv.authenticatedContext("user_fix04_7", {
+      email: "user_fix04_7@domain.com",
+      email_verified: true
+    }).firestore();
+
+    await assertFails(setDoc(doc(ownerDb, "profiles", "user_fix04_7"), {
+      uid: "user_fix04_7",
+      email: "user_fix04_7@domain.com",
+      name: "Utilisateur StorageUsedKb",
+      status: "pending_activation",
+      storageUsedKb: 0
+    }));
+  });
+
+  it("SEC-01-FIX-04-08 : Création avec role: 'super_admin' : refusée", async () => {
+    const ownerDb = testEnv.authenticatedContext("user_fix04_8", {
+      email: "user_fix04_8@domain.com",
+      email_verified: true
+    }).firestore();
+
+    await assertFails(setDoc(doc(ownerDb, "profiles", "user_fix04_8"), {
+      uid: "user_fix04_8",
+      email: "user_fix04_8@domain.com",
+      name: "Utilisateur Role SuperAdmin",
+      status: "pending_activation",
+      role: "super_admin"
+    }));
+  });
+
+  // --- MODIFICATION (9 à 20) ---
+
+  it("SEC-01-FIX-04-09 : Modification du nom par le propriétaire : autorisée", async () => {
+    await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+      await setDoc(doc(adminContext.firestore(), "profiles", "user_fix04_9"), {
+        uid: "user_fix04_9",
+        email: "user_fix04_9@domain.com",
+        name: "Nom Initial",
+        company: "Société Initiale",
+        status: "active",
+        loginCount: 5,
+        projectsCount: 2,
+        storageUsedKb: 128
+      });
+    });
+
+    const ownerDb = testEnv.authenticatedContext("user_fix04_9", {
+      email: "user_fix04_9@domain.com",
+      email_verified: true
+    }).firestore();
+
+    await assertSucceeds(updateDoc(doc(ownerDb, "profiles", "user_fix04_9"), {
+      name: "Nouveau Nom Légitime"
+    }));
+  });
+
+  it("SEC-01-FIX-04-10 : Modification de la société par le propriétaire : autorisée", async () => {
+    await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+      await setDoc(doc(adminContext.firestore(), "profiles", "user_fix04_10"), {
+        uid: "user_fix04_10",
+        email: "user_fix04_10@domain.com",
+        name: "Utilisateur 10",
+        company: "Ancienne Société",
+        country: "Algeria",
+        countryCode: "DZ",
+        city: "Algiers",
+        status: "active"
+      });
+    });
+
+    const ownerDb = testEnv.authenticatedContext("user_fix04_10", {
+      email: "user_fix04_10@domain.com",
+      email_verified: true
+    }).firestore();
+
+    await assertSucceeds(updateDoc(doc(ownerDb, "profiles", "user_fix04_10"), {
+      company: "Nouvelle Société Ingénierie",
+      country: "France",
+      countryCode: "FR",
+      city: "Paris"
+    }));
+  });
+
+  it("SEC-01-FIX-04-11 : Modification de l'email : refusée", async () => {
+    await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+      await setDoc(doc(adminContext.firestore(), "profiles", "user_fix04_11"), {
+        uid: "user_fix04_11",
+        email: "user_fix04_11@domain.com",
+        name: "Utilisateur 11",
+        status: "active"
+      });
+    });
+
+    const ownerDb = testEnv.authenticatedContext("user_fix04_11", {
+      email: "user_fix04_11@domain.com",
+      email_verified: true
+    }).firestore();
+
+    await assertFails(updateDoc(doc(ownerDb, "profiles", "user_fix04_11"), {
+      email: "autre_email@domain.com"
+    }));
+  });
+
+  it("SEC-01-FIX-04-12 : Modification de l'UID : refusée", async () => {
+    await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+      await setDoc(doc(adminContext.firestore(), "profiles", "user_fix04_12"), {
+        uid: "user_fix04_12",
+        email: "user_fix04_12@domain.com",
+        name: "Utilisateur 12",
+        status: "active"
+      });
+    });
+
+    const ownerDb = testEnv.authenticatedContext("user_fix04_12", {
+      email: "user_fix04_12@domain.com",
+      email_verified: true
+    }).firestore();
+
+    await assertFails(updateDoc(doc(ownerDb, "profiles", "user_fix04_12"), {
+      uid: "autre_uid_falsifie"
+    }));
+  });
+
+  it("SEC-01-FIX-04-13 : Modification de loginCount : refusée", async () => {
+    await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+      await setDoc(doc(adminContext.firestore(), "profiles", "user_fix04_13"), {
+        uid: "user_fix04_13",
+        email: "user_fix04_13@domain.com",
+        name: "Utilisateur 13",
+        loginCount: 3,
+        status: "active"
+      });
+    });
+
+    const ownerDb = testEnv.authenticatedContext("user_fix04_13", {
+      email: "user_fix04_13@domain.com",
+      email_verified: true
+    }).firestore();
+
+    await assertFails(updateDoc(doc(ownerDb, "profiles", "user_fix04_13"), {
+      loginCount: 4
+    }));
+  });
+
+  it("SEC-01-FIX-04-14 : Modification de projectsCount : refusée", async () => {
+    await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+      await setDoc(doc(adminContext.firestore(), "profiles", "user_fix04_14"), {
+        uid: "user_fix04_14",
+        email: "user_fix04_14@domain.com",
+        name: "Utilisateur 14",
+        projectsCount: 2,
+        status: "active"
+      });
+    });
+
+    const ownerDb = testEnv.authenticatedContext("user_fix04_14", {
+      email: "user_fix04_14@domain.com",
+      email_verified: true
+    }).firestore();
+
+    await assertFails(updateDoc(doc(ownerDb, "profiles", "user_fix04_14"), {
+      projectsCount: 0
+    }));
+  });
+
+  it("SEC-01-FIX-04-15 : Modification de storageUsedKb : refusée", async () => {
+    await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+      await setDoc(doc(adminContext.firestore(), "profiles", "user_fix04_15"), {
+        uid: "user_fix04_15",
+        email: "user_fix04_15@domain.com",
+        name: "Utilisateur 15",
+        storageUsedKb: 512,
+        status: "active"
+      });
+    });
+
+    const ownerDb = testEnv.authenticatedContext("user_fix04_15", {
+      email: "user_fix04_15@domain.com",
+      email_verified: true
+    }).firestore();
+
+    await assertFails(updateDoc(doc(ownerDb, "profiles", "user_fix04_15"), {
+      storageUsedKb: 0
+    }));
+  });
+
+  it("SEC-01-FIX-04-16 : Modification de role : refusée", async () => {
+    await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+      await setDoc(doc(adminContext.firestore(), "profiles", "user_fix04_16"), {
+        uid: "user_fix04_16",
+        email: "user_fix04_16@domain.com",
+        name: "Utilisateur 16",
+        role: "client",
+        status: "active"
+      });
+    });
+
+    const ownerDb = testEnv.authenticatedContext("user_fix04_16", {
+      email: "user_fix04_16@domain.com",
+      email_verified: true
+    }).firestore();
+
+    await assertFails(updateDoc(doc(ownerDb, "profiles", "user_fix04_16"), {
+      role: "super_admin"
+    }));
+  });
+
+  it("SEC-01-FIX-04-17 : Modification de status : refusée", async () => {
+    await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+      await setDoc(doc(adminContext.firestore(), "profiles", "user_fix04_17"), {
+        uid: "user_fix04_17",
+        email: "user_fix04_17@domain.com",
+        name: "Utilisateur 17",
+        status: "pending_activation"
+      });
+    });
+
+    const ownerDb = testEnv.authenticatedContext("user_fix04_17", {
+      email: "user_fix04_17@domain.com",
+      email_verified: true
+    }).firestore();
+
+    await assertFails(updateDoc(doc(ownerDb, "profiles", "user_fix04_17"), {
+      status: "active"
+    }));
+  });
+
+  it("SEC-01-FIX-04-18 : Modification de accountType : refusée", async () => {
+    await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+      await setDoc(doc(adminContext.firestore(), "profiles", "user_fix04_18"), {
+        uid: "user_fix04_18",
+        email: "user_fix04_18@domain.com",
+        name: "Utilisateur 18",
+        accountType: "basic",
+        status: "active"
+      });
+    });
+
+    const ownerDb = testEnv.authenticatedContext("user_fix04_18", {
+      email: "user_fix04_18@domain.com",
+      email_verified: true
+    }).firestore();
+
+    await assertFails(updateDoc(doc(ownerDb, "profiles", "user_fix04_18"), {
+      accountType: "enterprise"
+    }));
+  });
+
+  it("SEC-01-FIX-04-19 : Modification de subscriptionPlan : refusée", async () => {
+    await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+      await setDoc(doc(adminContext.firestore(), "profiles", "user_fix04_19"), {
+        uid: "user_fix04_19",
+        email: "user_fix04_19@domain.com",
+        name: "Utilisateur 19",
+        subscriptionPlan: "monthly",
+        status: "active"
+      });
+    });
+
+    const ownerDb = testEnv.authenticatedContext("user_fix04_19", {
+      email: "user_fix04_19@domain.com",
+      email_verified: true
+    }).firestore();
+
+    await assertFails(updateDoc(doc(ownerDb, "profiles", "user_fix04_19"), {
+      subscriptionPlan: "lifetime"
+    }));
+  });
+
+  it("SEC-01-FIX-04-20 : Modification du profil d'un autre utilisateur : refusée", async () => {
+    await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+      await setDoc(doc(adminContext.firestore(), "profiles", "victim_user_20"), {
+        uid: "victim_user_20",
+        email: "victim_user_20@domain.com",
+        name: "Victime 20",
+        company: "Société Victime",
+        status: "active"
+      });
+    });
+
+    const attackerDb = testEnv.authenticatedContext("attacker_user_20", {
+      email: "attacker_user_20@domain.com",
+      email_verified: true
+    }).firestore();
+
+    await assertFails(updateDoc(doc(attackerDb, "profiles", "victim_user_20"), {
+      name: "Nom Modifié Par Attaquant"
+    }));
+  });
+
+  // --- CONTRE-ÉPREUVES (21 à 24) ---
+
+  it("SEC-01-FIX-04-21 : Un document de profil créé par le contexte Admin SDK peut contenir les champs serveur et être lu", async () => {
+    await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+      await setDoc(doc(adminContext.firestore(), "profiles", "user_fix04_21"), {
+        uid: "user_fix04_21",
+        email: "user_fix04_21@domain.com",
+        name: "Utilisateur Provisionné Serveur",
+        company: "Orthogonal Corp",
+        role: "client",
+        status: "active",
+        accountType: "enterprise",
+        subscriptionPlan: "annual",
+        loginCount: 42,
+        projectsCount: 7,
+        storageUsedKb: 2048,
+        lastLoginAt: "2026-04-12T11:30:00.000Z"
+      });
+    });
+
+    const ownerDb = testEnv.authenticatedContext("user_fix04_21", {
+      email: "user_fix04_21@domain.com",
+      email_verified: true
+    }).firestore();
+
+    const snap = await assertSucceeds(getDoc(doc(ownerDb, "profiles", "user_fix04_21")));
+    expect(snap.exists()).toBe(true);
+    expect(snap.data()?.loginCount).toBe(42);
+    expect(snap.data()?.projectsCount).toBe(7);
+    expect(snap.data()?.storageUsedKb).toBe(2048);
+  });
+
+  it("SEC-01-FIX-04-22 : Un utilisateur peut toujours lire son propre profil", async () => {
+    await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+      await setDoc(doc(adminContext.firestore(), "profiles", "user_fix04_22"), {
+        uid: "user_fix04_22",
+        email: "user_fix04_22@domain.com",
+        name: "Utilisateur Lecture Propre"
+      });
+    });
+
+    const ownerDb = testEnv.authenticatedContext("user_fix04_22", {
+      email: "user_fix04_22@domain.com",
+      email_verified: true
+    }).firestore();
+
+    await assertSucceeds(getDoc(doc(ownerDb, "profiles", "user_fix04_22")));
+  });
+
+  it("SEC-01-FIX-04-23 : Un utilisateur ne peut toujours pas lire le profil d'un autre utilisateur", async () => {
+    await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+      await setDoc(doc(adminContext.firestore(), "profiles", "user_fix04_23_other"), {
+        uid: "user_fix04_23_other",
+        email: "other23@domain.com",
+        name: "Autre Utilisateur 23"
+      });
+    });
+
+    const callerDb = testEnv.authenticatedContext("user_fix04_23_caller", {
+      email: "caller23@domain.com",
+      email_verified: true
+    }).firestore();
+
+    await assertFails(getDoc(doc(callerDb, "profiles", "user_fix04_23_other")));
+  });
+
+  it("SEC-01-FIX-04-24 : Un Super Admin client ne peut pas contourner les restrictions sur les champs serveur", async () => {
+    const superAdminDb = testEnv.authenticatedContext("super_admin_24", {
+      email: "super_admin_24@pdi.dz",
+      role: "super_admin",
+      email_verified: true
+    }).firestore();
+
+    // 1. Le Super Admin client ne peut pas créer son propre profil avec loginCount / projectsCount / storageUsedKb / role
+    await assertFails(setDoc(doc(superAdminDb, "profiles", "super_admin_24"), {
+      uid: "super_admin_24",
+      email: "super_admin_24@pdi.dz",
+      name: "Super Admin Client",
+      status: "pending_activation",
+      loginCount: 100
+    }));
+
+    await assertFails(setDoc(doc(superAdminDb, "profiles", "super_admin_24"), {
+      uid: "super_admin_24",
+      email: "super_admin_24@pdi.dz",
+      name: "Super Admin Client",
+      status: "pending_activation",
+      projectsCount: 50
+    }));
+
+    await assertFails(setDoc(doc(superAdminDb, "profiles", "super_admin_24"), {
+      uid: "super_admin_24",
+      email: "super_admin_24@pdi.dz",
+      name: "Super Admin Client",
+      status: "pending_activation",
+      storageUsedKb: 9999
+    }));
+
+    // 2. Même si son profil (ou celui d'un tiers) existe déjà, le Super Admin client ne peut pas modifier les champs serveur
+    await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+      await setDoc(doc(adminContext.firestore(), "profiles", "super_admin_24"), {
+        uid: "super_admin_24",
+        email: "super_admin_24@pdi.dz",
+        name: "Super Admin Client",
+        status: "pending_activation",
+        loginCount: 1,
+        projectsCount: 0,
+        storageUsedKb: 0
+      });
+      await setDoc(doc(adminContext.firestore(), "profiles", "target_client_24"), {
+        uid: "target_client_24",
+        email: "target_client_24@domain.com",
+        name: "Client Cible 24",
+        status: "pending_activation",
+        loginCount: 1,
+        projectsCount: 0,
+        storageUsedKb: 0
+      });
+    });
+
+    await assertFails(updateDoc(doc(superAdminDb, "profiles", "super_admin_24"), {
+      loginCount: 999
+    }));
+
+    await assertFails(updateDoc(doc(superAdminDb, "profiles", "super_admin_24"), {
+      projectsCount: 999
+    }));
+
+    await assertFails(updateDoc(doc(superAdminDb, "profiles", "super_admin_24"), {
+      storageUsedKb: 99999
+    }));
+
+    await assertFails(updateDoc(doc(superAdminDb, "profiles", "super_admin_24"), {
+      status: "active"
+    }));
+
+    await assertFails(updateDoc(doc(superAdminDb, "profiles", "target_client_24"), {
+      loginCount: 999,
+      projectsCount: 50,
+      storageUsedKb: 4096
+    }));
+  });
 });
+

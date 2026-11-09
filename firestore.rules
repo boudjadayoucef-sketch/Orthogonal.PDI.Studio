@@ -54,21 +54,27 @@ service cloud.firestore {
     }
 
     // =========================================================================
-    // 1. PROFILES (FR-08 & FR-09)
+    // 1. PROFILES (FR-08, FR-09 & SEC-01-FIX-04)
     // =========================================================================
     function isValidProfileCreation(profileId) {
       let allowedKeys = [
         'uid', 'email', 'name', 'company', 'country', 'countryCode',
         'city', 'paymentGateway', 'currency', 'accountType',
-        'subscriptionPlan', 'status', 'createdAt', 'lastLoginAt',
-        'loginCount', 'projectsCount', 'storageUsedKb'
+        'subscriptionPlan', 'status', 'createdAt'
+      ];
+      let forbiddenKeys = [
+        'role', 'isAdmin', 'isSuperAdmin', 'permissions', 'isActivated', 'admin',
+        'loginCount', 'projectsCount', 'storageUsedKb', 'lastLoginAt'
       ];
       let data = request.resource.data;
       return isAuthenticated() &&
              request.auth.uid == profileId &&
-             data.uid == profileId &&
+             ('uid' in data) && data.uid is string && data.uid == profileId &&
+             ('email' in data) && data.email is string &&
+             ('email' in request.auth.token) && request.auth.token.email is string &&
+             data.email == request.auth.token.email &&
              data.keys().hasOnly(allowedKeys) &&
-             !data.keys().hasAny(['role', 'isAdmin', 'isSuperAdmin', 'permissions', 'isActivated', 'admin']) &&
+             !data.keys().hasAny(forbiddenKeys) &&
              (!('status' in data) || data.status == "pending_activation") &&
              (!('accountType' in data) || data.accountType == "basic") &&
              (!('subscriptionPlan' in data) || data.subscriptionPlan == "monthly");
@@ -76,14 +82,26 @@ service cloud.firestore {
 
     function isValidProfileUpdate(profileId) {
       let allowedUpdateKeys = [
-        'name', 'company', 'country', 'countryCode', 'city',
-        'lastLoginAt', 'loginCount', 'projectsCount', 'storageUsedKb',
+        'name', 'company', 'country', 'countryCode', 'city'
+      ];
+      let forbiddenUpdateKeys = [
+        'uid', 'email', 'role', 'isAdmin', 'isSuperAdmin', 'permissions',
+        'isActivated', 'admin', 'status', 'accountType', 'subscriptionPlan',
+        'loginCount', 'projectsCount', 'storageUsedKb', 'createdAt', 'lastLoginAt',
         'paymentGateway', 'currency'
       ];
+      let data = request.resource.data;
+      let diff = data.diff(resource.data);
       return isAuthenticated() &&
+             resource != null &&
              request.auth.uid == profileId &&
-             request.resource.data.uid == resource.data.uid &&
-             request.resource.data.diff(resource.data).affectedKeys().hasOnly(allowedUpdateKeys);
+             ('uid' in resource.data) &&
+             ('uid' in data) &&
+             data.uid == resource.data.uid &&
+             data.uid == profileId &&
+             (!('email' in resource.data) || (('email' in data) && data.email == resource.data.email)) &&
+             diff.affectedKeys().hasOnly(allowedUpdateKeys) &&
+             !diff.affectedKeys().hasAny(forbiddenUpdateKeys);
     }
 
     match /profiles/{profileId} {
