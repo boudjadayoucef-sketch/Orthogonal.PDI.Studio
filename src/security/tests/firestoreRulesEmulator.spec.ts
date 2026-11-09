@@ -3196,5 +3196,144 @@ describe("SEC-01-FIX-02A & FIX-01 : Firestore Security Rules Emulator Test Suite
       storageUsedKb: 4096
     }));
   });
+
+  // =========================================================================
+  // SUITE 5 : SEC-01-FIX-04-R1 — VALIDATION STRICTE DES CHAMPS DE PRÉSENTATION
+  // =========================================================================
+
+  it("SEC-01-FIX-04-R1-01 : Création de profil avec champs de présentation non conformes (objet, tableau, vide, hors limites) : refusée", async () => {
+    const ownerDb = testEnv.authenticatedContext("user_r1_create", {
+      email: "user_r1_create@domain.com",
+      email_verified: true
+    }).firestore();
+
+    // name absent
+    await assertFails(setDoc(doc(ownerDb, "profiles", "user_r1_create"), {
+      uid: "user_r1_create",
+      email: "user_r1_create@domain.com",
+      status: "pending_activation"
+    }));
+
+    // name vide
+    await assertFails(setDoc(doc(ownerDb, "profiles", "user_r1_create"), {
+      uid: "user_r1_create",
+      email: "user_r1_create@domain.com",
+      name: "",
+      status: "pending_activation"
+    }));
+
+    // name remplacé par un objet
+    await assertFails(setDoc(doc(ownerDb, "profiles", "user_r1_create"), {
+      uid: "user_r1_create",
+      email: "user_r1_create@domain.com",
+      name: { nested: "evil" },
+      status: "pending_activation"
+    }));
+
+    // city remplacé par un tableau
+    await assertFails(setDoc(doc(ownerDb, "profiles", "user_r1_create"), {
+      uid: "user_r1_create",
+      email: "user_r1_create@domain.com",
+      name: "Utilisateur R1",
+      city: ["Algiers", "Oran"],
+      status: "pending_activation"
+    }));
+
+    // countryCode non conforme (minuscules ou format invalide)
+    await assertFails(setDoc(doc(ownerDb, "profiles", "user_r1_create"), {
+      uid: "user_r1_create",
+      email: "user_r1_create@domain.com",
+      name: "Utilisateur R1",
+      countryCode: "dz-invalid",
+      status: "pending_activation"
+    }));
+
+    // company dépassant la taille maximale (150 caractères)
+    await assertFails(setDoc(doc(ownerDb, "profiles", "user_r1_create"), {
+      uid: "user_r1_create",
+      email: "user_r1_create@domain.com",
+      name: "Utilisateur R1",
+      company: "C".repeat(151),
+      status: "pending_activation"
+    }));
+  });
+
+  it("SEC-01-FIX-04-R1-02 : Modification de profil remplaçant un champ de présentation par un objet, un tableau ou une valeur hors limites : refusée", async () => {
+    await testEnv.withSecurityRulesDisabled(async (adminContext) => {
+      await setDoc(doc(adminContext.firestore(), "profiles", "user_r1_update"), {
+        uid: "user_r1_update",
+        email: "user_r1_update@domain.com",
+        name: "Nom Initial Valide",
+        company: "Société Initiale",
+        country: "Algeria",
+        countryCode: "DZ",
+        city: "Algiers",
+        status: "pending_activation"
+      });
+    });
+
+    const ownerDb = testEnv.authenticatedContext("user_r1_update", {
+      email: "user_r1_update@domain.com",
+      email_verified: true
+    }).firestore();
+
+    // name remplacé par un objet
+    await assertFails(updateDoc(doc(ownerDb, "profiles", "user_r1_update"), {
+      name: { evil: true }
+    }));
+
+    // city remplacé par un tableau
+    await assertFails(updateDoc(doc(ownerDb, "profiles", "user_r1_update"), {
+      city: ["Algiers"]
+    }));
+
+    // company remplacé par un nombre
+    await assertFails(updateDoc(doc(ownerDb, "profiles", "user_r1_update"), {
+      company: 12345
+    }));
+
+    // name vide
+    await assertFails(updateDoc(doc(ownerDb, "profiles", "user_r1_update"), {
+      name: ""
+    }));
+
+    // name trop long (> 120 caractères)
+    await assertFails(updateDoc(doc(ownerDb, "profiles", "user_r1_update"), {
+      name: "N".repeat(121)
+    }));
+
+    // countryCode invalide
+    await assertFails(updateDoc(doc(ownerDb, "profiles", "user_r1_update"), {
+      countryCode: "123"
+    }));
+  });
+
+  it("SEC-01-FIX-04-R1-03 : Création et modification de profil avec champs de présentation conformes : autorisées", async () => {
+    const ownerDb = testEnv.authenticatedContext("user_r1_valid", {
+      email: "user_r1_valid@domain.com",
+      email_verified: true
+    }).firestore();
+
+    await assertSucceeds(setDoc(doc(ownerDb, "profiles", "user_r1_valid"), {
+      uid: "user_r1_valid",
+      email: "user_r1_valid@domain.com",
+      name: "Ingénieur Tuyauterie",
+      company: "Orthogonal Engineering",
+      country: "Algeria",
+      countryCode: "DZ",
+      city: "Algiers",
+      status: "pending_activation",
+      accountType: "basic",
+      subscriptionPlan: "monthly"
+    }));
+
+    await assertSucceeds(updateDoc(doc(ownerDb, "profiles", "user_r1_valid"), {
+      name: "Ingénieur Tuyauterie Senior",
+      company: "Orthogonal Process SARL",
+      country: "France",
+      countryCode: "FR",
+      city: "Lyon"
+    }));
+  });
 });
 

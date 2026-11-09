@@ -222,6 +222,23 @@ export async function getFirebaseProfiles(): Promise<PdiUserProfile[]> {
   }
 }
 
+export function getProfileFromLocalCache(uid?: string): PdiUserProfile | null {
+  try {
+    const raw = localStorage.getItem("pdi_user_profile");
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as PdiUserProfile;
+    if (!parsed || typeof parsed !== "object" || typeof parsed.uid !== "string") {
+      return null;
+    }
+    if (uid && parsed.uid !== uid) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
 export function saveProfileToLocalCache(profile: PdiUserProfile): void {
   try {
     localStorage.setItem("pdi_user_profile", JSON.stringify(profile));
@@ -230,93 +247,381 @@ export function saveProfileToLocalCache(profile: PdiUserProfile): void {
   }
 }
 
+function restoreOrClearLocalCache(previousProfile: PdiUserProfile | null): void {
+  try {
+    if (previousProfile) {
+      localStorage.setItem("pdi_user_profile", JSON.stringify(previousProfile));
+    } else {
+      localStorage.removeItem("pdi_user_profile");
+    }
+  } catch {
+    // Ignore storage errors
+  }
+}
+
 /**
- * SEC-01-FIX-04 : Construit le payload strict de création initiale d'un profil dans Firestore.
- * Exclut formellement :
- * - les compteurs serveur : loginCount, projectsCount, storageUsedKb
- * - les champs de gestion serveur : lastLoginAt
- * - les champs de privilèges : role, isAdmin, isSuperAdmin, permissions, isActivated, admin
+ * SEC-01-FIX-04-R1 (Correction E) : Validation stricte des champs de présentation éditables.
+ * Rejette tout objet, tableau, nombre, booléen, null ou chaîne hors limites.
+ */
+export function validateProfilePresentationFields(
+  profile: Partial<PdiUserProfile>,
+  requireName: boolean
+): void {
+  if (!profile || typeof profile !== "object" || Array.isArray(profile)) {
+    throw new Error("Validation du profil refusée : données de profil invalides.");
+  }
+
+  const raw = profile as Record<string, unknown>;
+
+  if (requireName || "name" in raw) {
+    if (
+      typeof raw.name !== "string" ||
+      raw.name.trim().length < 1 ||
+      raw.name.length > 120
+    ) {
+      throw new Error(
+        "Validation du profil refusée : le champ 'name' doit être une chaîne non vide de 1 à 120 caractères."
+      );
+    }
+  }
+
+  if ("company" in raw && raw.company !== undefined) {
+    if (typeof raw.company !== "string" || raw.company.length > 150) {
+      throw new Error(
+        "Validation du profil refusée : le champ 'company' doit être une chaîne d'au plus 150 caractères."
+      );
+    }
+  }
+
+  if ("country" in raw && raw.country !== undefined) {
+    if (typeof raw.country !== "string" || raw.country.length > 100) {
+      throw new Error(
+        "Validation du profil refusée : le champ 'country' doit être une chaîne d'au plus 100 caractères."
+      );
+    }
+  }
+
+  if ("countryCode" in raw && raw.countryCode !== undefined) {
+    if (
+      typeof raw.countryCode !== "string" ||
+      raw.countryCode.length < 2 ||
+      raw.countryCode.length > 10 ||
+      !/^[A-Z]{2,10}$/.test(raw.countryCode)
+    ) {
+      throw new Error(
+        "Validation du profil refusée : le champ 'countryCode' doit être un code ISO majuscule valide (2 à 10 lettres)."
+      );
+    }
+  }
+
+  if ("city" in raw && raw.city !== undefined) {
+    if (typeof raw.city !== "string" || raw.city.length > 100) {
+      throw new Error(
+        "Validation du profil refusée : le champ 'city' doit être une chaîne d'au plus 100 caractères."
+      );
+    }
+  }
+}
+
+const FORBIDDEN_CLIENT_PROFILE_KEYS = [
+  "isAdmin",
+  "isSuperAdmin",
+  "permissions",
+  "isActivated",
+  "admin"
+] as const;
+
+const SERVER_COUNTER_AND_AUDIT_KEYS = [
+  "loginCount",
+  "projectsCount",
+  "storageUsedKb",
+  "lastLoginAt"
+] as const;
+
+/**
+ * SEC-01-FIX-04 & R1 : Construit le payload strict de création initiale d'un profil dans Firestore.
+ * Exclut formellement et rejette toute tentative d'injection :
+ * - des compteurs serveur : loginCount, projectsCount, storageUsedKb
+ * - des champs de gestion serveur : lastLoginAt
+ * - des champs de privilèges ou d'activation : role != client, status != pending_activation,
+ *   accountType != basic, subscriptionPlan != monthly, isAdmin, isSuperAdmin, permissions, isActivated, admin.
  */
 export function buildFirestoreProfileCreatePayload(
   profile: PdiUserProfile,
   authenticatedUid: string,
   authenticatedEmail: string
 ): Record<string, string> {
-  if (!authenticatedUid || profile.uid !== authenticatedUid) {
+  if (!authenticatedUid || typeof profile?.uid !== "string" || profile.uid !== authenticatedUid) {
     throw new Error("Intégrité du profil refusée : l'UID du profil ne correspond pas à l'utilisateur authentifié.");
   }
-  if (!authenticatedEmail || profile.email !== authenticatedEmail) {
+  const normalizedAuthEmail = authenticatedEmail.trim().toLowerCase();
+  const normalizedProfileEmail = typeof profile?.email === "string" ? profile.email.trim().toLowerCase() : "";
+  if (!normalizedAuthEmail || !normalizedProfileEmail || profile.email !== authenticatedEmail) {
     throw new Error("Intégrité du profil refusée : l'email du profil ne correspond pas au claim Firebase Authentication.");
+  }
+
+  const raw = profile as unknown as Record<string, unknown>;
+  for (const key of FORBIDDEN_CLIENT_PROFILE_KEYS) {
+    if (key in raw && raw[key] !== undefined) {
+      throw new Error(`Intégrité du profil refusée : le champ d'autorisation '${key}' est interdit côté client.`);
+    }
+  }
+  for (const key of SERVER_COUNTER_AND_AUDIT_KEYS) {
+    if (key in raw && raw[key] !== undefined) {
+      throw new Error(`Intégrité du profil refusée : le champ serveur '${key}' ne peut pas être défini par le client.`);
+    }
+  }
+
+  if (raw.role !== undefined && raw.role !== "client") {
+    throw new Error("Intégrité du profil refusée : aucun rôle privilégié ne peut être attribué par le client.");
+  }
+  if (raw.status !== undefined && raw.status !== "pending_activation") {
+    throw new Error("Intégrité du profil refusée : un profil créé par le client doit avoir le statut 'pending_activation'.");
+  }
+  if (raw.accountType !== undefined && raw.accountType !== "basic") {
+    throw new Error("Intégrité du profil refusée : un profil créé par le client doit avoir le plan initial 'basic'.");
+  }
+  if (raw.subscriptionPlan !== undefined && raw.subscriptionPlan !== "monthly") {
+    throw new Error("Intégrité du profil refusée : un profil créé par le client doit avoir le cycle initial 'monthly'.");
+  }
+
+  validateProfilePresentationFields(profile, true);
+
+  if (raw.paymentGateway !== undefined && (typeof raw.paymentGateway !== "string" || raw.paymentGateway.length > 60)) {
+    throw new Error("Validation du profil refusée : le champ 'paymentGateway' est invalide.");
+  }
+  if (raw.currency !== undefined && (typeof raw.currency !== "string" || raw.currency.length > 10)) {
+    throw new Error("Validation du profil refusée : le champ 'currency' est invalide.");
+  }
+  if (raw.createdAt !== undefined && (typeof raw.createdAt !== "string" || raw.createdAt.length === 0 || raw.createdAt.length > 60)) {
+    throw new Error("Validation du profil refusée : le champ 'createdAt' est invalide.");
   }
 
   const payload: Record<string, string> = {
     uid: authenticatedUid,
     email: authenticatedEmail,
-    name: profile.name || "",
+    name: profile.name,
     accountType: "basic",
     subscriptionPlan: "monthly",
     status: "pending_activation",
     createdAt: profile.createdAt || new Date().toISOString()
   };
 
-  if (typeof profile.company === "string") payload.company = profile.company;
-  if (typeof profile.country === "string") payload.country = profile.country;
-  if (typeof profile.countryCode === "string") payload.countryCode = profile.countryCode;
-  if (typeof profile.city === "string") payload.city = profile.city;
-  if (typeof profile.paymentGateway === "string") payload.paymentGateway = profile.paymentGateway;
-  if (typeof profile.currency === "string") payload.currency = profile.currency;
+  if (profile.company !== undefined) payload.company = profile.company;
+  if (profile.country !== undefined) payload.country = profile.country;
+  if (profile.countryCode !== undefined) payload.countryCode = profile.countryCode;
+  if (profile.city !== undefined) payload.city = profile.city;
+  if (profile.paymentGateway !== undefined) payload.paymentGateway = profile.paymentGateway;
+  if (profile.currency !== undefined) payload.currency = profile.currency;
 
   return payload;
 }
 
 /**
- * SEC-01-FIX-04 : Construit le payload strict de mise à jour cliente d'un profil dans Firestore.
- * Seuls les champs de présentation sont autorisés.
+ * SEC-01-FIX-04 & R1 : Construit le payload strict de mise à jour cliente d'un profil dans Firestore.
+ * Seuls les champs de présentation validés sont autorisés.
  * Exclut formellement : uid, email, role, status, accountType, subscriptionPlan,
  * loginCount, projectsCount, storageUsedKb, createdAt, lastLoginAt, paymentGateway, currency.
  */
 export function buildFirestoreProfileUpdatePayload(
   profile: Partial<PdiUserProfile>
 ): Record<string, string> {
+  validateProfilePresentationFields(profile, false);
+
   const payload: Record<string, string> = {};
-  if (typeof profile.name === "string") payload.name = profile.name;
-  if (typeof profile.company === "string") payload.company = profile.company;
-  if (typeof profile.country === "string") payload.country = profile.country;
-  if (typeof profile.countryCode === "string") payload.countryCode = profile.countryCode;
-  if (typeof profile.city === "string") payload.city = profile.city;
+  if (profile.name !== undefined) payload.name = profile.name;
+  if (profile.company !== undefined) payload.company = profile.company;
+  if (profile.country !== undefined) payload.country = profile.country;
+  if (profile.countryCode !== undefined) payload.countryCode = profile.countryCode;
+  if (profile.city !== undefined) payload.city = profile.city;
   return payload;
 }
 
+function buildSafeLocalCacheProfile(
+  profile: PdiUserProfile,
+  authenticatedUid: string,
+  authenticatedEmail: string,
+  authoritativeBase?: Partial<PdiUserProfile> | null
+): PdiUserProfile {
+  const safeProfile: PdiUserProfile = {
+    uid: authenticatedUid,
+    email: authenticatedEmail,
+    name: profile.name,
+    company: profile.company ?? authoritativeBase?.company ?? "",
+    country: profile.country ?? authoritativeBase?.country ?? "",
+    countryCode: profile.countryCode ?? authoritativeBase?.countryCode ?? "DZ",
+    city: profile.city ?? authoritativeBase?.city ?? "",
+    paymentGateway: authoritativeBase?.paymentGateway ?? profile.paymentGateway,
+    currency: authoritativeBase?.currency ?? profile.currency,
+    role: "client",
+    accountType: authoritativeBase?.accountType ?? "basic",
+    subscriptionPlan: authoritativeBase?.subscriptionPlan ?? "monthly",
+    status: authoritativeBase?.status ?? "pending_activation",
+    createdAt: authoritativeBase?.createdAt || profile.createdAt || new Date().toISOString()
+  };
+
+  if (authoritativeBase?.lastLoginAt !== undefined) {
+    safeProfile.lastLoginAt = authoritativeBase.lastLoginAt;
+  }
+  if (authoritativeBase?.loginCount !== undefined) {
+    safeProfile.loginCount = authoritativeBase.loginCount;
+  }
+  if (authoritativeBase?.projectsCount !== undefined) {
+    safeProfile.projectsCount = authoritativeBase.projectsCount;
+  }
+  if (authoritativeBase?.storageUsedKb !== undefined) {
+    safeProfile.storageUsedKb = authoritativeBase.storageUsedKb;
+  }
+
+  return safeProfile;
+}
+
+function assertNoClientServerFieldMutation(
+  profile: PdiUserProfile,
+  authoritativeData: Record<string, unknown>
+): void {
+  const raw = profile as unknown as Record<string, unknown>;
+
+  for (const key of FORBIDDEN_CLIENT_PROFILE_KEYS) {
+    if (key in raw && raw[key] !== undefined) {
+      throw new Error(`Sauvegarde Firestore refusée : le champ d'autorisation '${key}' est interdit côté client.`);
+    }
+  }
+
+  if (raw.role !== undefined && raw.role !== "client" && raw.role !== authoritativeData.role) {
+    throw new Error("Sauvegarde Firestore refusée : le champ serveur 'role' ne peut pas être modifié par le client.");
+  }
+
+  if (
+    raw.status !== undefined &&
+    authoritativeData.status !== undefined &&
+    raw.status !== authoritativeData.status
+  ) {
+    throw new Error("Sauvegarde Firestore refusée : le champ serveur 'status' ne peut pas être modifié par le client.");
+  }
+
+  if (
+    raw.accountType !== undefined &&
+    authoritativeData.accountType !== undefined &&
+    raw.accountType !== authoritativeData.accountType
+  ) {
+    throw new Error("Sauvegarde Firestore refusée : le champ serveur 'accountType' ne peut pas être modifié par le client.");
+  }
+
+  if (
+    raw.subscriptionPlan !== undefined &&
+    authoritativeData.subscriptionPlan !== undefined &&
+    raw.subscriptionPlan !== authoritativeData.subscriptionPlan
+  ) {
+    throw new Error("Sauvegarde Firestore refusée : le champ serveur 'subscriptionPlan' ne peut pas être modifié par le client.");
+  }
+
+  if (
+    raw.createdAt !== undefined &&
+    authoritativeData.createdAt !== undefined &&
+    raw.createdAt !== authoritativeData.createdAt
+  ) {
+    throw new Error("Sauvegarde Firestore refusée : le champ 'createdAt' est immuable.");
+  }
+
+  for (const key of SERVER_COUNTER_AND_AUDIT_KEYS) {
+    if (raw[key] !== undefined && raw[key] !== authoritativeData[key]) {
+      throw new Error(`Sauvegarde Firestore refusée : le champ serveur '${key}' ne peut pas être modifié par le client.`);
+    }
+  }
+}
+
 export async function saveFirebaseProfile(profile: PdiUserProfile): Promise<void> {
+  // 1. Vérification stricte de l'identité avant toute opération (locale ou distante)
   const currentUser = auth.currentUser;
-  if (!currentUser || currentUser.uid !== profile.uid) {
+  if (!currentUser || !profile || typeof profile.uid !== "string" || currentUser.uid !== profile.uid) {
     throw new Error("Sauvegarde Firestore refusée : l'UID du profil ne correspond pas à l'utilisateur authentifié.");
   }
 
+  const tokenEmail = currentUser.email || "";
+  if (!tokenEmail || typeof profile.email !== "string" || profile.email !== tokenEmail) {
+    throw new Error("Sauvegarde Firestore refusée : l'email du profil ne correspond pas à l'utilisateur authentifié.");
+  }
+
+  // Validation immédiate des champs de présentation et rejet des clés d'autorisation interdites
+  validateProfilePresentationFields(profile, true);
+  const raw = profile as unknown as Record<string, unknown>;
+  for (const key of FORBIDDEN_CLIENT_PROFILE_KEYS) {
+    if (key in raw && raw[key] !== undefined) {
+      throw new Error(`Sauvegarde Firestore refusée : le champ d'autorisation '${key}' est interdit côté client.`);
+    }
+  }
+  if (raw.role !== undefined && raw.role !== "client") {
+    throw new Error("Sauvegarde Firestore refusée : aucun rôle privilégié ne peut être attribué par le client.");
+  }
+
+  const previousCached = getProfileFromLocalCache(currentUser.uid);
+  if (previousCached) {
+    assertNoClientServerFieldMutation(profile, previousCached as unknown as Record<string, unknown>);
+  }
+
+  // 2. Sauvegarde résiliente dans le cache local (sans aucun champ serveur falsifié)
+  // avant l'opération réseau afin que le cache local reste disponible en cas d'échec distant.
+  const resilientLocalProfile = buildSafeLocalCacheProfile(
+    profile,
+    currentUser.uid,
+    tokenEmail,
+    previousCached
+  );
+  saveProfileToLocalCache(resilientLocalProfile);
+
+  // 3. Opération Firestore distante avec propagation stricte de toute erreur à l'appelant
   const profileRef = doc(db, "profiles", currentUser.uid);
   const existingSnap = await getDoc(profileRef);
 
   if (existingSnap.exists()) {
     const existingData = existingSnap.data();
     if (existingData.uid && existingData.uid !== profile.uid) {
+      restoreOrClearLocalCache(previousCached);
       throw new Error("Sauvegarde Firestore refusée : l'UID d'un profil ne peut pas être modifié.");
     }
-    if (existingData.email && profile.email && existingData.email !== profile.email) {
+    if (existingData.email && existingData.email !== profile.email) {
+      restoreOrClearLocalCache(previousCached);
       throw new Error("Sauvegarde Firestore refusée : l'email d'un profil ne peut pas être modifié après création.");
     }
 
+    try {
+      assertNoClientServerFieldMutation(profile, existingData);
+    } catch (mutationErr) {
+      saveProfileToLocalCache(
+        buildSafeLocalCacheProfile(
+          existingData as unknown as PdiUserProfile,
+          currentUser.uid,
+          tokenEmail,
+          existingData as Partial<PdiUserProfile>
+        )
+      );
+      throw mutationErr;
+    }
+
     const updatePayload = buildFirestoreProfileUpdatePayload(profile);
+    const synchronizedLocalProfile = buildSafeLocalCacheProfile(
+      profile,
+      currentUser.uid,
+      tokenEmail,
+      existingData as Partial<PdiUserProfile>
+    );
+    saveProfileToLocalCache(synchronizedLocalProfile);
+
     if (Object.keys(updatePayload).length > 0) {
       await updateDoc(profileRef, updatePayload);
     }
   } else {
-    const tokenEmail = currentUser.email || "";
-    const createPayload = buildFirestoreProfileCreatePayload(profile, currentUser.uid, tokenEmail);
+    let createPayload: Record<string, string>;
+    try {
+      createPayload = buildFirestoreProfileCreatePayload(profile, currentUser.uid, tokenEmail);
+    } catch (validationErr) {
+      restoreOrClearLocalCache(previousCached);
+      throw validationErr;
+    }
+
     await setDoc(profileRef, createPayload);
   }
-
-  // Mise à jour du cache local uniquement lorsque la persistance Firestore a réellement abouti
-  saveProfileToLocalCache(profile);
 }
 
 export async function deleteFirebaseProfile(uid: string): Promise<void> {
@@ -523,52 +828,25 @@ export async function revokeFirebaseLicenseKey(id: string): Promise<void> {
 }
 
 export async function validateAndConsumeLicenseKey(code: string, userEmail: string): Promise<{ valid: boolean; plan: PdiAccountType; error?: string }> {
-  try {
-    const cleanedCode = code.trim().toUpperCase();
-    const snap = await getDocs(collection(db, "license_keys"));
-    let foundDocId: string | null = null;
-    let foundKey: PdiLicenseKey | null = null;
+  const cleanedCode = typeof code === "string" ? code.trim().toUpperCase() : "";
+  const cleanedEmail = typeof userEmail === "string" ? userEmail.trim().toLowerCase() : "";
 
-    snap.forEach((d) => {
-      const k = d.data() as PdiLicenseKey;
-      if (k.code.toUpperCase() === cleanedCode) {
-        foundDocId = d.id;
-        foundKey = { ...k, id: d.id };
-      }
-    });
-
-    if (!foundKey || !foundDocId) {
-      return { valid: false, plan: "basic", error: "Clé de licence introuvable ou invalide." };
-    }
-
-    if (foundKey.status === "revoked") {
-      return { valid: false, plan: "basic", error: "Cette clé de licence a été révoquée par l'administrateur." };
-    }
-
-    if (foundKey.status === "expired" || (foundKey.expiresAt && new Date(foundKey.expiresAt) < new Date())) {
-      return { valid: false, plan: "basic", error: "Cette clé de licence a expiré." };
-    }
-
-    if (foundKey.status === "active" && foundKey.activatedBy && foundKey.activatedBy.toLowerCase() !== userEmail.toLowerCase()) {
-      return { valid: false, plan: "basic", error: "Cette clé de licence a déjà été activée par un autre compte." };
-    }
-
-    // Mark as active
-    await updateDoc(doc(db, "license_keys", foundDocId), {
-      status: "active",
-      activatedBy: userEmail,
-      activatedAt: new Date().toISOString()
-    });
-
-    const mappedPlan: PdiAccountType = 
-      foundKey.plan.toLowerCase().includes("enterprise") ? "enterprise" :
-      foundKey.plan.toLowerCase().includes("team") ? "team" :
-      foundKey.plan.toLowerCase().includes("pro") ? "pro" : "basic";
-
-    return { valid: true, plan: mappedPlan };
-  } catch (err: any) {
-    return { valid: false, plan: "basic", error: err.message || "Erreur de validation de la clé." };
+  if (!cleanedCode || !cleanedEmail) {
+    return {
+      valid: false,
+      plan: "basic",
+      error: "Clé de licence et adresse email requises."
+    };
   }
+
+  // SEC-01-FIX-04-R1 (Corrections A & B) :
+  // Ne jamais transformer une clé de licence côté client en preuve d'activation serveur,
+  // ni muter la collection license_keys depuis un flux client d'activation.
+  return {
+    valid: false,
+    plan: "basic",
+    error: "Validation et activation de licence impossibles côté client : cette opération requiert un traitement serveur autoritatif."
+  };
 }
 
 // ------------------------------------------
@@ -624,33 +902,28 @@ export async function loginWithEmailAndPasswordSecure(
     const tokenResult = await fbUser.getIdTokenResult(true);
     const isSuperAdminUser = isSuperAdminClaimAuthorized(tokenResult.claims, fbUser.emailVerified);
 
-    // Regular client user
+    // SEC-01-FIX-04-R1 (Correction D) : Lecture directe et exclusive de profiles/{uid} dans Firestore.
+    // Aucune requête globale sur la collection profiles, aucun repli localStorage,
+    // et aucune fabrication artificielle d'un profil local avec status: "active".
     let userProfile: PdiUserProfile | null = null;
     try {
       const userDoc = await getDoc(doc(db, "profiles", uid));
       if (userDoc.exists()) {
-        userProfile = { uid, ...userDoc.data() } as PdiUserProfile;
+        const rawData = userDoc.data();
+        userProfile = {
+          ...(rawData as PdiUserProfile),
+          uid,
+          role: "client"
+        };
       }
     } catch (e) {
-      console.warn("Direct profile read by UID fallback:", e);
+      console.warn("Direct profile read by UID failed:", e);
     }
 
     if (!userProfile) {
-      const profiles = await getFirebaseProfiles();
-      userProfile = profiles.find((p) => p.email.toLowerCase() === email || p.uid === uid) || null;
-    }
-
-    if (!userProfile) {
-      userProfile = {
-        uid,
-        email: fbUser.email || email,
-        name: fbUser.displayName || email.split("@")[0],
-        role: "client",
-        accountType: "basic",
-        subscriptionPlan: "monthly",
-        status: "active",
-        createdAt: new Date().toISOString()
-      };
+      throw new Error(
+        "Connexion refusée : le profil PD&I autoritatif est absent dans Firestore pour ce compte."
+      );
     }
 
     if (userProfile.status === "suspended") {
@@ -668,6 +941,10 @@ export async function loginWithEmailAndPasswordSecure(
 
     if (userProfile.status === "pending_activation") {
       throw new Error("Votre compte est en attente d'activation. Veuillez saisir votre clé d'activation PD&I.");
+    }
+
+    if (userProfile.status !== "active") {
+      throw new Error("Connexion refusée : le statut du profil PD&I n'est pas actif.");
     }
 
     // SEC-01-FIX-04 : Ne jamais tenter de modifier lastLoginAt ni loginCount dans Firestore depuis le client.
@@ -711,9 +988,9 @@ export async function registerWithEmailAndPasswordSecure(data: {
   requestedPlan?: string;
   activationKey?: string;
 }): Promise<PdiUserProfile> {
-  const email = data.email.trim().toLowerCase();
+  const email = typeof data.email === "string" ? data.email.trim().toLowerCase() : "";
 
-  if (!email || !data.password || !data.name) {
+  if (!email || !data.password || typeof data.name !== "string" || !data.name.trim()) {
     throw new Error("Veuillez renseigner votre nom, email et mot de passe (au moins 6 caractères).");
   }
 
@@ -721,26 +998,32 @@ export async function registerWithEmailAndPasswordSecure(data: {
     throw new Error("Le mot de passe doit contenir au moins 6 caractères.");
   }
 
-  // Check if country is allowed
   const countryCode = (data.countryCode || "DZ").toUpperCase();
+  validateProfilePresentationFields(
+    {
+      name: data.name,
+      company: data.company,
+      country: data.country,
+      countryCode,
+      city: data.city
+    },
+    true
+  );
+
+  // SEC-01-FIX-04-R1 (Correction A) :
+  // Si une clé d'activation est fournie à l'inscription, refuser explicitement avant toute création
+  // car l'activation autoritative (status: "active", accountType) requiert un traitement serveur.
+  if (typeof data.activationKey === "string" && data.activationKey.trim().length > 0) {
+    throw new Error(
+      "Activation de licence impossible côté client lors de l'inscription : l'attribution du statut 'active' et du plan de licence est réservée au serveur."
+    );
+  }
+
+  // Check if country is allowed
   const countries = await getCountryRestrictionsFromFirebase();
   const matchedCountry = countries.find(c => c.code.toUpperCase() === countryCode);
   if (matchedCountry && !matchedCountry.allowed) {
     throw new Error(`L'accès depuis ce pays (${matchedCountry.name}) est temporairement restreint par l'administrateur.`);
-  }
-
-  // Validate activation key if provided
-  let initialStatus: "active" | "pending_activation" = "pending_activation";
-  let assignedPlan: PdiAccountType = (data.requestedPlan as PdiAccountType) || "basic";
-
-  if (data.activationKey && data.activationKey.trim()) {
-    const keyRes = await validateAndConsumeLicenseKey(data.activationKey, email);
-    if (keyRes.valid) {
-      initialStatus = "active";
-      assignedPlan = keyRes.plan;
-    } else {
-      throw new Error(`Clé d'activation invalide : ${keyRes.error}`);
-    }
   }
 
   try {
@@ -753,36 +1036,28 @@ export async function registerWithEmailAndPasswordSecure(data: {
     const currency = isAlgeria ? "DZD" : "EUR";
 
     const canonicalEmail = fbUser.email || email;
+
+    // SEC-01-FIX-04-R1 (Correction A) :
+    // Cohérence stricte entre le profil retourné, le cache local et le document Firestore :
+    // accountType est toujours "basic", subscriptionPlan est "monthly" et status est "pending_activation".
     const profile: PdiUserProfile = {
       uid,
       email: canonicalEmail,
       name: data.name,
       company: data.company || "",
       country: data.country || (isAlgeria ? "Algérie" : "International"),
-      countryCode: countryCode,
+      countryCode,
       city: data.city || "",
       paymentGateway,
       currency,
       role: "client",
-      accountType: assignedPlan,
+      accountType: "basic",
       subscriptionPlan: "monthly",
-      status: initialStatus,
+      status: "pending_activation",
       createdAt: new Date().toISOString()
     };
 
     await saveFirebaseProfile(profile);
-
-    if (initialStatus === "active") {
-      await logConnectionToFirebase({
-        userId: profile.uid,
-        userEmail: profile.email,
-        userName: profile.name,
-        userRole: profile.role,
-        accountType: profile.accountType,
-        status: "success",
-        timestamp: new Date().toISOString()
-      });
-    }
 
     return profile;
   } catch (err: any) {
@@ -829,17 +1104,17 @@ export async function loginWithGoogleSecure(): Promise<{ profile: PdiUserProfile
       const profileSnap = await getDoc(doc(db, "profiles", gUser.uid));
       if (profileSnap.exists()) {
         profile = {
-          ...profileSnap.data(),
-          uid: gUser.uid
-        } as PdiUserProfile;
+          ...(profileSnap.data() as PdiUserProfile),
+          uid: gUser.uid,
+          role: "client"
+        };
       }
     } catch (e) {
       console.warn("Direct profile read fallback:", e);
     }
 
     if (!profile) {
-      // Must have an active account or activation key
-      throw new Error(`Aucun compte PD&I autorisé n'est lié à ${gEmail}. Veuillez d'abord créer un compte avec une clé d'activation.`);
+      throw new Error(`Connexion refusée : aucun profil PD&I autoritatif n'est enregistré dans Firestore pour ${gEmail}.`);
     }
 
     if (profile.status === "suspended") {
@@ -848,6 +1123,10 @@ export async function loginWithGoogleSecure(): Promise<{ profile: PdiUserProfile
 
     if (profile.status === "pending_activation") {
       throw new Error("Ce compte est en attente d'activation par clé de licence.");
+    }
+
+    if (profile.status !== "active") {
+      throw new Error("Connexion refusée : le statut du profil PD&I n'est pas actif.");
     }
 
     // SEC-01-FIX-04 : Ne pas écrire lastLoginAt ni loginCount dans Firestore depuis le client
@@ -879,30 +1158,20 @@ export async function logoutFirebase(): Promise<void> {
 }
 
 export async function activateAccountWithLicenseKey(email: string, licenseCode: string): Promise<PdiUserProfile> {
-  const cleanEmail = email.trim().toLowerCase();
-  const keyRes = await validateAndConsumeLicenseKey(licenseCode, cleanEmail);
+  const cleanEmail = typeof email === "string" ? email.trim().toLowerCase() : "";
+  const cleanCode = typeof licenseCode === "string" ? licenseCode.trim() : "";
 
-  if (!keyRes.valid) {
-    throw new Error(keyRes.error || "Clé de licence invalide.");
+  if (!cleanEmail || !cleanCode) {
+    throw new Error("Veuillez fournir une adresse email et une clé de licence valides.");
   }
 
-  const profiles = await getFirebaseProfiles();
-  let userProfile = profiles.find((p) => p.email.toLowerCase() === cleanEmail);
-
-  if (!userProfile) {
-    throw new Error("Aucun profil enregistré avec cet email. Veuillez d'abord créer un compte.");
-  }
-
-  const updated: PdiUserProfile = {
-    ...userProfile,
-    status: "active",
-    accountType: keyRes.plan,
-    lastLoginAt: new Date().toISOString(),
-    loginCount: (userProfile.loginCount || 0) + 1
-  };
-
-  await saveFirebaseProfile(updated);
-  return updated;
+  // SEC-01-FIX-04-R1 (Correction B) :
+  // Aucun updateDoc() client ne peut modifier status, accountType ou subscriptionPlan dans Firestore.
+  // En l'absence d'un traitement serveur autoritatif d'activation, cette opération doit échouer
+  // explicitement sans modifier le statut local ni prétendre que l'activation a été persistée.
+  throw new Error(
+    "Activation refusée : la modification des champs 'status', 'accountType' et 'subscriptionPlan' est réservée au serveur. Aucune activation autoritative n'a été persistée dans Firestore."
+  );
 }
 
 export async function recordSubscriberUsage(usage: Omit<PdiSubscriberUsage, "id" | "timestamp"> & { timestamp?: string }): Promise<void> {

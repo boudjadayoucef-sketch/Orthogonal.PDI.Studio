@@ -54,8 +54,19 @@ service cloud.firestore {
     }
 
     // =========================================================================
-    // 1. PROFILES (FR-08, FR-09 & SEC-01-FIX-04)
+    // 1. PROFILES (FR-08, FR-09, SEC-01-FIX-04 & SEC-01-FIX-04-R1)
     // =========================================================================
+    function isValidProfilePresentationFields(data) {
+      return ('name' in data) &&
+             data.name is string &&
+             data.name.size() >= 1 &&
+             data.name.size() <= 120 &&
+             (!('company' in data) || (data.company is string && data.company.size() <= 150)) &&
+             (!('country' in data) || (data.country is string && data.country.size() <= 100)) &&
+             (!('countryCode' in data) || (data.countryCode is string && data.countryCode.size() >= 2 && data.countryCode.size() <= 10 && data.countryCode.matches('^[A-Z]{2,10}$'))) &&
+             (!('city' in data) || (data.city is string && data.city.size() <= 100));
+    }
+
     function isValidProfileCreation(profileId) {
       let allowedKeys = [
         'uid', 'email', 'name', 'company', 'country', 'countryCode',
@@ -75,6 +86,10 @@ service cloud.firestore {
              data.email == request.auth.token.email &&
              data.keys().hasOnly(allowedKeys) &&
              !data.keys().hasAny(forbiddenKeys) &&
+             isValidProfilePresentationFields(data) &&
+             (!('paymentGateway' in data) || (data.paymentGateway is string && data.paymentGateway.size() <= 60)) &&
+             (!('currency' in data) || (data.currency is string && data.currency.size() <= 10)) &&
+             (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 60)) &&
              (!('status' in data) || data.status == "pending_activation") &&
              (!('accountType' in data) || data.accountType == "basic") &&
              (!('subscriptionPlan' in data) || data.subscriptionPlan == "monthly");
@@ -101,7 +116,8 @@ service cloud.firestore {
              data.uid == profileId &&
              (!('email' in resource.data) || (('email' in data) && data.email == resource.data.email)) &&
              diff.affectedKeys().hasOnly(allowedUpdateKeys) &&
-             !diff.affectedKeys().hasAny(forbiddenUpdateKeys);
+             !diff.affectedKeys().hasAny(forbiddenUpdateKeys) &&
+             isValidProfilePresentationFields(data);
     }
 
     match /profiles/{profileId} {
