@@ -494,9 +494,9 @@ describe("SEC-01-FIX-04-R1 : Persistance des profils Firestore, cohérence d'ins
   });
 
   // =========================================================================
-  // 7. Le cache local reste disponible en cas d'échec distant
+  // 7. Le cache local reste intact (non corrompu) en cas d'échec distant
   // =========================================================================
-  it("07. Le cache local reste disponible en cas d'échec distant sans inclure aucun champ serveur falsifié", async () => {
+  it("07. Le cache local reste disponible et strictement inchangé en cas d'échec distant sans inclure aucun profil non persisté", async () => {
     const initialProfile: PdiUserProfile = {
       uid: "user_123",
       email: "ingenieur@orthogonal.dz",
@@ -528,11 +528,12 @@ describe("SEC-01-FIX-04-R1 : Persistance des profils Firestore, cohérence d'ins
       })
     ).rejects.toThrow("FIRESTORE_UNAVAILABLE: Service temporairement indisponible");
 
-    // Le cache local reste disponible avec les modifications de présentation légitimes et les champs serveur intacts
+    // SEC-01-FIX-04-R2 (B2) : Aucune écriture non persistée ne doit polluer localStorage ; le cache précédent reste intact
     const cached = getProfileFromLocalCache("user_123");
     expect(cached).not.toBeNull();
-    expect(cached?.name).toBe("Nom Modifié Hors Ligne");
-    expect(cached?.company).toBe("Nouvelle Société");
+    expect(cached).toEqual(initialProfile);
+    expect(cached?.name).toBe("Nom Initial");
+    expect(cached?.company).toBe("Société Initiale");
     expect(cached?.status).toBe("pending_activation");
     expect(cached?.accountType).toBe("basic");
     expect(cached?.role).toBe("client");
@@ -728,4 +729,383 @@ describe("SEC-01-FIX-04-R1 : Persistance des profils Firestore, cohérence d'ins
     expect(updatedCache?.status).toBe("active");
     expect(updatedCache?.loginCount).toBe(7);
   });
+
+  // =========================================================================
+  // 11. SEC-01-FIX-04-R2 — B1 : Firestore est l'unique source d'autorité
+  // =========================================================================
+  it("11. (B1) Un cache local obsolète contenant des champs serveur différents ne bloque jamais une mise à jour légitime validée par Firestore", async () => {
+    // Le cache local est resté obsolète (pending_activation / basic / monthly / loginCount: 1)
+    const staleLocalCache: PdiUserProfile = {
+      uid: "user_123",
+      email: "ingenieur@orthogonal.dz",
+      name: "Ancien Nom Cache",
+      company: "Ancienne Société",
+      country: "Algérie",
+      countryCode: "DZ",
+      city: "Alger",
+      role: "client",
+      accountType: "basic",
+      subscriptionPlan: "monthly",
+      status: "pending_activation",
+      createdAt: "2026-04-12T10:00:00.000Z",
+      loginCount: 1,
+      projectsCount: 0,
+      storageUsedKb: 0
+    };
+    saveProfileToLocalCache(staleLocalCache);
+
+    // Le document Firestore autoritatif a été activé côté serveur (active / pro / yearly / loginCount: 8)
+    const authoritativeFirestoreDoc: PdiUserProfile = {
+      uid: "user_123",
+      email: "ingenieur@orthogonal.dz",
+      name: "Youcef Ingénieur",
+      company: "Orthogonal Studio",
+      country: "Algérie",
+      countryCode: "DZ",
+      city: "Alger",
+      role: "client",
+      accountType: "pro",
+      subscriptionPlan: "yearly",
+      status: "active",
+      createdAt: "2026-04-12T10:00:00.000Z",
+      loginCount: 8,
+      projectsCount: 4,
+      storageUsedKb: 1024
+    };
+
+    firestoreMocks.getDoc.mockResolvedValueOnce({
+      exists: () => true,
+      data: () => ({ ...authoritativeFirestoreDoc })
+    });
+    firestoreMocks.updateDoc.mockResolvedValueOnce(undefined);
+
+    // L'utilisateur soumet son profil courant (conforme à Firestore, mais différent du cache local obsolète)
+    await expect(
+      saveFirebaseProfile({
+        ...authoritativeFirestoreDoc,
+        name: "Youcef Boudjada Mis À Jour",
+        city: "Oran"
+      })
+    ).resolves.toBeUndefined();
+
+    expect(firestoreMocks.updateDoc).toHaveBeenCalledTimes(1);
+    const cachedAfter = getProfileFromLocalCache("user_123");
+    expect(cachedAfter?.name).toBe("Youcef Boudjada Mis À Jour");
+    expect(cachedAfter?.city).toBe("Oran");
+    expect(cachedAfter?.status).toBe("active");
+    expect(cachedAfter?.accountType).toBe("pro");
+    expect(cachedAfter?.subscriptionPlan).toBe("yearly");
+    expect(cachedAfter?.loginCount).toBe(8);
+  });
+
+  it("12. (B1) Un cache local manipulé ne peut jamais autoriser la modification d'un champ protégé par rapport à Firestore", async () => {
+    // Un attaquant falsifie localStorage avec status='active', accountType='enterprise', loginCount=999
+    const forgedLocalCache: PdiUserProfile = {
+      uid: "user_123",
+      email: "ingenieur@orthogonal.dz",
+      name: "Youcef Ingénieur",
+      company: "Orthogonal Studio",
+      country: "Algérie",
+      countryCode: "DZ",
+      city: "Alger",
+      role: "client",
+      accountType: "enterprise",
+      subscriptionPlan: "lifetime",
+      status: "active",
+      createdAt: "2026-04-12T10:00:00.000Z",
+      loginCount: 999
+    };
+    saveProfileToLocalCache(forgedLocalCache);
+    const snapshotBefore = getProfileFromLocalCache("user_123");
+
+    // Le document réel dans Firestore est pending_activation / basic / monthly / loginCount=1
+    const realFirestoreDoc: PdiUserProfile = {
+      uid: "user_123",
+      email: "ingenieur@orthogonal.dz",
+      name: "Youcef Ingénieur",
+      company: "Orthogonal Studio",
+      country: "Algérie",
+      countryCode: "DZ",
+      city: "Alger",
+      role: "client",
+      accountType: "basic",
+      subscriptionPlan: "monthly",
+      status: "pending_activation",
+      createdAt: "2026-04-12T10:00:00.000Z",
+      loginCount: 1
+    };
+
+    firestoreMocks.getDoc.mockResolvedValue({
+      exists: () => true,
+      data: () => ({ ...realFirestoreDoc })
+    });
+
+    // Même si l'objet passé correspond au cache falsifié, la comparaison avec Firestore rejette la mutation
+    await expect(
+      saveFirebaseProfile({
+        ...forgedLocalCache,
+        name: "Tentative Bypass Par Cache"
+      })
+    ).rejects.toThrow(/status/);
+
+    expect(firestoreMocks.updateDoc).not.toHaveBeenCalled();
+    expect(getProfileFromLocalCache("user_123")).toEqual(snapshotBefore);
+  });
+
+  // =========================================================================
+  // 13. SEC-01-FIX-04-R2 — B2 : Synchronisation atomique du cache (Tests B2-1 à B2-6)
+  // =========================================================================
+  it("13. (Test B2-1) Échec de getDoc() -> cache local strictement inchangé et erreur originale propagée", async () => {
+    const previousCache: PdiUserProfile = {
+      uid: "user_123",
+      email: "ingenieur@orthogonal.dz",
+      name: "Profil Avant Erreur GetDoc",
+      company: "Orthogonal",
+      country: "Algérie",
+      countryCode: "DZ",
+      city: "Alger",
+      role: "client",
+      accountType: "basic",
+      subscriptionPlan: "monthly",
+      status: "pending_activation",
+      createdAt: "2026-04-12T10:00:00.000Z"
+    };
+    saveProfileToLocalCache(previousCache);
+
+    const getDocError = new Error("FIRESTORE_GETDOC_FAILED: Network timeout");
+    firestoreMocks.getDoc.mockRejectedValueOnce(getDocError);
+
+    await expect(
+      saveFirebaseProfile({
+        ...previousCache,
+        name: "Nouveau Nom Non Persisté"
+      })
+    ).rejects.toThrow(getDocError);
+
+    expect(firestoreMocks.updateDoc).not.toHaveBeenCalled();
+    expect(firestoreMocks.setDoc).not.toHaveBeenCalled();
+    expect(getProfileFromLocalCache("user_123")).toEqual(previousCache);
+  });
+
+  it("14. (Test B2-2) Échec de updateDoc() -> cache local strictement inchangé et erreur originale propagée", async () => {
+    const previousCache: PdiUserProfile = {
+      uid: "user_123",
+      email: "ingenieur@orthogonal.dz",
+      name: "Profil Avant Erreur UpdateDoc",
+      company: "Orthogonal",
+      country: "Algérie",
+      countryCode: "DZ",
+      city: "Alger",
+      role: "client",
+      accountType: "pro",
+      subscriptionPlan: "yearly",
+      status: "active",
+      createdAt: "2026-04-12T10:00:00.000Z"
+    };
+    saveProfileToLocalCache(previousCache);
+
+    firestoreMocks.getDoc.mockResolvedValueOnce({
+      exists: () => true,
+      data: () => ({ ...previousCache })
+    });
+    const updateError = new Error("FIRESTORE_UPDATEDOC_FAILED: Permission denied");
+    firestoreMocks.updateDoc.mockRejectedValueOnce(updateError);
+
+    await expect(
+      saveFirebaseProfile({
+        ...previousCache,
+        name: "Modification Rejetée Par UpdateDoc",
+        city: "Constantine"
+      })
+    ).rejects.toThrow(updateError);
+
+    expect(getProfileFromLocalCache("user_123")).toEqual(previousCache);
+  });
+
+  it("15. (Test B2-3) Échec de setDoc() -> cache local strictement inchangé et erreur originale propagée", async () => {
+    localStorage.removeItem("pdi_user_profile");
+
+    firestoreMocks.getDoc.mockResolvedValueOnce({
+      exists: () => false
+    });
+    const setDocError = new Error("FIRESTORE_SETDOC_FAILED: Quota exceeded");
+    firestoreMocks.setDoc.mockRejectedValueOnce(setDocError);
+
+    const newProfile: PdiUserProfile = {
+      uid: "user_123",
+      email: "ingenieur@orthogonal.dz",
+      name: "Nouveau Profil Création Échouée",
+      company: "Orthogonal",
+      country: "Algérie",
+      countryCode: "DZ",
+      city: "Alger",
+      role: "client",
+      accountType: "basic",
+      subscriptionPlan: "monthly",
+      status: "pending_activation",
+      createdAt: "2026-04-12T10:00:00.000Z"
+    };
+
+    await expect(saveFirebaseProfile(newProfile)).rejects.toThrow(setDocError);
+
+    expect(getProfileFromLocalCache("user_123")).toBeNull();
+  });
+
+  it("16. (Test B2-4) Succès de updateDoc() -> le cache local est mis à jour UNIQUEMENT après la résolution de updateDoc()", async () => {
+    const initialDoc: PdiUserProfile = {
+      uid: "user_123",
+      email: "ingenieur@orthogonal.dz",
+      name: "Nom Avant Update",
+      company: "Société Avant Update",
+      country: "Algérie",
+      countryCode: "DZ",
+      city: "Alger",
+      role: "client",
+      accountType: "pro",
+      subscriptionPlan: "yearly",
+      status: "active",
+      createdAt: "2026-04-12T10:00:00.000Z",
+      loginCount: 5
+    };
+    saveProfileToLocalCache(initialDoc);
+
+    let cacheDuringUpdateDocExecution: PdiUserProfile | null = null;
+    firestoreMocks.getDoc.mockResolvedValueOnce({
+      exists: () => true,
+      data: () => ({ ...initialDoc })
+    });
+    firestoreMocks.updateDoc.mockImplementationOnce(async () => {
+      // Au moment où updateDoc s'exécute, localStorage ne doit PAS encore avoir été modifié
+      cacheDuringUpdateDocExecution = getProfileFromLocalCache("user_123");
+    });
+
+    await saveFirebaseProfile({
+      ...initialDoc,
+      name: "Nom Après Update Réussi",
+      company: "Société Après Update Réussi"
+    });
+
+    expect(cacheDuringUpdateDocExecution).toEqual(initialDoc);
+    const cacheAfterCompletion = getProfileFromLocalCache("user_123");
+    expect(cacheAfterCompletion?.name).toBe("Nom Après Update Réussi");
+    expect(cacheAfterCompletion?.company).toBe("Société Après Update Réussi");
+    expect(cacheAfterCompletion?.status).toBe("active");
+    expect(cacheAfterCompletion?.accountType).toBe("pro");
+    expect(cacheAfterCompletion?.loginCount).toBe(5);
+  });
+
+  it("17. (Test B2-5) Succès de setDoc() -> le cache local est mis à jour UNIQUEMENT après la résolution de setDoc()", async () => {
+    localStorage.removeItem("pdi_user_profile");
+
+    let cacheDuringSetDocExecution: PdiUserProfile | null = null;
+    firestoreMocks.getDoc.mockResolvedValueOnce({
+      exists: () => false
+    });
+    firestoreMocks.setDoc.mockImplementationOnce(async () => {
+      // Au moment où setDoc s'exécute, localStorage doit encore être vide
+      cacheDuringSetDocExecution = getProfileFromLocalCache("user_123");
+    });
+
+    const createdProfile: PdiUserProfile = {
+      uid: "user_123",
+      email: "ingenieur@orthogonal.dz",
+      name: "Profil Créé Après SetDoc",
+      company: "Orthogonal Création",
+      country: "Algérie",
+      countryCode: "DZ",
+      city: "Alger",
+      role: "client",
+      accountType: "basic",
+      subscriptionPlan: "monthly",
+      status: "pending_activation",
+      createdAt: "2026-04-12T10:00:00.000Z"
+    };
+
+    await saveFirebaseProfile(createdProfile);
+
+    expect(cacheDuringSetDocExecution).toBeNull();
+    const cacheAfterSetDoc = getProfileFromLocalCache("user_123");
+    expect(cacheAfterSetDoc).not.toBeNull();
+    expect(cacheAfterSetDoc?.name).toBe("Profil Créé Après SetDoc");
+    expect(cacheAfterSetDoc?.status).toBe("pending_activation");
+    expect(cacheAfterSetDoc?.accountType).toBe("basic");
+  });
+
+  it("18. (Test B2-6) Toute opération échouée propage exactement son instance d'erreur d'origine sans l'altérer", async () => {
+    const customError = new Error("CUSTOM_FIRESTORE_ERROR_CODE_503");
+    firestoreMocks.getDoc.mockRejectedValueOnce(customError);
+
+    let caughtError: unknown = null;
+    try {
+      await saveFirebaseProfile({
+        uid: "user_123",
+        email: "ingenieur@orthogonal.dz",
+        name: "Youcef Ingénieur",
+        role: "client",
+        accountType: "basic",
+        subscriptionPlan: "monthly",
+        status: "pending_activation",
+        createdAt: "2026-04-12T10:00:00.000Z"
+      });
+    } catch (err) {
+      caughtError = err;
+    }
+
+    expect(caughtError).toBe(customError);
+  });
+
+  // =========================================================================
+  // 19. SEC-01-FIX-04-R2 — B3 & B4 : Validation stricte de name et countryCode ISO Alpha-2 côté TypeScript
+  // =========================================================================
+  it("19. (B3 & B4) validateProfilePresentationFields rejette les noms blancs et impose un countryCode ISO 3166-1 alpha-2 exact", () => {
+    // B3 : Rejet des noms vides ou composés uniquement d'espaces
+    for (const invalidName of ["", " ", "    ", "\t", "\n", " \t \n "]) {
+      expect(() =>
+        validateProfilePresentationFields({ name: invalidName }, true)
+      ).toThrow(/name/);
+    }
+
+    // B3 : Acceptation d'un nom valide
+    expect(() =>
+      validateProfilePresentationFields({ name: "Ingénieur Valide" }, true)
+    ).not.toThrow();
+
+    // B4 : Acceptation des codes ISO alpha-2 exacts (2 lettres majuscules) et de l'omission
+    expect(() =>
+      validateProfilePresentationFields({ name: "Ingénieur", countryCode: "DZ" }, true)
+    ).not.toThrow();
+    expect(() =>
+      validateProfilePresentationFields({ name: "Ingénieur", countryCode: "US" }, true)
+    ).not.toThrow();
+    expect(() =>
+      validateProfilePresentationFields({ name: "Ingénieur" }, true)
+    ).not.toThrow();
+
+    // B4 : Rejet de tous les formats countryCode non conformes
+    const invalidCodes: unknown[] = [
+      "DZA",
+      "DZ123",
+      "dz",
+      "Dz",
+      "12",
+      "123",
+      "",
+      "A",
+      "FRX",
+      12,
+      ["DZ"],
+      { code: "DZ" },
+      null
+    ];
+
+    for (const badCode of invalidCodes) {
+      expect(() =>
+        validateProfilePresentationFields(
+          { name: "Ingénieur", countryCode: badCode as string },
+          true
+        )
+      ).toThrow(/countryCode/);
+    }
+  });
 });
+

@@ -247,21 +247,9 @@ export function saveProfileToLocalCache(profile: PdiUserProfile): void {
   }
 }
 
-function restoreOrClearLocalCache(previousProfile: PdiUserProfile | null): void {
-  try {
-    if (previousProfile) {
-      localStorage.setItem("pdi_user_profile", JSON.stringify(previousProfile));
-    } else {
-      localStorage.removeItem("pdi_user_profile");
-    }
-  } catch {
-    // Ignore storage errors
-  }
-}
-
 /**
- * SEC-01-FIX-04-R1 (Correction E) : Validation stricte des champs de présentation éditables.
- * Rejette tout objet, tableau, nombre, booléen, null ou chaîne hors limites.
+ * SEC-01-FIX-04-R1 & R2 (Corrections B3, B4, E) : Validation stricte des champs de présentation éditables.
+ * Rejette tout objet, tableau, nombre, booléen, null, nom composé uniquement d'espaces ou code pays hors ISO alpha-2.
  */
 export function validateProfilePresentationFields(
   profile: Partial<PdiUserProfile>,
@@ -276,8 +264,10 @@ export function validateProfilePresentationFields(
   if (requireName || "name" in raw) {
     if (
       typeof raw.name !== "string" ||
+      raw.name.length < 1 ||
+      raw.name.length > 120 ||
       raw.name.trim().length < 1 ||
-      raw.name.length > 120
+      /^\s*$/.test(raw.name)
     ) {
       throw new Error(
         "Validation du profil refusée : le champ 'name' doit être une chaîne non vide de 1 à 120 caractères."
@@ -304,12 +294,11 @@ export function validateProfilePresentationFields(
   if ("countryCode" in raw && raw.countryCode !== undefined) {
     if (
       typeof raw.countryCode !== "string" ||
-      raw.countryCode.length < 2 ||
-      raw.countryCode.length > 10 ||
-      !/^[A-Z]{2,10}$/.test(raw.countryCode)
+      raw.countryCode.length !== 2 ||
+      !/^[A-Z]{2}$/.test(raw.countryCode)
     ) {
       throw new Error(
-        "Validation du profil refusée : le champ 'countryCode' doit être un code ISO majuscule valide (2 à 10 lettres)."
+        "Validation du profil refusée : le champ 'countryCode' doit être un code ISO 3166-1 alpha-2 valide (exactement 2 lettres majuscules)."
       );
     }
   }
@@ -532,7 +521,7 @@ function assertNoClientServerFieldMutation(
 }
 
 export async function saveFirebaseProfile(profile: PdiUserProfile): Promise<void> {
-  // 1. Vérification stricte de l'identité avant toute opération (locale ou distante)
+  // 1. Validation de l'authentification et de l'identité (aucune lecture ni écriture localStorage)
   const currentUser = auth.currentUser;
   if (!currentUser || !profile || typeof profile.uid !== "string" || currentUser.uid !== profile.uid) {
     throw new Error("Sauvegarde Firestore refusée : l'UID du profil ne correspond pas à l'utilisateur authentifié.");
@@ -543,7 +532,6 @@ export async function saveFirebaseProfile(profile: PdiUserProfile): Promise<void
     throw new Error("Sauvegarde Firestore refusée : l'email du profil ne correspond pas à l'utilisateur authentifié.");
   }
 
-  // Validation immédiate des champs de présentation et rejet des clés d'autorisation interdites
   validateProfilePresentationFields(profile, true);
   const raw = profile as unknown as Record<string, unknown>;
   for (const key of FORBIDDEN_CLIENT_PROFILE_KEYS) {
@@ -555,51 +543,29 @@ export async function saveFirebaseProfile(profile: PdiUserProfile): Promise<void
     throw new Error("Sauvegarde Firestore refusée : aucun rôle privilégié ne peut être attribué par le client.");
   }
 
-  const previousCached = getProfileFromLocalCache(currentUser.uid);
-  if (previousCached) {
-    assertNoClientServerFieldMutation(profile, previousCached as unknown as Record<string, unknown>);
-  }
-
-  // 2. Sauvegarde résiliente dans le cache local (sans aucun champ serveur falsifié)
-  // avant l'opération réseau afin que le cache local reste disponible en cas d'échec distant.
-  const resilientLocalProfile = buildSafeLocalCacheProfile(
-    profile,
-    currentUser.uid,
-    tokenEmail,
-    previousCached
-  );
-  saveProfileToLocalCache(resilientLocalProfile);
-
-  // 3. Opération Firestore distante avec propagation stricte de toute erreur à l'appelant
+  // 2. Lecture du document Firestore existant — Firestore est l'unique source d'autorité (SEC-01-FIX-04-R2 B1)
   const profileRef = doc(db, "profiles", currentUser.uid);
   const existingSnap = await getDoc(profileRef);
 
+  // 3. Validation du payload par rapport au document Firestore autoritatif
+  // 4. Exécution de l'opération Firestore autorisée (updateDoc ou setDoc)
+  // 5. Synchronisation atomique du cache local UNIQUEMENT après le succès de l'écriture Firestore (SEC-01-FIX-04-R2 B2)
   if (existingSnap.exists()) {
     const existingData = existingSnap.data();
     if (existingData.uid && existingData.uid !== profile.uid) {
-      restoreOrClearLocalCache(previousCached);
       throw new Error("Sauvegarde Firestore refusée : l'UID d'un profil ne peut pas être modifié.");
     }
     if (existingData.email && existingData.email !== profile.email) {
-      restoreOrClearLocalCache(previousCached);
       throw new Error("Sauvegarde Firestore refusée : l'email d'un profil ne peut pas être modifié après création.");
     }
 
-    try {
-      assertNoClientServerFieldMutation(profile, existingData);
-    } catch (mutationErr) {
-      saveProfileToLocalCache(
-        buildSafeLocalCacheProfile(
-          existingData as unknown as PdiUserProfile,
-          currentUser.uid,
-          tokenEmail,
-          existingData as Partial<PdiUserProfile>
-        )
-      );
-      throw mutationErr;
-    }
+    assertNoClientServerFieldMutation(profile, existingData);
 
     const updatePayload = buildFirestoreProfileUpdatePayload(profile);
+    if (Object.keys(updatePayload).length > 0) {
+      await updateDoc(profileRef, updatePayload);
+    }
+
     const synchronizedLocalProfile = buildSafeLocalCacheProfile(
       profile,
       currentUser.uid,
@@ -607,20 +573,17 @@ export async function saveFirebaseProfile(profile: PdiUserProfile): Promise<void
       existingData as Partial<PdiUserProfile>
     );
     saveProfileToLocalCache(synchronizedLocalProfile);
-
-    if (Object.keys(updatePayload).length > 0) {
-      await updateDoc(profileRef, updatePayload);
-    }
   } else {
-    let createPayload: Record<string, string>;
-    try {
-      createPayload = buildFirestoreProfileCreatePayload(profile, currentUser.uid, tokenEmail);
-    } catch (validationErr) {
-      restoreOrClearLocalCache(previousCached);
-      throw validationErr;
-    }
-
+    const createPayload = buildFirestoreProfileCreatePayload(profile, currentUser.uid, tokenEmail);
     await setDoc(profileRef, createPayload);
+
+    const createdLocalProfile = buildSafeLocalCacheProfile(
+      profile,
+      currentUser.uid,
+      tokenEmail,
+      null
+    );
+    saveProfileToLocalCache(createdLocalProfile);
   }
 }
 

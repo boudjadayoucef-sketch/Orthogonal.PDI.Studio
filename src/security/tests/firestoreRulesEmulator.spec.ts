@@ -3335,5 +3335,148 @@ describe("SEC-01-FIX-02A & FIX-01 : Firestore Security Rules Emulator Test Suite
       city: "Lyon"
     }));
   });
-});
 
+  // =========================================================================
+  // SUITE 6 : SEC-01-FIX-04-R2 — VALIDATION B3 (WHITESPACE NAME) & B4 (ISO ALPHA-2 COUNTRY CODE)
+  // =========================================================================
+
+  it("SEC-01-FIX-04-R2-B3-01 : Création et modification de profil avec name composé uniquement d'espaces ou caractères blancs : refusées", async () => {
+    const ownerDb = testEnv.authenticatedContext("user_r2_b3", {
+      email: "user_r2_b3@domain.com",
+      email_verified: true
+    }).firestore();
+
+    // Création — name vide ""
+    await assertFails(setDoc(doc(ownerDb, "profiles", "user_r2_b3"), {
+      uid: "user_r2_b3",
+      email: "user_r2_b3@domain.com",
+      name: "",
+      status: "pending_activation"
+    }));
+
+    // Création — name simple espace " "
+    await assertFails(setDoc(doc(ownerDb, "profiles", "user_r2_b3"), {
+      uid: "user_r2_b3",
+      email: "user_r2_b3@domain.com",
+      name: " ",
+      status: "pending_activation"
+    }));
+
+    // Création — name espaces multiples "    "
+    await assertFails(setDoc(doc(ownerDb, "profiles", "user_r2_b3"), {
+      uid: "user_r2_b3",
+      email: "user_r2_b3@domain.com",
+      name: "    ",
+      status: "pending_activation"
+    }));
+
+    // Création — name caractères blancs (tabulations, retours ligne)
+    await assertFails(setDoc(doc(ownerDb, "profiles", "user_r2_b3"), {
+      uid: "user_r2_b3",
+      email: "user_r2_b3@domain.com",
+      name: "\t \n \r ",
+      status: "pending_activation"
+    }));
+
+    // Création — name valide non-blanc : autorisée
+    await assertSucceeds(setDoc(doc(ownerDb, "profiles", "user_r2_b3"), {
+      uid: "user_r2_b3",
+      email: "user_r2_b3@domain.com",
+      name: "Ingénieur Valide",
+      status: "pending_activation"
+    }));
+
+    // Modification — name vide ""
+    await assertFails(updateDoc(doc(ownerDb, "profiles", "user_r2_b3"), {
+      name: ""
+    }));
+
+    // Modification — name simple espace " "
+    await assertFails(updateDoc(doc(ownerDb, "profiles", "user_r2_b3"), {
+      name: " "
+    }));
+
+    // Modification — name espaces multiples "    "
+    await assertFails(updateDoc(doc(ownerDb, "profiles", "user_r2_b3"), {
+      name: "    "
+    }));
+
+    // Modification — name caractères blancs "\t\n "
+    await assertFails(updateDoc(doc(ownerDb, "profiles", "user_r2_b3"), {
+      name: "\t\n "
+    }));
+
+    // Modification — name valide non-blanc : autorisée
+    await assertSucceeds(updateDoc(doc(ownerDb, "profiles", "user_r2_b3"), {
+      name: "Ingénieur Tuyauterie Confirmé"
+    }));
+  });
+
+  it("SEC-01-FIX-04-R2-B4-01 : Création et modification de profil avec countryCode : accepte uniquement ISO 3166-1 alpha-2 (2 lettres majuscules)", async () => {
+    const ownerDb = testEnv.authenticatedContext("user_r2_b4", {
+      email: "user_r2_b4@domain.com",
+      email_verified: true
+    }).firestore();
+
+    const invalidCountryCodes: unknown[] = [
+      "DZA",
+      "DZ123",
+      "dz",
+      "Dz",
+      "12",
+      "123",
+      "",
+      "A",
+      "ABCDEF",
+      12,
+      ["DZ"],
+      { code: "DZ" },
+      null
+    ];
+
+    // Rejet en création pour toutes les valeurs countryCode invalides
+    for (const invalidCode of invalidCountryCodes) {
+      await assertFails(setDoc(doc(ownerDb, "profiles", "user_r2_b4"), {
+        uid: "user_r2_b4",
+        email: "user_r2_b4@domain.com",
+        name: "Ingénieur B4",
+        countryCode: invalidCode,
+        status: "pending_activation"
+      }));
+    }
+
+    // Création valide avec "DZ"
+    await assertSucceeds(setDoc(doc(ownerDb, "profiles", "user_r2_b4"), {
+      uid: "user_r2_b4",
+      email: "user_r2_b4@domain.com",
+      name: "Ingénieur B4",
+      countryCode: "DZ",
+      status: "pending_activation"
+    }));
+
+    // Rejet en modification pour toutes les valeurs countryCode invalides
+    for (const invalidCode of invalidCountryCodes) {
+      await assertFails(updateDoc(doc(ownerDb, "profiles", "user_r2_b4"), {
+        countryCode: invalidCode
+      }));
+    }
+
+    // Modification valide avec "US"
+    await assertSucceeds(updateDoc(doc(ownerDb, "profiles", "user_r2_b4"), {
+      countryCode: "US"
+    }));
+
+    // Création valide lorsque countryCode est omis (comportement optionnel préservé)
+    const ownerNoCodeDb = testEnv.authenticatedContext("user_r2_b4_optional", {
+      email: "user_r2_b4_optional@domain.com",
+      email_verified: true
+    }).firestore();
+
+    await assertSucceeds(setDoc(doc(ownerNoCodeDb, "profiles", "user_r2_b4_optional"), {
+      uid: "user_r2_b4_optional",
+      email: "user_r2_b4_optional@domain.com",
+      name: "Ingénieur Sans CountryCode",
+      status: "pending_activation"
+    }));
+  });
+});

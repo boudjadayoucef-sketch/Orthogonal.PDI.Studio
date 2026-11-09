@@ -54,16 +54,18 @@ service cloud.firestore {
     }
 
     // =========================================================================
-    // 1. PROFILES (FR-08, FR-09, SEC-01-FIX-04 & SEC-01-FIX-04-R1)
+    // 1. PROFILES (FR-08, FR-09, SEC-01-FIX-04, SEC-01-FIX-04-R1 & SEC-01-FIX-04-R2)
     // =========================================================================
     function isValidProfilePresentationFields(data) {
       return ('name' in data) &&
              data.name is string &&
              data.name.size() >= 1 &&
              data.name.size() <= 120 &&
+             data.name.trim().size() >= 1 &&
+             !data.name.matches('^\\s*$') &&
              (!('company' in data) || (data.company is string && data.company.size() <= 150)) &&
              (!('country' in data) || (data.country is string && data.country.size() <= 100)) &&
-             (!('countryCode' in data) || (data.countryCode is string && data.countryCode.size() >= 2 && data.countryCode.size() <= 10 && data.countryCode.matches('^[A-Z]{2,10}$'))) &&
+             (!('countryCode' in data) || (data.countryCode is string && data.countryCode.size() == 2 && data.countryCode.matches('^[A-Z]{2}$'))) &&
              (!('city' in data) || (data.city is string && data.city.size() <= 100));
     }
 
