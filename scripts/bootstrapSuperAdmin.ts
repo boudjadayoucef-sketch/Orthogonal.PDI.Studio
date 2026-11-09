@@ -517,6 +517,14 @@ export function inspectSafeTimeProperty(
   return { kind: 'missing' };
 }
 
+/**
+ * FIX-08-R5-B2 — Références natives capturées au chargement du module.
+ * Ne jamais appeler val.getTime() : cette propriété peut être contrôlée
+ * par un getter propre ou hérité.
+ */
+const SAFE_DATE_GET_TIME = Date.prototype.getTime;
+const SAFE_REFLECT_APPLY = Reflect.apply;
+
 export const TIME_PROPERTIES = [
   'seconds',
   '_seconds',
@@ -590,9 +598,28 @@ export function extractExactTime(val: any): ExactTimeSpec | null {
       }
     }
 
-    // 2. FIX-08-R4-B2 — Instance de Date acceptée uniquement après validation stricte des TIME_PROPERTIES
+    // 2. FIX-08-R5-B2 — Instance de Date acceptée uniquement après validation stricte des TIME_PROPERTIES
+    // et évaluation sécurisée via la référence native capturée SAFE_DATE_GET_TIME
     if (val instanceof Date) {
-      return fromMilliseconds(val.getTime(), 'date');
+      let milliseconds: number;
+
+      try {
+        milliseconds = SAFE_REFLECT_APPLY(
+          SAFE_DATE_GET_TIME,
+          val,
+          []
+        ) as number;
+      } catch {
+        return {
+          valid: false,
+          type: 'date',
+          seconds: NaN,
+          nanoseconds: NaN,
+          error: 'Date invalide'
+        };
+      }
+
+      return fromMilliseconds(milliseconds, 'date');
     }
 
     // 3. Propriétés de données propres uniquement

@@ -1701,6 +1701,195 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
         expect(res?.error).toBe('Propriétés temporelles héritées non autorisées');
         expect(multiCalled).toBe(0);
       });
+
+      // =====================================================================
+      // FIX-08-R5-B2 : PROTECTION CONTRE LES GETTERS PROPRES ET HÉRITÉS getTime
+      // =====================================================================
+
+      it('Test R5-01 — Getter propre getTime : jamais exécuté, compteur à 0, Date reste valide', () => {
+        let ownGetTimeCalls = 0;
+        const validTimestamp = 1785571200456;
+        const hostileDate = new Date(validTimestamp);
+
+        Object.defineProperty(hostileDate, 'getTime', {
+          get() {
+            ownGetTimeCalls++;
+            throw new Error('HOSTILE_GETTIME_OWN_SENTINEL');
+          },
+          configurable: true,
+          enumerable: true
+        });
+
+        expect(() => extractExactTime(hostileDate)).not.toThrow();
+        const res = extractExactTime(hostileDate);
+        expect(res).not.toBeNull();
+        expect(res?.valid).toBe(true);
+        expect(res?.type).toBe('date');
+        expect(res?.seconds).toBe(1785571200);
+        expect(res?.nanoseconds).toBe(456000000);
+        expect(ownGetTimeCalls).toBe(0);
+      });
+
+      it('Test R5-02 — Getter hérité getTime : jamais exécuté, compteur à 0, analyse correcte', () => {
+        let inheritedGetTimeCalls = 0;
+        const validTimestamp = 1785571200789;
+        const intermediateProto = Object.create(Date.prototype);
+
+        Object.defineProperty(intermediateProto, 'getTime', {
+          get() {
+            inheritedGetTimeCalls++;
+            throw new Error('HOSTILE_GETTIME_INHERITED_SENTINEL');
+          },
+          configurable: true,
+          enumerable: true
+        });
+
+        const realDate = new Date(validTimestamp);
+        Object.setPrototypeOf(realDate, intermediateProto);
+
+        expect(() => extractExactTime(realDate)).not.toThrow();
+        const res = extractExactTime(realDate);
+        expect(res).not.toBeNull();
+        expect(res?.valid).toBe(true);
+        expect(res?.type).toBe('date');
+        expect(res?.seconds).toBe(1785571200);
+        expect(res?.nanoseconds).toBe(789000000);
+        expect(inheritedGetTimeCalls).toBe(0);
+      });
+
+      it('Test R5-03 — Prototype à plusieurs niveaux avec getter getTime : jamais exécuté, compteur à 0', () => {
+        let multiLevelGetTimeCalls = 0;
+        const protoL3 = Object.create(Date.prototype);
+        Object.defineProperty(protoL3, 'getTime', {
+          get() {
+            multiLevelGetTimeCalls++;
+            throw new Error('HOSTILE_GETTIME_L3_SENTINEL');
+          },
+          configurable: true,
+          enumerable: true
+        });
+        const protoL2 = Object.create(protoL3);
+        const protoL1 = Object.create(protoL2);
+
+        const realDate = new Date(1785571200999);
+        Object.setPrototypeOf(realDate, protoL1);
+
+        expect(() => extractExactTime(realDate)).not.toThrow();
+        const res = extractExactTime(realDate);
+        expect(res).not.toBeNull();
+        expect(res?.valid).toBe(true);
+        expect(res?.seconds).toBe(1785571200);
+        expect(res?.nanoseconds).toBe(999000000);
+        expect(multiLevelGetTimeCalls).toBe(0);
+      });
+
+      it('Test R5-04 — Date invalide new Date(NaN) : valid === false, aucune exception non maîtrisée', () => {
+        const invalidDate = new Date(NaN);
+        expect(() => extractExactTime(invalidDate)).not.toThrow();
+        const res = extractExactTime(invalidDate);
+        expect(res?.valid).toBe(false);
+        expect(res?.error).toBe('Date invalide');
+      });
+
+      it('Test R5-05 — Date normale acceptée avec valeurs temporelles exactes', () => {
+        const normalDate = new Date('2026-08-01T08:00:00.123Z');
+        const res = extractExactTime(normalDate);
+        expect(res?.valid).toBe(true);
+        expect(res?.type).toBe('date');
+        expect(res?.seconds).toBe(Math.floor(normalDate.getTime() / 1000));
+        expect(res?.nanoseconds).toBe(123000000);
+      });
+
+      it('Test R5-06 — Contrôles sur les six propriétés temporelles TIME_PROPERTIES préservés', () => {
+        for (const prop of TIME_PROPERTIES) {
+          let ownCalled = 0;
+          let inheritedCalled = 0;
+
+          // Propre
+          const ownObj = {};
+          Object.defineProperty(ownObj, prop, {
+            get() {
+              ownCalled++;
+              throw new Error(`HOSTILE_PROP_OWN_${prop}`);
+            }
+          });
+          expect(() => extractExactTime(ownObj)).not.toThrow();
+          const ownRes = extractExactTime(ownObj);
+          expect(ownRes?.valid).toBe(false);
+          expect(ownRes?.error).toBe('Propriétés temporelles par getter/setter non autorisées');
+          expect(ownCalled).toBe(0);
+
+          // Hérité
+          const proto = {};
+          Object.defineProperty(proto, prop, {
+            get() {
+              inheritedCalled++;
+              throw new Error(`HOSTILE_PROP_INHERITED_${prop}`);
+            }
+          });
+          const childObj = Object.create(proto);
+          expect(() => extractExactTime(childObj)).not.toThrow();
+          const inheritedRes = extractExactTime(childObj);
+          expect(inheritedRes?.valid).toBe(false);
+          expect(inheritedRes?.error).toBe('Propriétés temporelles héritées non autorisées');
+          expect(inheritedCalled).toBe(0);
+        }
+      });
+
+      it('Test R5-07 — Régression nanoseconde : deux timestamps différant de 1 ns sont déclarés distincts', () => {
+        const ts1 = { seconds: 1785571200, nanoseconds: 500000000 };
+        const ts2 = { seconds: 1785571200, nanoseconds: 500000001 };
+        const tsExact = { seconds: 1785571200, nanoseconds: 500000000 };
+
+        expect(areDatesOrTimestampsEqual(ts1, tsExact)).toBe(true);
+        expect(areDatesOrTimestampsEqual(ts1, ts2)).toBe(false);
+      });
+
+      it('Test R5-08 — Sentinelles dans les exceptions des getters jamais exposées et compteurs à zéro', () => {
+        let ownGetTimeCount = 0;
+        let inheritedGetTimeCount = 0;
+
+        const sentinels = [
+          'HOSTILE_GETTIME_OWN_SENTINEL_SECRET',
+          'HOSTILE_GETTIME_INHERITED_SENTINEL_SECRET'
+        ];
+
+        const dateWithOwn = new Date(1785571200000);
+        Object.defineProperty(dateWithOwn, 'getTime', {
+          get() {
+            ownGetTimeCount++;
+            throw new Error(sentinels[0]);
+          }
+        });
+
+        const protoWithGetTime = Object.create(Date.prototype);
+        Object.defineProperty(protoWithGetTime, 'getTime', {
+          get() {
+            inheritedGetTimeCount++;
+            throw new Error(sentinels[1]);
+          }
+        });
+        const dateWithInherited = new Date(1785571200000);
+        Object.setPrototypeOf(dateWithInherited, protoWithGetTime);
+
+        // Extraction
+        const resOwn = extractExactTime(dateWithOwn);
+        const resInherited = extractExactTime(dateWithInherited);
+
+        expect(resOwn?.valid).toBe(true);
+        expect(resInherited?.valid).toBe(true);
+        expect(ownGetTimeCount).toBe(0);
+        expect(inheritedGetTimeCount).toBe(0);
+
+        // Sanitize check
+        const sanitizedOwn = sanitizeReportErrorMessage(new Error(sentinels[0]));
+        expect(sanitizedOwn).toBe(GENERIC_EXTERNAL_ERROR);
+        expect(sanitizedOwn).not.toContain(sentinels[0]);
+
+        const sanitizedInherited = sanitizeReportErrorMessage(new Error(sentinels[1]));
+        expect(sanitizedInherited).toBe(GENERIC_EXTERNAL_ERROR);
+        expect(sanitizedInherited).not.toContain(sentinels[1]);
+      });
     });
 
     // -----------------------------------------------------------------------
