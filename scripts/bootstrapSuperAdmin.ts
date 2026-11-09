@@ -1,22 +1,24 @@
 /**
- * ORTHOGONAL PD&I STUDIO — SEC-01 / AUTH-ADMIN-05-FIX-08
+ * ORTHOGONAL PD&I STUDIO — SEC-01 / AUTH-ADMIN-05-FIX-08-R1
  * Script de Bootstrap Super Admin sécurisé (Firebase Admin SDK).
  * 
  * Ce script est autonome, idempotent et strictement sécurisé :
  * - Cible exclusivement le projet Firebase 'graphical-router-x18qq' via adminAuth.app.options.projectId et getFirestoreProjectId(db).
  * - Autorise exclusivement l'adresse 'boudjada.youcef@gmail.com'.
  * - Contrôle le compte : existence, activation stricte (disabled === false), vérification email (emailVerified === true), fournisseur 'google.com'.
+ * - FIX-08-R1-A : Élimination absolue des messages d'erreur SDK bruts, stacks et payloads dans BootstrapReport, report.error,
+ *   les exceptions levées et les logs CLI. Normalisation centralisée avec sanitizeReportErrorMessage() et codes d'erreur strictement validés.
+ * - FIX-08-R1-B : Élimination de l'opérateur 'in' dans extractExactTime() au profit exclusif de Object.prototype.hasOwnProperty.call().
+ *   Rejet strict des propriétés temporelles héritées, préservation de la précision nanoseconde.
  * - FIX-08-A : Suppression totale des valeurs sensibles, dates, timestamps et données brutes dans compareClaimsStructural et deepCompareFirestoreData.
  * - FIX-08-B : Remplacement strict de l'opérateur 'in' par Object.prototype.hasOwnProperty.call() pour n'évaluer que les propriétés propres.
  * - FIX-08-C : Détection exacte de isDangerousKey sans rejeter les propriétés légitimes cibles (constructorName, prototypeVersion),
- *   safeDefineProperty sécurisée avec Object.defineProperty, préservation des propriétés propres cibles (y compris constructor et __proto__ en données propres).
+ *   safeDefineProperty sécurisée avec Object.defineProperty, préservation des propriétés propres cibles.
  * - FIX-08-D : Retrait d'email et uid de BootstrapReport et des logs de sortie (traitement mémoire interne préservé).
  * - FIX-07-A : Échec ambigu de l'écriture Firestore : encadrement spécifique, relecture diagnostique, comparaison intégrale,
  *   signalement partialState: true, refus de retry automatique, interdiction stricte de poursuivre vers les Custom Claims.
- * - FIX-07-B & FIX-07-G : Vérification structurelle récursive des Custom Claims (compareClaimsStructural) : indépendante de l'ordre JSON,
- *   détection des clés manquantes, types différents et clés supplémentaires inattendues. Préservation de tous les claims existants.
- * - FIX-07-C : Exclusion absolue des champs d'autorisation historiques (role, roles, admin, isAdmin, isSuperAdmin, permissions,
- *   customClaims, accessLevel, privileges, authorization, authorizations, securityRole, adminRole) à tous les niveaux.
+ * - FIX-07-B & FIX-07-G : Vérification structurelle récursive des Custom Claims : indépendante de l'ordre JSON, détection des clés manquantes/inattendues.
+ * - FIX-07-C : Exclusion absolue des champs d'autorisation historiques à tous les niveaux.
  * - FIX-07-D : Validation stricte du compte désactivé (userRecord.disabled === false impératif, fail-closed).
  * - FIX-07-E : Réduction des données exposées dans les rapports : finalProfileToSave retiré du rapport, conflits sans valeurs brutes.
  * - FIX-06 B1 : Extraction temporelle stricte avec fuseau obligatoire, calendrier réel, fraction 1..9 chiffres max, décalages UTC validés.
@@ -32,6 +34,64 @@ import { adminAuth, adminDb } from '../src/lib/firebase-admin.ts';
 export const EXPECTED_PROJECT_ID = 'graphical-router-x18qq';
 export const ALLOWED_SUPER_ADMIN_EMAIL = 'boudjada.youcef@gmail.com';
 export const HISTORICAL_PROFILE_DOC_ID = 'superadmin-youcef-boudjada';
+
+/**
+ * FIX-08-R1-A — Validation et assainissement strict d'un code d'erreur SDK.
+ * Autorise uniquement les chaînes alphanumériques courtes (ex: 'auth/user-not-found', 'unavailable').
+ * Rejette toute chaîne contenant des espaces, caractères spéciaux ou données utilisateurs.
+ */
+export function sanitizeSdkErrorCode(code: any): string | null {
+  if (typeof code !== 'string') return null;
+  const trimmed = code.trim();
+  if (/^[a-zA-Z0-9_\/-]{3,50}$/.test(trimmed)) {
+    return trimmed.toLowerCase();
+  }
+  return null;
+}
+
+export function formatSanitizedErrorCode(code: any): string {
+  const sanitized = sanitizeSdkErrorCode(code);
+  return sanitized ? ` (code: ${sanitized})` : '';
+}
+
+/**
+ * FIX-08-R1-A — Préfixes stricts des erreurs contrôlées de bootstrap autorisées.
+ * Tout message d'erreur ne débutant pas par l'un de ces préfixes est considéré non contrôlé
+ * et normalisé en [ERREUR SYSTÈME] sans divulgation d'aucun message SDK brut.
+ */
+export const CONTROLLED_ERROR_PREFIXES = [
+  '[BLOCAGE PROJET]',
+  '[BLOCAGE EMAIL]',
+  '[COMPTE INTROUVABLE]',
+  '[COMPTE DÉSACTIVÉ]',
+  '[EMAIL NON VÉRIFIÉ]',
+  '[FOURNISSEUR INVALIDE]',
+  '[ERREUR LECTURE FIRESTORE]',
+  '[ÉTAT PARTIEL - INTERVENTION REQUISE]',
+  '[ÉTAT PARTIEL - ÉCHEC ÉCRITURE AMBIGU]',
+  '[ÉTAT PARTIEL]',
+  '[ARGUMENT INVALIDE]',
+  '[ERREUR FUSION]'
+] as const;
+
+/**
+ * FIX-08-R1-A — Normalisation centralisée des erreurs de bootstrap :
+ * Supprime systématiquement tout message brut SDK, stack trace ou données interpolées non contrôlées.
+ */
+export function sanitizeReportErrorMessage(err: any): string {
+  if (!err) return '[ERREUR INCONNUE] Une erreur indéterminée est survenue.';
+  const rawMsg = typeof err === 'string' ? err : err?.message;
+
+  if (
+    typeof rawMsg === 'string' &&
+    CONTROLLED_ERROR_PREFIXES.some((prefix) => rawMsg.startsWith(prefix))
+  ) {
+    return rawMsg;
+  }
+
+  const code = sanitizeSdkErrorCode(err?.code);
+  return `[ERREUR SYSTÈME] Une erreur non gérée est survenue durant le bootstrap${code ? ` (code: ${code})` : ''}.`;
+}
 
 /**
  * FIX-08-C — Liste exacte des clés dangereuses pour prévenir la pollution de prototype.
@@ -291,7 +351,8 @@ export interface ExactTimeSpec {
 }
 
 /**
- * Extraction temporelle exacte sans perte de précision nanoseconde.
+ * FIX-08-R1-B — Extraction temporelle exacte sans opérateur 'in' :
+ * Utilise strictement Object.prototype.hasOwnProperty.call() pour n'évaluer que les propriétés propres.
  */
 export function extractExactTime(val: any): ExactTimeSpec | null {
   if (val === null || val === undefined) return null;
@@ -312,12 +373,17 @@ export function extractExactTime(val: any): ExactTimeSpec | null {
   if (val instanceof Date) return fromMilliseconds(val.getTime(), 'date');
 
   if (typeof val === 'object') {
-    const hasSeconds = 'seconds' in val || '_seconds' in val;
-    const hasNanoseconds = 'nanoseconds' in val || '_nanoseconds' in val;
-    const rawSec = 'seconds' in val ? val.seconds : val._seconds;
-    const rawNs = 'nanoseconds' in val ? val.nanoseconds : val._nanoseconds;
+    const hasSeconds = Object.prototype.hasOwnProperty.call(val, 'seconds');
+    const hasUnderscoreSeconds = Object.prototype.hasOwnProperty.call(val, '_seconds');
+    const hasNanoseconds = Object.prototype.hasOwnProperty.call(val, 'nanoseconds');
+    const hasUnderscoreNanoseconds = Object.prototype.hasOwnProperty.call(val, '_nanoseconds');
 
-    if (hasSeconds || hasNanoseconds) {
+    const hasAnySeconds = hasSeconds || hasUnderscoreSeconds;
+    const hasAnyNanoseconds = hasNanoseconds || hasUnderscoreNanoseconds;
+    const rawSec = hasSeconds ? val.seconds : (hasUnderscoreSeconds ? val._seconds : undefined);
+    const rawNs = hasNanoseconds ? val.nanoseconds : (hasUnderscoreNanoseconds ? val._nanoseconds : undefined);
+
+    if (hasAnySeconds || hasAnyNanoseconds) {
       if (
         typeof rawSec !== 'number' ||
         typeof rawNs !== 'number' ||
@@ -337,7 +403,20 @@ export function extractExactTime(val: any): ExactTimeSpec | null {
       return { valid: true, type: 'timestamp', seconds: rawSec, nanoseconds: rawNs };
     }
 
-    if (typeof val.toDate === 'function' || typeof val.toMillis === 'function') {
+    // FIX-08-R1-B : Propriétés temporelles purement héritées rejetées strictement
+    const hasInheritedSeconds = !hasAnySeconds && ((val as any).seconds !== undefined || (val as any)._seconds !== undefined);
+    const hasInheritedNanoseconds = !hasAnyNanoseconds && ((val as any).nanoseconds !== undefined || (val as any)._nanoseconds !== undefined);
+    if (hasInheritedSeconds || hasInheritedNanoseconds) {
+      return {
+        valid: false,
+        type: 'timestamp',
+        seconds: NaN,
+        nanoseconds: NaN,
+        error: 'Propriétés temporelles héritées non autorisées'
+      };
+    }
+
+    if (typeof (val as any).toDate === 'function' || typeof (val as any).toMillis === 'function') {
       return {
         valid: false,
         type: 'timestamp',
@@ -610,8 +689,7 @@ export function deepCompareFirestoreData(expected: any, actual: any, path = ''):
 /**
  * FIX-08-C : Fusion récursive non destructive protégée :
  * - Priorité absolue aux champs, objets imbriqués et tableaux de targetData.
- * - Les propriétés propres déjà présentes dans la cible (y compris constructor, __proto__, constructorName, etc.)
- *   sont intégralement préservées sans déclencher de setter de prototype.
+ * - Les propriétés propres déjà présentes dans la cible sont intégralement préservées.
  * - Les clés dangereuses provenant du profil historique restent strictement exclues.
  * - Exclusion absolue des champs d'autorisation et des données commerciales depuis l'historique.
  * - Résumé non sensible des conflits (ConflictSummary sans valeurs brutes).
@@ -629,7 +707,7 @@ export function mergeProfileDataNonDestructive(
   const recoveredFields: string[] = [];
 
   if (!targetProfileData && !historicalProfileData) {
-    throw new Error("Impossible d'effectuer la fusion : aucun profil cible ni profil historique n'a été trouvé.");
+    throw new Error("[ERREUR FUSION] Impossible d'effectuer la fusion : aucun profil cible ni profil historique n'a été trouvé.");
   }
 
   function filterHistoricalValue(value: any, path: string): any {
@@ -665,7 +743,7 @@ export function mergeProfileDataNonDestructive(
   ): Record<string, any> {
     const result: Record<string, any> = createSafePlainObject();
 
-    // FIX-08-C : Copier toutes les propriétés propres de target sans en exclure arbitrairement
+    // FIX-08-C : Copier toutes les propriétés propres de target
     if (target && isPlainObject(target)) {
       for (const tKey of Object.getOwnPropertyNames(target)) {
         safeDefineProperty(result, tKey, target[tKey]);
@@ -695,7 +773,6 @@ export function mergeProfileDataNonDestructive(
               });
             }
           }
-          // Si targetValue === undefined : NE JAMAIS IMPORTER DEPUIS L'HISTORIQUE !
           continue;
         }
 
@@ -722,7 +799,6 @@ export function mergeProfileDataNonDestructive(
             safeDefineProperty(result, key, targetValue);
           }
         } else {
-          // Champ absent de la cible et non protégé :
           if (isPlainObject(histValue)) {
             const nestedMerged = mergeRecursive(null, histValue, fieldPath);
             if (nestedMerged && Object.keys(nestedMerged).length > 0) {
@@ -852,10 +928,7 @@ export async function runSuperAdminBootstrap(options: BootstrapOptions = {}): Pr
       authProjectId !== firestoreProjectId
     ) {
       throw new Error(
-        `[BLOCAGE PROJET] Projet Auth/Firestore non autorisé ou non vérifiable. ` +
-        `Auth='${authProjectId || 'indéfini'}', ` +
-        `Firestore='${firestoreProjectId || 'indéfini'}', ` +
-        `attendu='${EXPECTED_PROJECT_ID}'.`
+        `[BLOCAGE PROJET] Projet Auth/Firestore non autorisé ou non vérifiable. Attendu='${EXPECTED_PROJECT_ID}'.`
       );
     }
 
@@ -869,7 +942,9 @@ export async function runSuperAdminBootstrap(options: BootstrapOptions = {}): Pr
     try {
       userRecord = await authSdk.getUserByEmail(targetEmail);
     } catch (err: any) {
-      throw new Error(`[COMPTE INTROUVABLE] Aucun utilisateur Firebase Auth pour le compte cible : ${err?.message || err}`);
+      // FIX-08-R1-A : Aucun err.message brut propagé
+      const code = sanitizeSdkErrorCode(err?.code);
+      throw new Error(`[COMPTE INTROUVABLE] Aucun utilisateur Firebase Auth pour le compte cible${code ? ` (code: ${code})` : ''}.`);
     }
 
     // FIX-07-D : Validation stricte du compte désactivé (userRecord.disabled === false impératif, fail-closed)
@@ -921,7 +996,9 @@ export async function runSuperAdminBootstrap(options: BootstrapOptions = {}): Pr
         report.historicalProfileFound = true;
       }
     } catch (err: any) {
-      throw new Error(`[ERREUR LECTURE FIRESTORE] Échec de la lecture du profil historique : ${err?.message || err}`);
+      // FIX-08-R1-A : Aucun err.message brut propagé
+      const code = sanitizeSdkErrorCode(err?.code);
+      throw new Error(`[ERREUR LECTURE FIRESTORE] Échec de la lecture du profil historique${code ? ` (code: ${code})` : ''}.`);
     }
 
     try {
@@ -931,7 +1008,9 @@ export async function runSuperAdminBootstrap(options: BootstrapOptions = {}): Pr
         report.targetProfileFound = true;
       }
     } catch (err: any) {
-      throw new Error(`[ERREUR LECTURE FIRESTORE] Échec de la lecture du profil cible : ${err?.message || err}`);
+      // FIX-08-R1-A : Aucun err.message brut propagé
+      const code = sanitizeSdkErrorCode(err?.code);
+      throw new Error(`[ERREUR LECTURE FIRESTORE] Échec de la lecture du profil cible${code ? ` (code: ${code})` : ''}.`);
     }
 
     // 5. Construction et validation de la fusion non destructive protégée (FIX-07-C & FIX-08-C)
@@ -944,7 +1023,7 @@ export async function runSuperAdminBootstrap(options: BootstrapOptions = {}): Pr
 
     // 6. Exécution sécurisée conditionnée au mode --execute (strictement ignorée en dry-run)
     if (isExecute) {
-      // Étape 6.1 : Écriture du profil cible dans Firestore avec gestion d'échec ambigu (FIX-07-A)
+      // Étape 6.1 : Écriture du profil cible dans Firestore avec gestion d'échec ambigu (FIX-07-A & FIX-08-R1-A)
       try {
         await targetDocRef.set(finalProfileToSave, { merge: true });
         report.profileWritten = true;
@@ -968,13 +1047,17 @@ export async function runSuperAdminBootstrap(options: BootstrapOptions = {}): Pr
         report.partialState = true;
         report.profileWritten = diagnosticDataPresent;
 
+        // FIX-08-R1-A : Aucun writeErr.message brut propagé
+        const code = sanitizeSdkErrorCode(writeErr?.code);
+        const codeSuffix = code ? ` (code: ${code})` : '';
+
         if (diagnosticDataPresent) {
           throw new Error(
-            `[ÉTAT PARTIEL - INTERVENTION REQUISE] L'écriture Firestore targetDocRef.set() a levé une exception, mais la relecture diagnostique constate que les données attendues ont bien été enregistrées. Une intervention manuelle est requise avant toute modification de Custom Claims : ${writeErr?.message || writeErr}`
+            `[ÉTAT PARTIEL - INTERVENTION REQUISE] L'écriture Firestore targetDocRef.set() a levé une exception, mais la relecture diagnostique constate que les données attendues ont bien été enregistrées. Une intervention manuelle est requise avant toute modification de Custom Claims${codeSuffix}.`
           );
         } else {
           throw new Error(
-            `[ÉTAT PARTIEL - ÉCHEC ÉCRITURE AMBIGU] L'écriture Firestore targetDocRef.set() a échoué (${writeErr?.message || writeErr}) et la relecture diagnostique n'a pas pu certifier l'état final (diagnosticRead=${diagnosticReadPossible}, matched=${diagnosticDataPresent}). Arrêt immédiat sans modification de Custom Claims.`
+            `[ÉTAT PARTIEL - ÉCHEC ÉCRITURE AMBIGU] L'écriture Firestore targetDocRef.set() a échoué et la relecture diagnostique n'a pas pu certifier l'état final (diagnosticRead=${diagnosticReadPossible}, matched=${diagnosticDataPresent}). Arrêt immédiat sans modification de Custom Claims${codeSuffix}.`
           );
         }
       }
@@ -992,13 +1075,22 @@ export async function runSuperAdminBootstrap(options: BootstrapOptions = {}): Pr
 
         const diffs = deepCompareFirestoreData(finalProfileToSave, reloadedData);
         if (diffs.length > 0) {
-          throw new Error(`Le profil relu ne correspond pas aux données enregistrées : ${diffs.join(' ; ')}`);
+          throw new Error(`Divergence structurelle du profil relu : ${diffs.join(' ; ')}`);
         }
 
         report.profileVerified = true;
       } catch (err: any) {
         report.partialState = true;
-        throw new Error(`[ÉTAT PARTIEL] Profil Firestore écrit, MAIS échec de la relecture/vérification du profil : ${err?.message || err}`);
+        // FIX-08-R1-A : Préserver nos messages contrôlés sans exposer de message SDK brut
+        const rawMsg = err?.message;
+        if (
+          typeof rawMsg === 'string' &&
+          (rawMsg.startsWith('Le document') || rawMsg.startsWith("L'UID") || rawMsg.startsWith('Divergence structurelle'))
+        ) {
+          throw new Error(`[ÉTAT PARTIEL] Profil Firestore écrit, MAIS ${rawMsg}`);
+        }
+        const code = sanitizeSdkErrorCode(err?.code);
+        throw new Error(`[ÉTAT PARTIEL] Profil Firestore écrit, MAIS échec de la relecture/vérification du profil${code ? ` (code: ${code})` : ''}.`);
       }
 
       // Étape 6.3 : Ajouter le Custom Claim role: 'super_admin' (après vérification Firestore réussie)
@@ -1007,7 +1099,9 @@ export async function runSuperAdminBootstrap(options: BootstrapOptions = {}): Pr
         report.claimsUpdated = true;
       } catch (err: any) {
         report.partialState = true;
-        throw new Error(`[ÉTAT PARTIEL] Profil Firestore écrit et vérifié, MAIS échec de l'attribution des Custom Claims : ${err?.message || err}`);
+        // FIX-08-R1-A : Aucun err.message brut propagé
+        const code = sanitizeSdkErrorCode(err?.code);
+        throw new Error(`[ÉTAT PARTIEL] Profil Firestore écrit et vérifié, MAIS échec de l'attribution des Custom Claims${code ? ` (code: ${code})` : ''}.`);
       }
 
       // Étape 6.4 : Relire et vérifier intégralement les Custom Claims (FIX-07-B, FIX-07-G & FIX-08-A)
@@ -1027,7 +1121,16 @@ export async function runSuperAdminBootstrap(options: BootstrapOptions = {}): Pr
         report.claimsVerified = true;
       } catch (err: any) {
         report.partialState = true;
-        throw new Error(`[ÉTAT PARTIEL] Profil Firestore écrit et vérifié, MAIS échec de la relecture/vérification des Custom Claims : ${err?.message || err}`);
+        // FIX-08-R1-A : Préserver nos messages contrôlés sans exposer de message SDK brut
+        const rawMsg = err?.message;
+        if (
+          typeof rawMsg === 'string' &&
+          (rawMsg.startsWith('Le claim') || rawMsg.startsWith('Divergence structurelle'))
+        ) {
+          throw new Error(`[ÉTAT PARTIEL] Profil Firestore écrit et vérifié, MAIS ${rawMsg}`);
+        }
+        const code = sanitizeSdkErrorCode(err?.code);
+        throw new Error(`[ÉTAT PARTIEL] Profil Firestore écrit et vérifié, MAIS échec de la relecture/vérification des Custom Claims${code ? ` (code: ${code})` : ''}.`);
       }
     }
 
@@ -1038,7 +1141,8 @@ export async function runSuperAdminBootstrap(options: BootstrapOptions = {}): Pr
       report.partialState = true;
     }
     report.success = false;
-    report.error = err?.message || String(err);
+    // FIX-08-R1-A : Assainissement centralisé sans fuite de message brut
+    report.error = sanitizeReportErrorMessage(err);
     return report;
   }
 }
@@ -1073,11 +1177,13 @@ if (isDirectCliExecution(import.meta.url, process.argv[1])) {
         }
       })
       .catch((err) => {
-        console.error('\n[FATAL]', err);
+        // FIX-08-R1-A : Aucun objet d'erreur brut imprimé dans la sortie
+        console.error(`\n[FATAL] Échec critique non géré durant le bootstrap Super Admin${formatSanitizedErrorCode(err?.code)}.\n`);
         process.exit(1);
       });
   } catch (cliErr: any) {
-    console.error(`\n[ERREUR CLI] ${cliErr.message}\n`);
+    // FIX-08-R1-A : Assainissement du message CLI
+    console.error(`\n[ERREUR CLI] ${sanitizeReportErrorMessage(cliErr)}\n`);
     process.exit(1);
   }
 }
