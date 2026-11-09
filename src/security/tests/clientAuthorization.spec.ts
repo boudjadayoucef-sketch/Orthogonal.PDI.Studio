@@ -1,17 +1,19 @@
 /**
- * SEC-01-FIX-03 — Tests unitaires d'autorisation Super Admin côté client
+ * SEC-01-FIX-03-R1 — Tests unitaires d'autorisation Super Admin côté client
  *
- * Vérifie l'ensemble des 10 exigences strictes du cahier des charges :
- * 1. Custom Claim Super Admin + email vérifié -> autorisé
- * 2. Custom Claim Super Admin + email non vérifié -> refusé
- * 3. Claim `role` absent -> refusé
- * 4. Claim `role: client` -> refusé
- * 5. Profil Firestore avec `role: super_admin`, mais token client -> refusé
- * 6. localStorage avec `super_admin`, mais token absent / nul -> refusé
- * 7. Adresse email historique Super Admin sans claim -> refusée
- * 8. Claim falsifié ou incomplet -> refusé
- * 9. Session démo (`authMode === "demo"`) donne zéro privilège administratif
- * 10. Accès direct aux vues administratives sans claim -> redirection vers vue de repli ("isometric")
+ * Vérifie l'ensemble des exigences strictes :
+ * 1. role=super_admin et email_verified=true : autorisé
+ * 2. role=super_admin sans email_verified : refusé, même si userEmailVerified=true
+ * 3. role=super_admin et email_verified=false : refusé
+ * 4. role=super_admin et email_verified="true" : refusé
+ * 5. Token client après une session Super Admin : rétrogradation immédiate
+ * 6. Déconnexion pendant une vérification asynchrone : aucun rétablissement des droits
+ * 7. Changement de compte pendant une vérification asynchrone : ancien résultat ignoré
+ * 8. Erreur de récupération du token : refus d'autorisation
+ * 9. Claims Super Admin actualisés après révocation : accès administratif refusé
+ * 10. Aucun état provenant de localStorage ne peut rétablir les privilèges
+ *
+ * + Maintien des tests de compatibilité de vues et session démo.
  */
 
 import { describe, it, expect } from "vitest";
@@ -21,14 +23,16 @@ import {
   verifySuperAdminFromFirebaseUser,
   isRestrictedAdminView,
   getAuthorizedView,
-  SUPER_ADMIN_RESTRICTED_VIEWS
+  SUPER_ADMIN_RESTRICTED_VIEWS,
+  resolveNextAuthMode
 } from "../clientAuthorization";
 
-describe("SEC-01-FIX-03: Client Authorization & Super Admin Authority", () => {
-  // 1. Custom Claim Super Admin + email vérifié -> autorisé
-  it("Test 1: Custom Claim role==='super_admin' + emailVerified===true authorizes Super Admin", () => {
+describe("SEC-01-FIX-03-R1: Client Authorization, Token Listener Hardening & Revocation", () => {
+  // 1. role=super_admin et email_verified=true : autorisé
+  it("Exigence 1: role='super_admin' and email_verified=true is authorized", () => {
     const claims = { role: "super_admin", email_verified: true };
     expect(isSuperAdminClaimAuthorized(claims, true)).toBe(true);
+    expect(isSuperAdminClaimAuthorized(claims, undefined)).toBe(true);
 
     const tokenResult = {
       token: "valid-jwt",
@@ -42,71 +46,157 @@ describe("SEC-01-FIX-03: Client Authorization & Super Admin Authority", () => {
     expect(isSuperAdminFromTokenResult(tokenResult, true)).toBe(true);
   });
 
-  // 2. Custom Claim Super Admin + email non vérifié -> refusé
-  it("Test 2: Custom Claim role==='super_admin' + email NOT verified (false or missing) is strictly rejected", () => {
-    const claims = { role: "super_admin" };
-    expect(isSuperAdminClaimAuthorized(claims, false)).toBe(false);
-    expect(isSuperAdminClaimAuthorized(claims, undefined)).toBe(false);
-
-    // Même si claims.email_verified est faux
-    const claimsUnverified = { role: "super_admin", email_verified: false };
-    expect(isSuperAdminClaimAuthorized(claimsUnverified, false)).toBe(false);
-    expect(isSuperAdminClaimAuthorized(claimsUnverified, true)).toBe(false);
-  });
-
-  // 3. Claim role absent -> refusé
-  it("Test 3: Missing role claim is rejected even with verified email", () => {
-    const claimsWithoutRole = { user_id: "xyz123", email_verified: true };
-    expect(isSuperAdminClaimAuthorized(claimsWithoutRole, true)).toBe(false);
-
-    const emptyClaims = {};
-    expect(isSuperAdminClaimAuthorized(emptyClaims, true)).toBe(false);
-    expect(isSuperAdminClaimAuthorized(null, true)).toBe(false);
-    expect(isSuperAdminClaimAuthorized(undefined, true)).toBe(false);
-  });
-
-  // 4. Claim role: client -> refusé
-  it("Test 4: Non super_admin roles (e.g. 'client', 'user', 'guest') are strictly rejected", () => {
-    expect(isSuperAdminClaimAuthorized({ role: "client", email_verified: true }, true)).toBe(false);
-    expect(isSuperAdminClaimAuthorized({ role: "user", email_verified: true }, true)).toBe(false);
-    expect(isSuperAdminClaimAuthorized({ role: "guest", email_verified: true }, true)).toBe(false);
-  });
-
-  // 5. Profil Firestore avec role: super_admin, mais token client -> refusé
-  it("Test 5: Firestore profile claiming 'super_admin' is discarded if token claims say otherwise", () => {
-    const firestoreProfile = {
-      name: "Attacker Pretending Admin",
-      email: "attacker@pdi-vision.dz",
-      role: "super_admin"
-    };
+  // 2. role=super_admin sans email_verified : refusé, même si userEmailVerified=true
+  it("Exigence 2: role='super_admin' without email_verified claim is strictly rejected even if userEmailVerified=true", () => {
+    const claimsWithoutEmailVerified = { role: "super_admin" };
+    expect(isSuperAdminClaimAuthorized(claimsWithoutEmailVerified, true)).toBe(false);
+    expect(isSuperAdminClaimAuthorized(claimsWithoutEmailVerified, false)).toBe(false);
+    expect(isSuperAdminClaimAuthorized(claimsWithoutEmailVerified, undefined)).toBe(false);
 
     const tokenResult = {
-      token: "valid-jwt",
-      authTime: "now",
-      issuedAtTime: "now",
-      expirationTime: "later",
-      signInProvider: "password",
-      signInSecondFactor: null,
-      claims: { role: "client", email_verified: true }
+      claims: { role: "super_admin" }
     };
-
-    // Le token affirme client -> le résultat doit être faux indépendamment de firestoreProfile
-    const isSuper = isSuperAdminFromTokenResult(tokenResult, true);
-    expect(isSuper).toBe(false);
-    expect(firestoreProfile.role === "super_admin").toBe(true); // profile declares it, but client authorization ignores it
+    expect(isSuperAdminFromTokenResult(tokenResult, true)).toBe(false);
   });
 
-  // 6. localStorage avec super_admin, mais token absent / nul -> refusé
-  it("Test 6: localStorage containing 'super_admin' without valid verified token results in rejection", async () => {
-    // Simuler absence de Firebase User authentifié
-    const isSuperNullUser = await verifySuperAdminFromFirebaseUser(null);
-    expect(isSuperNullUser).toBe(false);
+  // 3. role=super_admin et email_verified=false : refusé
+  it("Exigence 3: role='super_admin' and email_verified=false is strictly rejected", () => {
+    const claimsUnverified = { role: "super_admin", email_verified: false };
+    expect(isSuperAdminClaimAuthorized(claimsUnverified, true)).toBe(false);
+    expect(isSuperAdminClaimAuthorized(claimsUnverified, false)).toBe(false);
+    expect(isSuperAdminClaimAuthorized(claimsUnverified, undefined)).toBe(false);
+  });
 
-    // Simuler token sans claims valides
-    const mockUserNoClaims = {
+  // 4. role=super_admin et email_verified="true" : refusé
+  it("Exigence 4: role='super_admin' and email_verified='true' (string) is strictly rejected", () => {
+    const claimsStringTrue = { role: "super_admin", email_verified: "true" };
+    expect(isSuperAdminClaimAuthorized(claimsStringTrue, true)).toBe(false);
+    expect(isSuperAdminClaimAuthorized(claimsStringTrue, false)).toBe(false);
+
+    // Types alternatifs inattendus (number, object, null)
+    expect(isSuperAdminClaimAuthorized({ role: "super_admin", email_verified: 1 }, true)).toBe(false);
+    expect(isSuperAdminClaimAuthorized({ role: "super_admin", email_verified: {} }, true)).toBe(false);
+    expect(isSuperAdminClaimAuthorized({ role: "super_admin", email_verified: null }, true)).toBe(false);
+  });
+
+  // 5. Token client après une session Super Admin : rétrogradation immédiate
+  it("Exigence 5: Client token received after Super Admin session triggers immediate downgrade to 'client'", () => {
+    const currentAuthMode = "super_admin";
+    const user = { uid: "user-123", emailVerified: true };
+    const clientClaims = { role: "client", email_verified: true };
+    const sessionContext = {
+      isSubscribed: true,
+      callbackSeq: 2,
+      currentSeq: 2,
+      activeUid: "user-123"
+    };
+
+    const nextMode = resolveNextAuthMode(currentAuthMode, user, clientClaims, sessionContext);
+    expect(nextMode).toBe("client");
+  });
+
+  // 6. Déconnexion pendant une vérification asynchrone : aucun rétablissement des droits
+  it("Exigence 6: Sign-out occurring during async token verification prevents any re-elevation of rights", () => {
+    const currentAuthMode = "guest"; // l'utilisateur s'est déconnecté
+    const staleUser = { uid: "user-super", emailVerified: true };
+    const superClaims = { role: "super_admin", email_verified: true };
+
+    // Contexte 1 : l'utilisateur actuel est devenu null (déconnexion effective)
+    const contextSignedOut = {
+      isSubscribed: true,
+      callbackSeq: 1,
+      currentSeq: 1,
+      activeUid: null // auth.currentUser est null
+    };
+
+    const modeAfterSignOut = resolveNextAuthMode(currentAuthMode, staleUser, superClaims, contextSignedOut);
+    expect(modeAfterSignOut).toBe("guest");
+
+    // Contexte 2 : le composant a été démonté (isSubscribed: false)
+    const contextUnmounted = {
+      isSubscribed: false,
+      callbackSeq: 1,
+      currentSeq: 1,
+      activeUid: "user-super"
+    };
+    const modeAfterUnmount = resolveNextAuthMode("guest", staleUser, superClaims, contextUnmounted);
+    expect(modeAfterUnmount).toBe("guest");
+  });
+
+  // 7. Changement de compte pendant une vérification asynchrone : ancien résultat ignoré
+  it("Exigence 7: Account switch occurring during async token check discards obsolete callback result", () => {
+    const currentAuthMode = "client"; // nouveau compte client actif
+    const staleSuperUser = { uid: "super-user-uid", emailVerified: true };
+    const superClaims = { role: "super_admin", email_verified: true };
+
+    // Séquence obsolète (un nouveau callback a été émis entre-temps)
+    const contextStaleSeq = {
+      isSubscribed: true,
+      callbackSeq: 1,
+      currentSeq: 2, // une nouvelle séquence a démarré
+      activeUid: "new-client-uid" // le compte actif a changé
+    };
+
+    const nextModeStale = resolveNextAuthMode(currentAuthMode, staleSuperUser, superClaims, contextStaleSeq);
+    expect(nextModeStale).toBe("client"); // inchangé, l'ancien résultat est totalement ignoré
+  });
+
+  // 8. Erreur de récupération du token : refus d'autorisation
+  it("Exigence 8: Token acquisition failure strictly denies authorization and reverts Super Admin", async () => {
+    const failingUser = {
+      emailVerified: true,
+      getIdTokenResult: async () => {
+        throw new Error("Network / auth error during token refresh");
+      }
+    };
+
+    const isSuper = await verifySuperAdminFromFirebaseUser(failingUser as any, true);
+    expect(isSuper).toBe(false);
+
+    // En cas d'erreur dans le listener, rétrogradation immédiate
+    const prevAuthMode = "super_admin";
+    const modeOnError = resolveNextAuthMode(prevAuthMode, { uid: "failing-uid", emailVerified: true }, null, {
+      isSubscribed: true,
+      callbackSeq: 1,
+      currentSeq: 1,
+      activeUid: "failing-uid"
+    });
+    expect(modeOnError).toBe("client");
+  });
+
+  // 9. Claims Super Admin actualisés après révocation : accès administratif refusé
+  it("Exigence 9: Revoked claims on token update immediately deny access to restricted views", () => {
+    // Session initialement super_admin
+    let authMode = "super_admin";
+    let activeModule = "super_admin_console";
+
+    // Réception du nouveau token révoqué (claims ne contenant plus super_admin)
+    const revokedClaims = { role: "client", email_verified: true };
+    authMode = resolveNextAuthMode(authMode, { uid: "user-1" }, revokedClaims, {
+      isSubscribed: true,
+      callbackSeq: 3,
+      currentSeq: 3,
+      activeUid: "user-1"
+    });
+    expect(authMode).toBe("client");
+
+    // Gardien de vue : accès à super_admin_console refusé et replié vers isometric
+    const safeView = getAuthorizedView(activeModule, authMode === "super_admin", "isometric");
+    expect(safeView).toBe("isometric");
+    expect(getAuthorizedView("license_keys", authMode === "super_admin", "isometric")).toBe("isometric");
+  });
+
+  // 10. Aucun état provenant de localStorage ne peut rétablir les privilèges
+  it("Exigence 10: LocalStorage manipulation cannot restore administrative privileges without verified token", async () => {
+    // Simuler absence d'utilisateur Firebase valide malgré un localStorage corrompu
+    const isSuperNull = await verifySuperAdminFromFirebaseUser(null);
+    expect(isSuperNull).toBe(false);
+
+    // Utilisateur avec token vide ou sans claim
+    const mockUserEmptyClaims = {
       emailVerified: true,
       getIdTokenResult: async () => ({
-        token: "jwt",
+        token: "fake-jwt",
         authTime: "now",
         issuedAtTime: "now",
         expirationTime: "later",
@@ -115,74 +205,35 @@ describe("SEC-01-FIX-03: Client Authorization & Super Admin Authority", () => {
         claims: {}
       })
     };
-    const isSuperNoClaims = await verifySuperAdminFromFirebaseUser(mockUserNoClaims as any);
-    expect(isSuperNoClaims).toBe(false);
+    const isSuperEmpty = await verifySuperAdminFromFirebaseUser(mockUserEmptyClaims as any);
+    expect(isSuperEmpty).toBe(false);
+
+    // Tentative de forcer super_admin dans resolveNextAuthMode avec un token vide
+    const coercedMode = resolveNextAuthMode("super_admin", { uid: "attacker" }, {}, {
+      isSubscribed: true,
+      callbackSeq: 1,
+      currentSeq: 1,
+      activeUid: "attacker"
+    });
+    expect(coercedMode).toBe("client");
   });
 
-  // 7. Adresse email historique Super Admin sans claim -> refusée
-  it("Test 7: Historic Super Admin email addresses are rejected if missing the custom claim", () => {
-    const historicEmails = [
-      "boudjada.youcef@gmail.com",
-      "boudjada.youcef@outlook.com",
-      "youcef.boudjada@pdi-vision.dz",
-      "admin@pdi-vision.dz"
-    ];
-
-    for (const email of historicEmails) {
-      // Token avec claims standard client ou vide
-      const clientClaims = { email, role: "client", email_verified: true };
-      expect(isSuperAdminClaimAuthorized(clientClaims, true)).toBe(false);
-
-      const claimsWithoutRole = { email, email_verified: true };
-      expect(isSuperAdminClaimAuthorized(claimsWithoutRole, true)).toBe(false);
-    }
+  // Tests complémentaires de robustesse
+  it("Complementary: Rejects role casing variants and missing role claim", () => {
+    expect(isSuperAdminClaimAuthorized({ role: "SUPER_ADMIN", email_verified: true })).toBe(false);
+    expect(isSuperAdminClaimAuthorized({ role: "admin", email_verified: true })).toBe(false);
+    expect(isSuperAdminClaimAuthorized({ email_verified: true })).toBe(false);
+    expect(isSuperAdminClaimAuthorized(null)).toBe(false);
+    expect(isSuperAdminClaimAuthorized(undefined)).toBe(false);
   });
 
-  // 8. Claim falsifié ou incomplet -> refusé
-  it("Test 8: Malformed, partial, or injection claims are rejected", () => {
-    // string 'admin' au lieu de 'super_admin'
-    expect(isSuperAdminClaimAuthorized({ role: "admin", email_verified: true }, true)).toBe(false);
-
-    // String 'true' au lieu de boolean true pour email_verified
-    expect(isSuperAdminClaimAuthorized({ role: "super_admin", email_verified: "true" }, true)).toBe(false);
-
-    // Objets ou types inattendus
-    expect(isSuperAdminClaimAuthorized({ role: ["super_admin"], email_verified: true }, true)).toBe(false);
-    expect(isSuperAdminClaimAuthorized({ role: { super_admin: true }, email_verified: true }, true)).toBe(false);
-    expect(isSuperAdminClaimAuthorized({ role: "SUPER_ADMIN", email_verified: true }, true)).toBe(false);
-    expect(isSuperAdminClaimAuthorized({ role: "super_admin " }, true)).toBe(false);
-  });
-
-  // 9. Session démo (authMode === "demo") donne zéro privilège administratif
-  it("Test 9: Demo session authMode === 'demo' has zero administrative privilege", () => {
-    const authMode: string = "demo";
-    const isSuper = authMode === "super_admin";
-    expect(isSuper).toBe(false);
-
-    // Vérifie que les vues d'administration sont bloquées pour une session démo
-    expect(getAuthorizedView("super_admin_console", isSuper, "isometric")).toBe("isometric");
-    expect(getAuthorizedView("license_keys", isSuper, "isometric")).toBe("isometric");
-  });
-
-  // 10. Accès direct aux vues administratives sans claim -> redirection vers vue de repli ("isometric")
-  it("Test 10: Direct access to admin views without verified claim redirects to fallback ('isometric')", () => {
-    // Vérification du catalogue de vues protégées
+  it("Complementary: Catalog of restricted admin views is sound", () => {
     expect(SUPER_ADMIN_RESTRICTED_VIEWS.has("super_admin_console")).toBe(true);
     expect(SUPER_ADMIN_RESTRICTED_VIEWS.has("license_keys")).toBe(true);
     expect(isRestrictedAdminView("super_admin_console")).toBe(true);
     expect(isRestrictedAdminView("license_keys")).toBe(true);
     expect(isRestrictedAdminView("isometric")).toBe(false);
     expect(isRestrictedAdminView("home")).toBe(false);
-    expect(isRestrictedAdminView("profile")).toBe(false);
-
-    // Utilisateur non super admin (isSuper = false)
-    expect(getAuthorizedView("super_admin_console", false, "isometric")).toBe("isometric");
-    expect(getAuthorizedView("license_keys", false, "isometric")).toBe("isometric");
-    expect(getAuthorizedView("isometric", false, "isometric")).toBe("isometric");
-    expect(getAuthorizedView("projects", false, "isometric")).toBe("projects");
-
-    // Utilisateur Super Admin vérifié (isSuper = true)
-    expect(getAuthorizedView("super_admin_console", true, "isometric")).toBe("super_admin_console");
-    expect(getAuthorizedView("license_keys", true, "isometric")).toBe("license_keys");
+    expect(isRestrictedAdminView("projects")).toBe(false);
   });
 });

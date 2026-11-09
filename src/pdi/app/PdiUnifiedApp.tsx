@@ -82,7 +82,7 @@ import { PdiCompanyPanel } from "../ui/PdiCompanyPanel";
 import { PdiSuperAdminConsole } from "../superadmin/PdiSuperAdminConsole";
 import { PdiFeedbackModal } from "../feedback/PdiFeedbackModal";
 import { PdiNewProjectModal } from "../modals/PdiNewProjectModal";
-import { onAuthStateChanged } from "firebase/auth";
+import { onAuthStateChanged, onIdTokenChanged } from "firebase/auth";
 import { recordSubscriberUsage, changeUserProfilePassword, auth } from "../../lib/firebase";
 import { isSuperAdminClaimAuthorized, isRestrictedAdminView, getAuthorizedView } from "../../security/clientAuthorization";
 import { projectsApi } from "../../lib/pdiApiClient";
@@ -718,26 +718,66 @@ export default function PdiUnifiedApp() {
     return () => window.removeEventListener("pdi:navigate", onNavigate as EventListener);
   }, [handleLogoutToHome]);
 
-  // Règle SEC-01-FIX-03 : Source unique d'autorité Super Admin = Token Firebase vérifié avec claims
+  // Règle SEC-01-FIX-03-R1 : Surveillance dynamique et réactive des droits Super Admin via onIdTokenChanged
+  // avec protection anti-course asynchrone (session UID + seq generation token).
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (fbUser) => {
-      if (fbUser) {
-        try {
-          const tokenResult = await fbUser.getIdTokenResult();
-          const isSuper = isSuperAdminClaimAuthorized(tokenResult.claims, fbUser.emailVerified);
-          if (isSuper) {
-            setAuthMode("super_admin");
-          } else {
-            setAuthMode((prev) => (prev === "super_admin" ? "client" : prev));
-          }
-        } catch {
+    let isSubscribed = true;
+    let currentAuthSequence = 0;
+    const initialRefreshCompletedForUid = new Set<string>();
+
+    const unsubscribe = onIdTokenChanged(auth, async (fbUser) => {
+      currentAuthSequence += 1;
+      const callbackSeq = currentAuthSequence;
+
+      if (!fbUser) {
+        // Déconnexion immédiate : révocation totale de tout privilège Super Admin ou Admin
+        if (isSubscribed) {
+          setAuthMode((prev) => (prev === "super_admin" || prev === "admin" ? "guest" : prev));
+        }
+        return;
+      }
+
+      const targetUid = fbUser.uid;
+
+      try {
+        // A1 : Effectuer une actualisation forcée au démarrage de la session pour l'UID, sans boucle infinie
+        const shouldForceRefresh = !initialRefreshCompletedForUid.has(targetUid);
+        if (shouldForceRefresh) {
+          initialRefreshCompletedForUid.add(targetUid);
+        }
+
+        const tokenResult = await fbUser.getIdTokenResult(shouldForceRefresh);
+
+        // A2 : Protection contre les callbacks asynchrones obsolètes
+        // Vérifier 1) que le composant est monté, 2) que ce callback est la dernière séquence,
+        // 3) que auth.currentUser existe toujours et possède le même UID.
+        if (!isSubscribed || callbackSeq !== currentAuthSequence) {
+          return;
+        }
+        if (!auth.currentUser || auth.currentUser.uid !== targetUid) {
+          return;
+        }
+
+        const isSuper = isSuperAdminClaimAuthorized(tokenResult.claims, fbUser.emailVerified);
+        if (isSuper) {
+          setAuthMode("super_admin");
+        } else {
+          // Token actualisé ne contenant plus les privilèges -> rétrogradation immédiate
           setAuthMode((prev) => (prev === "super_admin" ? "client" : prev));
         }
-      } else {
-        setAuthMode((prev) => (prev === "super_admin" || prev === "admin" ? "guest" : prev));
+      } catch {
+        // En cas d'erreur de récupération du token : refus strict et rétrogradation
+        if (isSubscribed && callbackSeq === currentAuthSequence && auth.currentUser?.uid === targetUid) {
+          setAuthMode((prev) => (prev === "super_admin" ? "client" : prev));
+        }
       }
     });
-    return () => unsubscribe();
+
+    return () => {
+      isSubscribed = false;
+      currentAuthSequence += 1;
+      unsubscribe();
+    };
   }, []);
 
   // Règle SEC-01-FIX-03 : Gardien permanent des vues administratives restreintes

@@ -34,13 +34,15 @@ export const SUPER_ADMIN_RESTRICTED_VIEWS = new Set<string>([
 /**
  * Détermine si des Custom Claims de token confèrent le statut Super Admin.
  * 
- * Exigences strictes :
- * 1. claims doit être un objet non nul.
- * 2. claims.role doit être strictement égal à "super_admin".
- * 3. L'email doit être vérifié :
- *    - soit claims.email_verified === true
- *    - soit userEmailVerified === true (propriété emailVerified du User Firebase Auth)
- * 4. Aucun fallback par email, ni par profile.role, ni par localStorage.
+ * Exigences strictes SEC-01-FIX-03-R1 :
+ * 1. claims doit être un objet valide non nul.
+ * 2. claims.role === "super_admin".
+ * 3. claims.email_verified === true obligatoirement (strict boolean).
+ * 4. L'absence du claim email_verified entraîne obligatoirement un refus.
+ * 5. userEmailVerified ne doit JAMAIS compenser l'absence ou la fausseté du claim.
+ * 6. Si userEmailVerified est fourni, il peut agir comme contrôle de cohérence
+ *    complémentaire (si userEmailVerified === false, refus), mais JAMAIS comme substitut.
+ * 7. Aucun fallback par email, ni par profile.role, ni par localStorage.
  */
 export function isSuperAdminClaimAuthorized(
   claims: TokenClaims | null | undefined,
@@ -55,15 +57,14 @@ export function isSuperAdminClaimAuthorized(
     return false;
   }
 
-  // Vérification stricte que l'email est vérifié sans contradiction ni falsification
-  // Si claims.email_verified est présent, il doit valoir strictement boolean true.
-  if ('email_verified' in claims && claims.email_verified !== true) {
+  // Règle A3 : Le claim email_verified doit être STRICTEMENT boolean true
+  // L'absence du claim, ou toute valeur autre que true (false, string, undefined, etc.) est refusée
+  if (claims.email_verified !== true) {
     return false;
   }
 
-  // L'email doit être vérifié soit au niveau du claim, soit au niveau de l'utilisateur Firebase Auth
-  const isVerified = (claims.email_verified === true) || (userEmailVerified === true);
-  if (!isVerified) {
+  // Contrôle complémentaire éventuel : si userEmailVerified est explicitement false, refuser
+  if (userEmailVerified === false) {
     return false;
   }
 
@@ -124,4 +125,36 @@ export function getAuthorizedView(
     return fallbackView;
   }
   return requestedView;
+}
+
+/**
+ * Helper pur testable pour la résolution d'état d'authentification lors de changements de token.
+ * Résout le rôle ('super_admin' ou rétrogradation 'client'/'guest') en fonction du token et des conditions de session.
+ */
+export function resolveNextAuthMode(
+  currentAuthMode: string,
+  user: { uid: string; emailVerified?: boolean } | null | undefined,
+  tokenClaims: TokenClaims | null | undefined,
+  sessionContext: {
+    isSubscribed: boolean;
+    callbackSeq: number;
+    currentSeq: number;
+    activeUid: string | null | undefined;
+  }
+): string {
+  // Callback obsolète, désabonné ou session changée : aucun changement d'état autorisé
+  if (!sessionContext.isSubscribed || sessionContext.callbackSeq !== sessionContext.currentSeq) {
+    return currentAuthMode;
+  }
+  if (!user || user.uid !== sessionContext.activeUid) {
+    return currentAuthMode === 'super_admin' || currentAuthMode === 'admin' ? 'guest' : currentAuthMode;
+  }
+
+  const isSuper = isSuperAdminClaimAuthorized(tokenClaims, user.emailVerified);
+  if (isSuper) {
+    return 'super_admin';
+  }
+
+  // Token client ou droits révoqués -> rétrogradation immédiate
+  return currentAuthMode === 'super_admin' ? 'client' : currentAuthMode;
 }
