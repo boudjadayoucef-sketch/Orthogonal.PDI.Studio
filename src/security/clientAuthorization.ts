@@ -142,12 +142,26 @@ export function resolveNextAuthMode(
     activeUid: string | null | undefined;
   }
 ): string {
-  // Callback obsolète, désabonné ou session changée : aucun changement d'état autorisé
-  if (!sessionContext.isSubscribed || sessionContext.callbackSeq !== sessionContext.currentSeq) {
+  // Callback après démontage : aucun changement d'état
+  if (!sessionContext.isSubscribed) {
     return currentAuthMode;
   }
-  if (!user || user.uid !== sessionContext.activeUid) {
+
+  // B3 : Incohérence entre l'utilisateur actif (activeUid) et l'utilisateur du callback :
+  // Ne jamais laisser subsister une autorisation privilégiée.
+  if (!sessionContext.activeUid) {
     return currentAuthMode === 'super_admin' || currentAuthMode === 'admin' ? 'guest' : currentAuthMode;
+  }
+  if (!user || user.uid !== sessionContext.activeUid) {
+    if (sessionContext.callbackSeq === sessionContext.currentSeq) {
+      return currentAuthMode === 'super_admin' || currentAuthMode === 'admin' ? 'client' : currentAuthMode;
+    }
+    return currentAuthMode;
+  }
+
+  // Callback obsolète supplanté par une séquence plus récente : ignorer
+  if (sessionContext.callbackSeq !== sessionContext.currentSeq) {
+    return currentAuthMode;
   }
 
   const isSuper = isSuperAdminClaimAuthorized(tokenClaims, user.emailVerified);
@@ -156,5 +170,165 @@ export function resolveNextAuthMode(
   }
 
   // Token client ou droits révoqués -> rétrogradation immédiate
-  return currentAuthMode === 'super_admin' ? 'client' : currentAuthMode;
+  return currentAuthMode === 'super_admin' || currentAuthMode === 'admin' ? 'client' : currentAuthMode;
 }
+
+export interface TokenMonitorUser extends FirebaseUserLike {
+  uid: string;
+}
+
+export interface SuperAdminTokenMonitorOptions {
+  auth: { readonly currentUser: { readonly uid: string } | null };
+  subscribeIdTokenChanged: (
+    callback: (user: TokenMonitorUser | null) => void | Promise<void>
+  ) => () => void;
+  setAuthMode: (updater: (prev: string) => string) => void;
+  onAdminRevoked?: () => void;
+}
+
+function demotePrivilegedToClient(prev: string): string {
+  return prev === 'super_admin' || prev === 'admin' ? 'client' : prev;
+}
+
+function demotePrivilegedToGuest(prev: string): string {
+  return prev === 'super_admin' || prev === 'admin' ? 'guest' : prev;
+}
+
+/**
+ * SEC-01-FIX-03-R2 (B1 / B2 / B3) :
+ * Gestionnaire de production du listener Firebase `onIdTokenChanged` assurant :
+ * - B1 : Fail-closed immédiat (synchrone) dès la détection d'un changement de compte
+ *        ou d'une session non encore validée, avant toute attente de `getIdTokenResult()`.
+ * - A1 : Rafraîchissement forcé (`getIdTokenResult(true)`) au démarrage de chaque nouvelle session UID,
+ *        puis `getIdTokenResult(false)` lors des rafraîchissements suivants du même UID pour éviter toute boucle.
+ * - A2 : Protection contre les courses asynchrones via numéro de séquence et drapeau de montage (`isSubscribed`).
+ * - B3 : Révocation immédiate des privilèges en cas d'incohérence entre `auth.currentUser.uid` et `fbUser.uid`.
+ */
+export function attachSuperAdminTokenMonitor(
+  options: SuperAdminTokenMonitorOptions
+): () => void {
+  const { auth, subscribeIdTokenChanged, setAuthMode, onAdminRevoked } = options;
+  let isSubscribed = true;
+  let currentAuthSequence = 0;
+  let lastSessionUid: string | null = null;
+  let activeVerifiedSuperUid: string | null = null;
+
+  const revokeToClient = () => {
+    activeVerifiedSuperUid = null;
+    setAuthMode(demotePrivilegedToClient);
+    onAdminRevoked?.();
+  };
+
+  const revokeToGuest = () => {
+    lastSessionUid = null;
+    activeVerifiedSuperUid = null;
+    setAuthMode(demotePrivilegedToGuest);
+    onAdminRevoked?.();
+  };
+
+  const unsubscribe = subscribeIdTokenChanged(async (fbUser) => {
+    currentAuthSequence += 1;
+    const callbackSeq = currentAuthSequence;
+
+    if (!isSubscribed) {
+      return;
+    }
+
+    // Déconnexion explicite : suppression immédiate de tout état Super Admin / Admin
+    if (!fbUser || typeof fbUser.uid !== 'string' || fbUser.uid.length === 0) {
+      revokeToGuest();
+      return;
+    }
+
+    const targetUid = fbUser.uid;
+
+    // B3 : Vérification immédiate de cohérence entre auth.currentUser.uid et le compte traité
+    const currentActiveUser = auth.currentUser;
+    if (!currentActiveUser || typeof currentActiveUser.uid !== 'string' || currentActiveUser.uid.length === 0) {
+      revokeToGuest();
+      return;
+    }
+    if (currentActiveUser.uid !== targetUid) {
+      lastSessionUid = currentActiveUser.uid;
+      revokeToClient();
+      return;
+    }
+
+    // B1 : Fail-closed immédiat au changement de compte ou tant que le compte courant
+    // n'est pas déjà le Super Admin vérifié actif. Aucun privilège du compte précédent
+    // ne peut subsister pendant l'attente asynchrone du token du nouveau compte.
+    const isNewAccountSession = lastSessionUid !== targetUid;
+    if (isNewAccountSession || activeVerifiedSuperUid !== targetUid) {
+      revokeToClient();
+    }
+    lastSessionUid = targetUid;
+
+    if (typeof fbUser.getIdTokenResult !== 'function') {
+      revokeToClient();
+      return;
+    }
+
+    try {
+      // A1 : Actualisation forcée au démarrage de la session pour ce compte, sans boucle infinie
+      const shouldForceRefresh = isNewAccountSession;
+      const tokenResult = await fbUser.getIdTokenResult(shouldForceRefresh);
+
+      // A2 : Après démontage du composant, aucun callback ne peut modifier l'état
+      if (!isSubscribed) {
+        return;
+      }
+
+      // B3 : Après l'attente asynchrone, vérifier que auth.currentUser existe et correspond toujours à targetUid
+      const postAwaitCurrentUser = auth.currentUser;
+      if (!postAwaitCurrentUser || typeof postAwaitCurrentUser.uid !== 'string' || postAwaitCurrentUser.uid.length === 0) {
+        revokeToGuest();
+        return;
+      }
+      if (postAwaitCurrentUser.uid !== targetUid) {
+        // Incohérence entre UID actif et UID du callback : ne jamais laisser subsister une autorisation privilégiée
+        if (activeVerifiedSuperUid === targetUid || callbackSeq === currentAuthSequence) {
+          revokeToClient();
+        }
+        return;
+      }
+
+      // A2 : Ignorer tout callback obsolète supplanté par une séquence plus récente
+      if (callbackSeq !== currentAuthSequence) {
+        return;
+      }
+
+      const isSuper = isSuperAdminClaimAuthorized(tokenResult?.claims, fbUser.emailVerified);
+      if (isSuper) {
+        activeVerifiedSuperUid = targetUid;
+        setAuthMode(() => 'super_admin');
+      } else {
+        revokeToClient();
+      }
+    } catch {
+      if (!isSubscribed) {
+        return;
+      }
+      const postErrorCurrentUser = auth.currentUser;
+      if (!postErrorCurrentUser || typeof postErrorCurrentUser.uid !== 'string' || postErrorCurrentUser.uid.length === 0) {
+        revokeToGuest();
+        return;
+      }
+      if (
+        callbackSeq === currentAuthSequence ||
+        postErrorCurrentUser.uid === targetUid ||
+        activeVerifiedSuperUid === targetUid
+      ) {
+        revokeToClient();
+      }
+    }
+  });
+
+  return () => {
+    isSubscribed = false;
+    currentAuthSequence += 1;
+    lastSessionUid = null;
+    activeVerifiedSuperUid = null;
+    unsubscribe();
+  };
+}
+

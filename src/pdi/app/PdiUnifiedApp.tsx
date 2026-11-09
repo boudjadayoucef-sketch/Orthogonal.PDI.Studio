@@ -82,9 +82,9 @@ import { PdiCompanyPanel } from "../ui/PdiCompanyPanel";
 import { PdiSuperAdminConsole } from "../superadmin/PdiSuperAdminConsole";
 import { PdiFeedbackModal } from "../feedback/PdiFeedbackModal";
 import { PdiNewProjectModal } from "../modals/PdiNewProjectModal";
-import { onAuthStateChanged, onIdTokenChanged } from "firebase/auth";
+import { onIdTokenChanged } from "firebase/auth";
 import { recordSubscriberUsage, changeUserProfilePassword, auth } from "../../lib/firebase";
-import { isSuperAdminClaimAuthorized, isRestrictedAdminView, getAuthorizedView } from "../../security/clientAuthorization";
+import { attachSuperAdminTokenMonitor, isRestrictedAdminView, getAuthorizedView } from "../../security/clientAuthorization";
 import { projectsApi } from "../../lib/pdiApiClient";
 
 type PdiModule = "home" | "isometric" | "drive" | "vision" | "sketch" | "cad" | "json" | "pdf" | "projects" | "assistant" | "profile" | "subscription" | "super_admin_console" | "license_keys";
@@ -538,18 +538,19 @@ export default function PdiUnifiedApp() {
       setAuthMode("demo");
       try { window.localStorage.setItem(PDI_AUTH_KEY, "demo"); } catch {}
     }
-    if (module === "home") { setActiveModule("home"); return; }
+    const safeModule = getAuthorizedView(module, authMode === "super_admin", "isometric") as PdiModule;
+    if (safeModule === "home") { setActiveModule("home"); return; }
     const id = `tab-${Date.now().toString(36)}`;
     // PATCH 017F1 : un onglet = un projet identifie, reutilisable et renommable.
-    const resolvedTitle = title || navItems.find(x=>x.id===module)?.title || "Projet PD&I";
+    const resolvedTitle = title || navItems.find(x=>x.id===safeModule)?.title || "Projet PD&I";
     const resolvedProjectId = projectId || `project-${Date.now().toString(36)}`;
-    const next: PdiWorkspaceTab = { id, title: resolvedTitle, module, projectId: resolvedProjectId, dirty: false, createdAt: new Date().toISOString() };
-    const tabs = [...workspaceTabs, next]; setWorkspaceTabs(tabs); setActiveTabId(id); setActiveModule(module); persistTabs(tabs,id);
-    pdiUpsertProject({ projectId: resolvedProjectId, title: resolvedTitle, module });
+    const next: PdiWorkspaceTab = { id, title: resolvedTitle, module: safeModule, projectId: resolvedProjectId, dirty: false, createdAt: new Date().toISOString() };
+    const tabs = [...workspaceTabs, next]; setWorkspaceTabs(tabs); setActiveTabId(id); setActiveModule(safeModule); persistTabs(tabs,id);
+    pdiUpsertProject({ projectId: resolvedProjectId, title: resolvedTitle, module: safeModule });
     setProjectsRefresh((v) => v + 1);
   };
-  const switchTab = (id: string) => { const tab = workspaceTabs.find(t=>t.id===id); if(!tab) return; setActiveTabId(id); setActiveModule(tab.module); persistTabs(workspaceTabs,id); };
-  const closeTab = (id: string) => { const tabs = workspaceTabs.filter(t=>t.id!==id); const next = tabs[tabs.length-1] || null; setWorkspaceTabs(tabs); setActiveTabId(next?.id || null); setActiveModule(next?.module || "home"); persistTabs(tabs,next?.id || null); };
+  const switchTab = (id: string) => { const tab = workspaceTabs.find(t=>t.id===id); if(!tab) return; const safeModule = getAuthorizedView(tab.module, authMode === "super_admin", "isometric") as PdiModule; setActiveTabId(id); setActiveModule(safeModule); persistTabs(workspaceTabs,id); };
+  const closeTab = (id: string) => { const tabs = workspaceTabs.filter(t=>t.id!==id); const next = tabs[tabs.length-1] || null; const safeModule = getAuthorizedView(next?.module || "home", authMode === "super_admin", "isometric") as PdiModule; setWorkspaceTabs(tabs); setActiveTabId(next?.id || null); setActiveModule(safeModule); persistTabs(tabs,next?.id || null); };
 
   // ÉTAPE 5 : Modal Nouveau Projet & Raccordement ISO
   const [newProjectModalOpen, setNewProjectModalOpen] = useState(false);
@@ -718,66 +719,25 @@ export default function PdiUnifiedApp() {
     return () => window.removeEventListener("pdi:navigate", onNavigate as EventListener);
   }, [handleLogoutToHome]);
 
-  // Règle SEC-01-FIX-03-R1 : Surveillance dynamique et réactive des droits Super Admin via onIdTokenChanged
-  // avec protection anti-course asynchrone (session UID + seq generation token).
+  // Règle SEC-01-FIX-03-R2 (B1 / B2 / B3) : Surveillance dynamique et réactive des droits Super Admin via onIdTokenChanged
+  // avec fail-closed immédiat au changement de compte, protection anti-course asynchrone et cohérence stricte de l'UID.
   useEffect(() => {
-    let isSubscribed = true;
-    let currentAuthSequence = 0;
-    const initialRefreshCompletedForUid = new Set<string>();
-
-    const unsubscribe = onIdTokenChanged(auth, async (fbUser) => {
-      currentAuthSequence += 1;
-      const callbackSeq = currentAuthSequence;
-
-      if (!fbUser) {
-        // Déconnexion immédiate : révocation totale de tout privilège Super Admin ou Admin
-        if (isSubscribed) {
-          setAuthMode((prev) => (prev === "super_admin" || prev === "admin" ? "guest" : prev));
-        }
-        return;
-      }
-
-      const targetUid = fbUser.uid;
-
-      try {
-        // A1 : Effectuer une actualisation forcée au démarrage de la session pour l'UID, sans boucle infinie
-        const shouldForceRefresh = !initialRefreshCompletedForUid.has(targetUid);
-        if (shouldForceRefresh) {
-          initialRefreshCompletedForUid.add(targetUid);
-        }
-
-        const tokenResult = await fbUser.getIdTokenResult(shouldForceRefresh);
-
-        // A2 : Protection contre les callbacks asynchrones obsolètes
-        // Vérifier 1) que le composant est monté, 2) que ce callback est la dernière séquence,
-        // 3) que auth.currentUser existe toujours et possède le même UID.
-        if (!isSubscribed || callbackSeq !== currentAuthSequence) {
-          return;
-        }
-        if (!auth.currentUser || auth.currentUser.uid !== targetUid) {
-          return;
-        }
-
-        const isSuper = isSuperAdminClaimAuthorized(tokenResult.claims, fbUser.emailVerified);
-        if (isSuper) {
-          setAuthMode("super_admin");
-        } else {
-          // Token actualisé ne contenant plus les privilèges -> rétrogradation immédiate
-          setAuthMode((prev) => (prev === "super_admin" ? "client" : prev));
-        }
-      } catch {
-        // En cas d'erreur de récupération du token : refus strict et rétrogradation
-        if (isSubscribed && callbackSeq === currentAuthSequence && auth.currentUser?.uid === targetUid) {
-          setAuthMode((prev) => (prev === "super_admin" ? "client" : prev));
-        }
-      }
+    return attachSuperAdminTokenMonitor({
+      auth,
+      subscribeIdTokenChanged: (cb) => onIdTokenChanged(auth, cb),
+      setAuthMode: (updater) => setAuthMode((prev) => updater(prev) as typeof authMode),
+      onAdminRevoked: () => {
+        setActiveModule((prev) => {
+          if (isRestrictedAdminView(prev)) {
+            try {
+              window.localStorage.setItem("pdi.activeModule.v1", "isometric");
+            } catch {}
+            return "isometric";
+          }
+          return prev;
+        });
+      },
     });
-
-    return () => {
-      isSubscribed = false;
-      currentAuthSequence += 1;
-      unsubscribe();
-    };
   }, []);
 
   // Règle SEC-01-FIX-03 : Gardien permanent des vues administratives restreintes
