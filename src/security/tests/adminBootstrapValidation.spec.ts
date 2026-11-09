@@ -15,6 +15,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
+import * as bootstrapModule from '../../../scripts/bootstrapSuperAdmin.ts';
 import {
   mergeProfileDataNonDestructive,
   deepCompareFirestoreData,
@@ -34,7 +35,6 @@ import {
   ALLOWED_SDK_ERROR_CODES,
   sanitizeSdkErrorCode,
   formatSanitizedErrorCode,
-  SAFE_INTERNAL_MESSAGES,
   GENERIC_EXTERNAL_ERROR,
   getSafeInternalMessage,
   isInternalBootstrapError,
@@ -1550,6 +1550,157 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
         expect(extractExactTime(objWithToMillis)?.valid).toBe(false);
         expect(toMillisCalled).toBe(false);
       });
+
+      // FIX-08-R4-B2 — Tests d'inspection sécurisée sur instances de Date
+      it('B2 Test I — date invalide new Date(NaN) rejetée', () => {
+        const invalidDate = new Date(NaN);
+        const res = extractExactTime(invalidDate);
+        expect(res?.valid).toBe(false);
+        expect(res?.error).toBe('Date invalide');
+      });
+
+      it('B2 Test J — Date avec getter propre seconds rejetée avec compteur à zéro', () => {
+        let ownSecondsCalls = 0;
+        const hostileDate = new Date(1785571200000);
+        Object.defineProperty(hostileDate, 'seconds', {
+          get() {
+            ownSecondsCalls++;
+            throw new Error('HOSTILE_DATE_OWN_SECONDS_GETTER');
+          },
+          configurable: true,
+          enumerable: true
+        });
+
+        expect(() => extractExactTime(hostileDate)).not.toThrow();
+        const res = extractExactTime(hostileDate);
+        expect(res?.valid).toBe(false);
+        expect(res?.error).toBe('Propriétés temporelles par getter/setter non autorisées');
+        expect(ownSecondsCalls).toBe(0);
+      });
+
+      it('B2 Test K — Date avec getter hérité seconds rejetée avec compteur à zéro', () => {
+        let inheritedSecondsCalls = 0;
+        const proto = Object.create(Date.prototype);
+        Object.defineProperty(proto, 'seconds', {
+          get() {
+            inheritedSecondsCalls++;
+            throw new Error('HOSTILE_DATE_INHERITED_SECONDS_GETTER');
+          },
+          configurable: true,
+          enumerable: true
+        });
+        const hostileInheritedDate = Object.create(proto);
+        expect(hostileInheritedDate instanceof Date).toBe(true);
+
+        expect(() => extractExactTime(hostileInheritedDate)).not.toThrow();
+        const res = extractExactTime(hostileInheritedDate);
+        expect(res?.valid).toBe(false);
+        expect(res?.error).toBe('Propriétés temporelles héritées non autorisées');
+        expect(inheritedSecondsCalls).toBe(0);
+      });
+
+      it('B2 Test L — Date avec getter propre toDate rejetée avec compteur à zéro', () => {
+        let ownToDateCalls = 0;
+        const hostileDate = new Date(1785571200000);
+        Object.defineProperty(hostileDate, 'toDate', {
+          get() {
+            ownToDateCalls++;
+            throw new Error('HOSTILE_DATE_OWN_TODATE_GETTER');
+          },
+          configurable: true,
+          enumerable: true
+        });
+
+        expect(() => extractExactTime(hostileDate)).not.toThrow();
+        const res = extractExactTime(hostileDate);
+        expect(res?.valid).toBe(false);
+        expect(res?.error).toBe('Propriétés temporelles par getter/setter non autorisées');
+        expect(ownToDateCalls).toBe(0);
+      });
+
+      it('B2 Test M — Date avec getter hérité toMillis rejetée avec compteur à zéro', () => {
+        let inheritedToMillisCalls = 0;
+        const proto = Object.create(Date.prototype);
+        Object.defineProperty(proto, 'toMillis', {
+          get() {
+            inheritedToMillisCalls++;
+            throw new Error('HOSTILE_DATE_INHERITED_TOMILLIS_GETTER');
+          },
+          configurable: true,
+          enumerable: true
+        });
+        const hostileInheritedDate = Object.create(proto);
+        expect(hostileInheritedDate instanceof Date).toBe(true);
+
+        expect(() => extractExactTime(hostileInheritedDate)).not.toThrow();
+        const res = extractExactTime(hostileInheritedDate);
+        expect(res?.valid).toBe(false);
+        expect(res?.error).toBe('Propriétés temporelles héritées non autorisées');
+        expect(inheritedToMillisCalls).toBe(0);
+      });
+
+      it('B2 Test N — Date avec getters propres et hérités sur chacune des 6 TIME_PROPERTIES : aucun getter exécuté', () => {
+        for (const prop of TIME_PROPERTIES) {
+          // Propre
+          let ownCalled = 0;
+          const ownDate = new Date(1785571200000);
+          Object.defineProperty(ownDate, prop, {
+            get() {
+              ownCalled++;
+              throw new Error(`HOSTILE_DATE_OWN_${prop}`);
+            },
+            configurable: true,
+            enumerable: true
+          });
+          expect(() => extractExactTime(ownDate)).not.toThrow();
+          const ownRes = extractExactTime(ownDate);
+          expect(ownRes?.valid).toBe(false);
+          expect(ownRes?.error).toBe('Propriétés temporelles par getter/setter non autorisées');
+          expect(ownCalled).toBe(0);
+
+          // Hérité
+          let inheritedCalled = 0;
+          const proto = Object.create(Date.prototype);
+          Object.defineProperty(proto, prop, {
+            get() {
+              inheritedCalled++;
+              throw new Error(`HOSTILE_DATE_INHERITED_${prop}`);
+            },
+            configurable: true,
+            enumerable: true
+          });
+          const inheritedDate = Object.create(proto);
+          expect(inheritedDate instanceof Date).toBe(true);
+          expect(() => extractExactTime(inheritedDate)).not.toThrow();
+          const inheritedRes = extractExactTime(inheritedDate);
+          expect(inheritedRes?.valid).toBe(false);
+          expect(inheritedRes?.error).toBe('Propriétés temporelles héritées non autorisées');
+          expect(inheritedCalled).toBe(0);
+        }
+      });
+
+      it('B2 Test O — Date avec prototype multi-niveaux comportant un getter rejetée sans exécution', () => {
+        let multiCalled = 0;
+        const protoL3 = Object.create(Date.prototype);
+        Object.defineProperty(protoL3, 'nanoseconds', {
+          get() {
+            multiCalled++;
+            throw new Error('HOSTILE_DATE_L3_NANOSECONDS');
+          },
+          configurable: true,
+          enumerable: true
+        });
+        const protoL2 = Object.create(protoL3);
+        const protoL1 = Object.create(protoL2);
+        const deepDate = Object.create(protoL1);
+        expect(deepDate instanceof Date).toBe(true);
+
+        expect(() => extractExactTime(deepDate)).not.toThrow();
+        const res = extractExactTime(deepDate);
+        expect(res?.valid).toBe(false);
+        expect(res?.error).toBe('Propriétés temporelles héritées non autorisées');
+        expect(multiCalled).toBe(0);
+      });
     });
 
     // -----------------------------------------------------------------------
@@ -1640,22 +1791,22 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
         }
       });
 
-      it('B3 Test 4 — Codes internes connus : vérification que les codes attendus produisent les messages constants correspondants', () => {
-        expect(SAFE_INTERNAL_MESSAGES.CLI_POSITIONAL_ARG).toBe('Argument positionnel non autorisé.');
-        expect(SAFE_INTERNAL_MESSAGES.CLI_UNKNOWN_ARG).toBe('Argument CLI non reconnu.');
-        expect(SAFE_INTERNAL_MESSAGES.CLI_MUTUALLY_EXCLUSIVE).toBe('Options CLI incompatibles.');
-        expect(SAFE_INTERNAL_MESSAGES.CLI_EXECUTE_NOT_ALONE).toBe("L'option execute doit être fournie seule.");
-        expect(SAFE_INTERNAL_MESSAGES.CLI_DRYRUN_REPEATED).toBe("L'option dry-run ne doit pas être répétée.");
-        expect(SAFE_INTERNAL_MESSAGES.PROJECT_MISMATCH).toContain('[BLOCAGE PROJET]');
-        expect(SAFE_INTERNAL_MESSAGES.EMAIL_MISMATCH).toContain('[BLOCAGE EMAIL]');
-        expect(SAFE_INTERNAL_MESSAGES.USER_NOT_FOUND).toContain('[COMPTE INTROUVABLE]');
-        expect(SAFE_INTERNAL_MESSAGES.ACCOUNT_DISABLED).toContain('[COMPTE DÉSACTIVÉ]');
-        expect(SAFE_INTERNAL_MESSAGES.EMAIL_NOT_VERIFIED).toContain('[EMAIL NON VÉRIFIÉ]');
-        expect(SAFE_INTERNAL_MESSAGES.INVALID_PROVIDER).toContain('[FOURNISSEUR INVALIDE]');
-        expect(SAFE_INTERNAL_MESSAGES.PROFILE_STRUCTURAL_DIFF).toBe('[ÉTAT PARTIEL] Profil Firestore écrit, MAIS Divergence structurelle du profil relu.');
-        expect(SAFE_INTERNAL_MESSAGES.CLAIMS_STRUCTURAL_DIFF).toBe('[ÉTAT PARTIEL] Profil Firestore écrit et vérifié, MAIS Divergence structurelle des Custom Claims relus.');
+      it('B3 Test 4 — Dictionnaire privé et registre WeakMap non exportés, authentification inviolable', () => {
+        // B3.1 & B3.2 : Ni SAFE_INTERNAL_MESSAGES, ni INTERNAL_ERROR_REGISTRY, ni INTERNAL_ERROR_BRAND ne sont exportés
+        expect((bootstrapModule as any).SAFE_INTERNAL_MESSAGES).toBeUndefined();
+        expect((bootstrapModule as any).INTERNAL_ERROR_REGISTRY).toBeUndefined();
+        expect((bootstrapModule as any).INTERNAL_ERROR_BRAND).toBeUndefined();
 
-        // Test par les fonctions publiques existantes
+        // Vérification des erreurs internes réelles générées par parseCliArgs
+        try {
+          parseCliArgs(['argument_invalide']);
+          expect.unreachable('Devait échouer');
+        } catch (err: any) {
+          expect(isInternalBootstrapError(err)).toBe(true);
+          expect(getSafeInternalMessage(err)).toBe('Argument positionnel non autorisé.');
+          expect(sanitizeReportErrorMessage(err)).toBe('Argument positionnel non autorisé.');
+        }
+
         try {
           parseCliArgs(['--unknown']);
           expect.unreachable('Devait échouer');
@@ -1663,18 +1814,89 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
           expect(isInternalBootstrapError(err)).toBe(true);
           expect(getSafeInternalMessage(err)).toBe('Argument CLI non reconnu.');
           expect(sanitizeReportErrorMessage(err)).toBe('Argument CLI non reconnu.');
+
+          // B3.3 : Tentative hostile de mutation de safeCode sur l'instance : le code est géré par WeakMap
+          try {
+            Object.defineProperty(err, 'safeCode', { value: 'USER_NOT_FOUND' });
+          } catch {}
+          // Le message reste strictement celui authentifié dans le registre
+          expect(getSafeInternalMessage(err)).toBe('Argument CLI non reconnu.');
+          expect(sanitizeReportErrorMessage(err)).toBe('Argument CLI non reconnu.');
+        }
+
+        try {
+          parseCliArgs(['--execute', '--dry-run']);
+          expect.unreachable('Devait échouer');
+        } catch (err: any) {
+          expect(isInternalBootstrapError(err)).toBe(true);
+          expect(getSafeInternalMessage(err)).toBe('Options CLI incompatibles.');
+          expect(sanitizeReportErrorMessage(err)).toBe('Options CLI incompatibles.');
+        }
+
+        try {
+          parseCliArgs(['--execute', '--execute']);
+          expect.unreachable('Devait échouer');
+        } catch (err: any) {
+          expect(isInternalBootstrapError(err)).toBe(true);
+          expect(getSafeInternalMessage(err)).toBe("L'option execute doit être fournie seule.");
+          expect(sanitizeReportErrorMessage(err)).toBe("L'option execute doit être fournie seule.");
+        }
+
+        try {
+          parseCliArgs(['--dry-run', '--dry-run']);
+          expect.unreachable('Devait échouer');
+        } catch (err: any) {
+          expect(isInternalBootstrapError(err)).toBe(true);
+          expect(getSafeInternalMessage(err)).toBe("L'option dry-run ne doit pas être répétée.");
+          expect(sanitizeReportErrorMessage(err)).toBe("L'option dry-run ne doit pas être répétée.");
         }
       });
 
-      it('B3 Test 5 — Codes internes inconnus : produit impérativement le message générique GENERIC_EXTERNAL_ERROR', () => {
+      it('B3 Test 5 — Contrefaçons et getters hostiles : rejet sans exécution et neutralisation vers GENERIC_EXTERNAL_ERROR', () => {
         // Objet simulant un code inconnu
         const unknownInternalObj = {
           safeCode: 'UNKNOWN_OR_ARBITRARY_CODE',
           name: 'InternalBootstrapError'
         };
-        // Non authentifié car pas d'instance valide
+        expect(isInternalBootstrapError(unknownInternalObj)).toBe(false);
         expect(getSafeInternalMessage(unknownInternalObj)).toBe(GENERIC_EXTERNAL_ERROR);
         expect(sanitizeReportErrorMessage(unknownInternalObj)).toBe(GENERIC_EXTERNAL_ERROR);
+
+        // Fausse erreur avec prototype hérité de Error
+        const fakeProtoErr = Object.create(Error.prototype);
+        fakeProtoErr.name = 'InternalBootstrapError';
+        expect(isInternalBootstrapError(fakeProtoErr)).toBe(false);
+        expect(getSafeInternalMessage(fakeProtoErr)).toBe(GENERIC_EXTERNAL_ERROR);
+        expect(sanitizeReportErrorMessage(fakeProtoErr)).toBe(GENERIC_EXTERNAL_ERROR);
+
+        // Objet avec propriétés copiées
+        const fakeCopiedErr = { name: 'InternalBootstrapError', safeCode: 'USER_NOT_FOUND', message: 'Hacked' };
+        expect(isInternalBootstrapError(fakeCopiedErr)).toBe(false);
+        expect(getSafeInternalMessage(fakeCopiedErr)).toBe(GENERIC_EXTERNAL_ERROR);
+        expect(sanitizeReportErrorMessage(fakeCopiedErr)).toBe(GENERIC_EXTERNAL_ERROR);
+
+        // Objet avec getter hostile safeCode : ne doit JAMAIS être appelé
+        let hostileGetterCalls = 0;
+        const fakeGetterErr = {};
+        Object.defineProperty(fakeGetterErr, 'safeCode', {
+          get() {
+            hostileGetterCalls++;
+            throw new Error('HOSTILE_GETTER_TRIGGERED');
+          }
+        });
+        expect(() => isInternalBootstrapError(fakeGetterErr)).not.toThrow();
+        expect(isInternalBootstrapError(fakeGetterErr)).toBe(false);
+        expect(() => getSafeInternalMessage(fakeGetterErr)).not.toThrow();
+        expect(getSafeInternalMessage(fakeGetterErr)).toBe(GENERIC_EXTERNAL_ERROR);
+        expect(() => sanitizeReportErrorMessage(fakeGetterErr)).not.toThrow();
+        expect(sanitizeReportErrorMessage(fakeGetterErr)).toBe(GENERIC_EXTERNAL_ERROR);
+        expect(hostileGetterCalls).toBe(0);
+
+        // Objet avec symbole arbitraire
+        const fakeSymbolErr = { [Symbol('INTERNAL_ERROR_BRAND')]: true, safeCode: 'USER_NOT_FOUND' };
+        expect(isInternalBootstrapError(fakeSymbolErr)).toBe(false);
+        expect(getSafeInternalMessage(fakeSymbolErr)).toBe(GENERIC_EXTERNAL_ERROR);
+        expect(sanitizeReportErrorMessage(fakeSymbolErr)).toBe(GENERIC_EXTERNAL_ERROR);
       });
 
       it('B3 Test 6 — Erreurs SDK Auth et Firestore : aucune fuite dans les rapports, exceptions ou sorties CLI', async () => {
@@ -1694,7 +1916,7 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
         expect(reportAuth.error).toBeDefined();
         expect(reportAuth.error).not.toContain(PRIVATE_SECRET_SENTINEL);
         expect(reportAuth.error).not.toContain('unavailable');
-        expect(reportAuth.error).toBe(SAFE_INTERNAL_MESSAGES.USER_NOT_FOUND);
+        expect(reportAuth.error).toBe('[COMPTE INTROUVABLE] Aucun utilisateur Firebase Auth pour le compte cible.');
 
         // Injection d'une erreur Firestore avec sentinelle
         mockAuth.getUserByEmail = vi.fn(async () => ({ ...userRecordState }));
@@ -1717,7 +1939,7 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
         expect(reportFs.error).toBeDefined();
         expect(reportFs.error).not.toContain(PRIVATE_SECRET_SENTINEL);
         expect(reportFs.error).not.toContain('permission-denied');
-        expect(reportFs.error).toBe(SAFE_INTERNAL_MESSAGES.HISTORICAL_READ_FAILED);
+        expect(reportFs.error).toBe('[ERREUR LECTURE FIRESTORE] Échec de la lecture du profil historique.');
       });
 
       it('B3 Test 7 — Stack traces : une erreur avec sentinelle dans sa stack ne fuit jamais', () => {

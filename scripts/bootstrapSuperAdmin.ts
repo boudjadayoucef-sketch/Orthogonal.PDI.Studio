@@ -81,18 +81,20 @@ export function formatSanitizedErrorCode(code: any): string {
 }
 
 /**
- * FIX-08-R3-B3 — Symbole privé non forgeable et non exporté pour l'authentification des erreurs internes de bootstrap.
+ * FIX-08-R4-B3.2 — Registre privé WeakMap pour l'authentification non forgeable des erreurs internes.
+ * Aucune propriété n'est attachée à l'instance (ni symbole inspectable, ni code lisible).
  */
-const INTERNAL_ERROR_BRAND = Symbol('INTERNAL_ERROR_BRAND');
+const INTERNAL_ERROR_REGISTRY = new WeakMap<object, string>();
 
 export const GENERIC_EXTERNAL_ERROR =
   'Une erreur externe est survenue. Consultez le diagnostic sécurisé.';
 
 /**
- * FIX-08-R3-B3 — Dictionnaire fermé des messages internes autorisés.
+ * FIX-08-R4-B3.1 — Dictionnaire privé et immuable des 24 messages internes autorisés.
+ * Non exporté et gelé par Object.freeze() pour interdire toute modification à l'exécution.
  * Aucun message n'est une donnée libre, aucun argument ni identifiant externe n'est interpolé.
  */
-export const SAFE_INTERNAL_MESSAGES: Readonly<Record<string, string>> = {
+const SAFE_INTERNAL_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
   CLI_POSITIONAL_ARG:
     'Argument positionnel non autorisé.',
   CLI_UNKNOWN_ARG:
@@ -141,45 +143,41 @@ export const SAFE_INTERNAL_MESSAGES: Readonly<Record<string, string>> = {
     '[ÉTAT PARTIEL] Profil Firestore écrit et vérifié, MAIS Divergence structurelle des Custom Claims relus.',
   CLAIMS_VERIFICATION_FAILED:
     "[ÉTAT PARTIEL] Profil Firestore écrit et vérifié, MAIS échec de la relecture/vérification des Custom Claims."
-};
+});
 
 /**
- * FIX-08-R3-B3 — Classe d'erreur interne non exportée, authentifiée par le symbole privé non exporté.
+ * FIX-08-R4-B3.2 / B3.3 — Classe d'erreur interne non exportée.
+ * Enregistrée exclusivement dans le WeakMap privé du module.
+ * Ne stocke aucun code ni message libre sur l'instance.
  */
 class InternalBootstrapError extends Error {
-  readonly [INTERNAL_ERROR_BRAND] = true;
-
-  constructor(
-    readonly safeCode: string,
-    customMessage?: string
-  ) {
-    const message = customMessage ?? SAFE_INTERNAL_MESSAGES[safeCode] ?? GENERIC_EXTERNAL_ERROR;
+  constructor(safeCode: string) {
+    const message = Object.prototype.hasOwnProperty.call(SAFE_INTERNAL_MESSAGES, safeCode)
+      ? SAFE_INTERNAL_MESSAGES[safeCode]
+      : GENERIC_EXTERNAL_ERROR;
     super(message);
     this.name = 'InternalBootstrapError';
     Object.setPrototypeOf(this, InternalBootstrapError.prototype);
+    INTERNAL_ERROR_REGISTRY.set(this, safeCode);
   }
 }
 
 /**
- * FIX-08-R3-B3 — Vérifie si une erreur est une erreur interne authentifiée,
- * sans jamais inspecter err.message ni faire confiance à des préfixes textuels.
+ * FIX-08-R4-B3.3 — Vérifie si une erreur est une erreur interne authentifiée
+ * via l'appartenance au registre privé WeakMap.
  */
-export function isInternalBootstrapError(error: unknown): error is Error & { safeCode: string } {
-  return Boolean(
-    error &&
-    typeof error === 'object' &&
-    error instanceof InternalBootstrapError &&
-    Object.prototype.hasOwnProperty.call(error, INTERNAL_ERROR_BRAND) &&
-    (error as any)[INTERNAL_ERROR_BRAND] === true
-  );
+export function isInternalBootstrapError(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && INTERNAL_ERROR_REGISTRY.has(error);
 }
 
 /**
- * FIX-08-R3-B3 — Extrait le message sécurisé constant d'une erreur interne authentifiée.
+ * FIX-08-R4-B3.3 — Extrait le message sécurisé constant d'une erreur interne authentifiée.
+ * Récupère le code via le WeakMap privé et résout dans le dictionnaire privé gelé.
+ * Ne lit AUCUNE propriété sur l'objet d'erreur (aucun getter ne peut être déclenché).
  */
 export function getSafeInternalMessage(error: unknown): string {
-  if (isInternalBootstrapError(error)) {
-    const code = (error as any).safeCode;
+  if (typeof error === 'object' && error !== null && INTERNAL_ERROR_REGISTRY.has(error)) {
+    const code = INTERNAL_ERROR_REGISTRY.get(error);
     if (typeof code === 'string' && Object.prototype.hasOwnProperty.call(SAFE_INTERNAL_MESSAGES, code)) {
       return SAFE_INTERNAL_MESSAGES[code];
     }
@@ -188,18 +186,13 @@ export function getSafeInternalMessage(error: unknown): string {
 }
 
 /**
- * FIX-08-R3-B3 — Normalisation centralisée des erreurs de bootstrap :
+ * FIX-08-R4-B3.3 — Normalisation centralisée des erreurs de bootstrap :
  * Utilise EXCLUSIVEMENT le dictionnaire fermé de messages constants pour les erreurs internes authentifiées.
- * Neutralise toutes les autres erreurs vers GENERIC_EXTERNAL_ERROR sans jamais lire err.message.
+ * Neutralise toutes les autres erreurs vers GENERIC_EXTERNAL_ERROR sans jamais lire err.message ou d'autres propriétés.
  */
-export function sanitizeReportErrorMessage(err: any): string {
+export function sanitizeReportErrorMessage(err: unknown): string {
   if (!err) return GENERIC_EXTERNAL_ERROR;
-
-  if (isInternalBootstrapError(err)) {
-    return getSafeInternalMessage(err);
-  }
-
-  return GENERIC_EXTERNAL_ERROR;
+  return getSafeInternalMessage(err);
 }
 
 /**
@@ -567,10 +560,9 @@ export function extractExactTime(val: any): ExactTimeSpec | null {
     };
   };
 
-  if (val instanceof Date) return fromMilliseconds(val.getTime(), 'date');
-
   if (typeof val === 'object') {
-    // 1. Inspection sécurisée stricte sans exécution de getters pour toutes les TIME_PROPERTIES
+    // 1. FIX-08-R4-B2 — Inspection sécurisée stricte sans exécution de getters pour toutes les TIME_PROPERTIES
+    // Exécutée AVANT toute acceptation d'instance de Date ou Timestamp
     const inspections: Record<string, SafePropertyInspection> = {};
 
     for (const prop of TIME_PROPERTIES) {
@@ -598,7 +590,12 @@ export function extractExactTime(val: any): ExactTimeSpec | null {
       }
     }
 
-    // 2. Propriétés de données propres uniquement
+    // 2. FIX-08-R4-B2 — Instance de Date acceptée uniquement après validation stricte des TIME_PROPERTIES
+    if (val instanceof Date) {
+      return fromMilliseconds(val.getTime(), 'date');
+    }
+
+    // 3. Propriétés de données propres uniquement
     const secInsp = inspections['seconds'];
     const uSecInsp = inspections['_seconds'];
     const nsInsp = inspections['nanoseconds'];
@@ -923,10 +920,7 @@ export function mergeProfileDataNonDestructive(
   const recoveredFields: string[] = [];
 
   if (!targetProfileData && !historicalProfileData) {
-    throw new InternalBootstrapError(
-      'FUSION_NO_PROFILE',
-      "[ERREUR FUSION] Impossible d'effectuer la fusion : aucun profil cible ni profil historique n'a été trouvé."
-    );
+    throw new InternalBootstrapError('FUSION_NO_PROFILE');
   }
 
   function filterHistoricalValue(value: any, path: string): any {
