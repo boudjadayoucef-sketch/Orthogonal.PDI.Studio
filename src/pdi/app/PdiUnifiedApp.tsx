@@ -82,7 +82,9 @@ import { PdiCompanyPanel } from "../ui/PdiCompanyPanel";
 import { PdiSuperAdminConsole } from "../superadmin/PdiSuperAdminConsole";
 import { PdiFeedbackModal } from "../feedback/PdiFeedbackModal";
 import { PdiNewProjectModal } from "../modals/PdiNewProjectModal";
-import { recordSubscriberUsage, changeUserProfilePassword } from "../../lib/firebase";
+import { onAuthStateChanged } from "firebase/auth";
+import { recordSubscriberUsage, changeUserProfilePassword, auth } from "../../lib/firebase";
+import { isSuperAdminClaimAuthorized, isRestrictedAdminView, getAuthorizedView } from "../../security/clientAuthorization";
 import { projectsApi } from "../../lib/pdiApiClient";
 
 type PdiModule = "home" | "isometric" | "drive" | "vision" | "sketch" | "cad" | "json" | "pdf" | "projects" | "assistant" | "profile" | "subscription" | "super_admin_console" | "license_keys";
@@ -327,17 +329,29 @@ export default function PdiUnifiedApp() {
 
   const [authMode, setAuthMode] = useState<"guest" | "demo" | "pending_email" | "client" | "admin" | "super_admin">(() => {
     try {
-      return (window.localStorage.getItem(PDI_AUTH_KEY) as any) || "super_admin";
+      const saved = window.localStorage.getItem(PDI_AUTH_KEY);
+      // Règle SEC-01-FIX-03 : Ne JAMAIS restaurer de rôle administratif depuis localStorage
+      if (saved === "super_admin" || saved === "admin") {
+        return "client";
+      }
+      if (saved === "client" || saved === "demo" || saved === "pending_email") {
+        return saved;
+      }
+      return "guest";
     } catch {
-      return "super_admin";
+      return "guest";
     }
   });
 
   const [activeModule, setActiveModule] = useState<PdiModule>(() => {
     try {
       const saved = window.localStorage.getItem("pdi.activeModule.v1") as PdiModule;
-      const auth = window.localStorage.getItem(PDI_AUTH_KEY) || "demo";
-      const isConnected = auth !== "guest" && auth !== "pending_email";
+      // Règle SEC-01-FIX-03 : Ne jamais restaurer de vue administrative au démarrage sans vérification
+      if (isRestrictedAdminView(saved)) {
+        return "isometric";
+      }
+      const authVal = window.localStorage.getItem(PDI_AUTH_KEY) || "demo";
+      const isConnected = authVal !== "guest" && authVal !== "pending_email";
       if (isConnected) {
         // PATCH 017B : on ne restaure qu'un module reellement affichable.
         return (saved && saved !== "home") ? pdiSafeModule(saved, "isometric") : "isometric";
@@ -365,17 +379,25 @@ export default function PdiUnifiedApp() {
   const [savedUserProfile, setSavedUserProfile] = useState(() => {
     try {
       const raw = window.localStorage.getItem("pdi.user.profile.v1");
-      if (raw) return JSON.parse(raw);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object") {
+          return {
+            ...parsed,
+            role: "client"
+          };
+        }
+      }
     } catch {}
     return {
-      name: "Youcef Seif Eddine Boudjada",
-      email: "boudjada.youcef@gmail.com",
-      role: "super_admin",
+      name: "Utilisateur PD&I",
+      email: "utilisateur@pdi-vision.dz",
+      role: "client",
       company: "PD&I Vision DZ",
       country: "Algérie",
-      plan: "Pro",
-      emailStatus: "confirmé",
-      createdAt: "2026-08-20"
+      plan: "Basic",
+      emailStatus: "non confirmé",
+      createdAt: new Date().toISOString()
     };
   });
 
@@ -422,14 +444,14 @@ export default function PdiUnifiedApp() {
   };
 
   const pdiUserProfile = {
-    name: savedUserProfile?.name || "Youcef Seif Eddine Boudjada",
-    email: savedUserProfile?.email || "boudjada.youcef@gmail.com",
+    name: savedUserProfile?.name || "Utilisateur PD&I",
+    email: savedUserProfile?.email || "utilisateur@pdi-vision.dz",
     role: authMode,
     company: savedUserProfile?.company || "PD&I Vision DZ",
     country: savedUserProfile?.country || "Algérie",
-    plan: authMode === "guest" ? "Guest" : authMode === "demo" ? "Demo" : (savedUserProfile?.plan || "Pro"),
-    emailStatus: "confirmé",
-    createdAt: savedUserProfile?.createdAt || "2026-08-20",
+    plan: authMode === "guest" ? "Guest" : authMode === "demo" ? "Demo" : (savedUserProfile?.plan || "Basic"),
+    emailStatus: savedUserProfile?.emailStatus || "non confirmé",
+    createdAt: savedUserProfile?.createdAt || new Date().toISOString(),
   };
 
   const [licenseKeys, setLicenseKeys] = useState<Array<{ id:string; code:string; type:string; plan:string; status:string; email:string; createdAt:string; expiresAt:string }>>(() => {
@@ -628,11 +650,15 @@ export default function PdiUnifiedApp() {
       "license_keys"
     ];
 
-    const dest = (target && allowed.includes(target as PdiModule) ? (target as PdiModule) : "home");
+    let dest = (target && allowed.includes(target as PdiModule) ? (target as PdiModule) : "home");
+    // Règle SEC-01-FIX-03 : Interdire l'accès aux vues administratives sans autorité Super Admin vérifiée
+    if (isRestrictedAdminView(dest) && authMode !== "super_admin") {
+      dest = "isometric";
+    }
     setActiveModule(dest);
     try { window.localStorage.setItem("pdi.activeModule.v1", dest); } catch {}
     window.scrollTo(0, 0);
-  }, []);
+  }, [authMode]);
 
   const handleLogoutToHome = React.useCallback(() => {
     try {
@@ -691,6 +717,38 @@ export default function PdiUnifiedApp() {
     window.addEventListener("pdi:navigate", onNavigate as EventListener);
     return () => window.removeEventListener("pdi:navigate", onNavigate as EventListener);
   }, [handleLogoutToHome]);
+
+  // Règle SEC-01-FIX-03 : Source unique d'autorité Super Admin = Token Firebase vérifié avec claims
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (fbUser) => {
+      if (fbUser) {
+        try {
+          const tokenResult = await fbUser.getIdTokenResult();
+          const isSuper = isSuperAdminClaimAuthorized(tokenResult.claims, fbUser.emailVerified);
+          if (isSuper) {
+            setAuthMode("super_admin");
+          } else {
+            setAuthMode((prev) => (prev === "super_admin" ? "client" : prev));
+          }
+        } catch {
+          setAuthMode((prev) => (prev === "super_admin" ? "client" : prev));
+        }
+      } else {
+        setAuthMode((prev) => (prev === "super_admin" || prev === "admin" ? "guest" : prev));
+      }
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // Règle SEC-01-FIX-03 : Gardien permanent des vues administratives restreintes
+  useEffect(() => {
+    if (isRestrictedAdminView(activeModule) && authMode !== "super_admin") {
+      setActiveModule("isometric");
+      try {
+        window.localStorage.setItem("pdi.activeModule.v1", "isometric");
+      } catch {}
+    }
+  }, [activeModule, authMode]);
 
   useEffect(() => { try { window.localStorage.setItem(PDI_AUTH_KEY, authMode); } catch {} }, [authMode]);
 
@@ -813,12 +871,13 @@ export default function PdiUnifiedApp() {
           try { window.location.hash = "landing"; } catch {}
         }}
         onSuccess={(profile, isSuper) => {
-          const role = isSuper ? "super_admin" : (profile.role || "client");
-          setAuthMode(role as any);
-          setSavedUserProfile(profile);
+          // Règle SEC-01-FIX-03 : L'autorité Super Admin vient UNIQUEMENT du claim vérifié (isSuper)
+          const role = isSuper ? "super_admin" : "client";
+          setAuthMode(role);
+          setSavedUserProfile({ ...profile, role });
           try {
             window.localStorage.setItem(PDI_AUTH_KEY, role);
-            window.localStorage.setItem("pdi.user.profile.v1", JSON.stringify(profile));
+            window.localStorage.setItem("pdi.user.profile.v1", JSON.stringify({ ...profile, role }));
             window.sessionStorage.setItem(PDI_STAGE_KEY, "app");
             window.localStorage.setItem("pdi.force.app.v1", "1");
             window.location.hash = "app";
@@ -1309,14 +1368,14 @@ export default function PdiUnifiedApp() {
               </div>
               <button onClick={()=>{setActiveModule("home"); setAccountMenuOpen(false);}}>Accueil Application</button>
               <button onClick={()=>{setStage("landing"); try { window.location.hash = "landing"; } catch {} setAccountMenuOpen(false);}} style={{ color: "#FB923C", fontWeight: 800 }}>🌐 Page Commerciale (Vitrine)</button>
-              {(authMode === "super_admin" || pdiUserProfile.email.includes("boudjada")) && (
+              {authMode === "super_admin" && (
                 <button onClick={()=>{setActiveModule("super_admin_console"); setAccountMenuOpen(false);}} style={{ color: "#FFFFFF", fontWeight: 900 }}>⚡ Super Admin Console</button>
               )}
               <button onClick={()=>{setActiveModule("profile"); setAccountMenuOpen(false);}}>Voir profil</button>
               <button onClick={()=>{setActiveModule("projects"); setAccountMenuOpen(false);}}>Mes projets</button>
               <button onClick={()=>{setActiveModule("subscription"); setAccountMenuOpen(false);}}>Abonnement</button>
               <button onClick={()=>{setFeedbackModalOpen(true); setAccountMenuOpen(false);}}>★ Retour Expérience</button>
-              {(authMode === "super_admin" || pdiUserProfile.email.includes("boudjada")) && (
+              {authMode === "super_admin" && (
                 <button onClick={()=>{setActiveModule("license_keys"); setAccountMenuOpen(false);}}>Clés SaaS</button>
               )}
               <button className="pdi-menu-logout" onClick={handleLogoutToHome} style={{ color: "#f87171", borderTop: "1px solid rgba(248,113,113,0.2)", marginTop: "4px", paddingTop: "6px" }}>⎋ Déconnexion</button>
@@ -1648,17 +1707,31 @@ export default function PdiUnifiedApp() {
         {activeModule === "subscription" && <ComingSoonPanel title="Abonnement"><p>Plan actuel : <b>{pdiUserProfile.plan}</b>. Les clés SaaS, paiements et renouvellements seront reliés au Super Admin dans les patchs 011 à 016.</p></ComingSoonPanel>}
 
         {activeModule === "super_admin_console" && (
-          <div style={{ minHeight: "calc(100vh - 128px)" }}>
-            <PdiSuperAdminConsole />
-          </div>
+          authMode === "super_admin" ? (
+            <div style={{ minHeight: "calc(100vh - 128px)" }}>
+              <PdiSuperAdminConsole />
+            </div>
+          ) : (
+            <ComingSoonPanel title="Accès non autorisé">
+              <p>Cette console est strictement réservée au Super Administrateur authentifié.</p>
+            </ComingSoonPanel>
+          )
         )}
 
-        {activeModule === "license_keys" && <ComingSoonPanel title="Générateur de clés SaaS">
-          <div className="pdi-license-panel">
-            <section className="pdi-license-form"><h3>Créer une clé</h3><label>Type<select value={licenseDraft.type} onChange={e=>setLicenseDraft({...licenseDraft,type:e.target.value})}><option>TRIAL_7</option><option>TRIAL_30</option><option>GUEST</option><option>SOLO_MONTHLY</option><option>SOLO_YEARLY</option><option>PRO_MONTHLY</option><option>PRO_YEARLY</option><option>TEAM_MONTHLY</option><option>TEAM_YEARLY</option><option>ENTERPRISE</option><option>ADMIN_INVITE</option><option>SUPER_ADMIN</option></select></label><label>Plan<select value={licenseDraft.plan} onChange={e=>setLicenseDraft({...licenseDraft,plan:e.target.value})}><option>DEMO</option><option>GUEST</option><option>SOLO</option><option>PRO</option><option>TEAM</option><option>ENTERPRISE</option></select></label><label>Email assigné<input value={licenseDraft.email} onChange={e=>setLicenseDraft({...licenseDraft,email:e.target.value})} placeholder="client@email.com" /></label><button onClick={generateLicenseKey}>Générer clé</button><small>Flux futur : demande → paiement → génération compte → email activation unique.</small></section>
-            <section className="pdi-license-list"><h3>Clés générées</h3>{licenseKeys.length===0?<p>Aucune clé générée.</p>:licenseKeys.map(k=><div key={k.id} className="pdi-license-row"><code>{k.code}</code><span>{k.type}</span><span>{k.plan}</span><span>{k.email || "non assignée"}</span><span>{k.status}</span><span>exp. {k.expiresAt}</span><button onClick={()=>navigator.clipboard?.writeText(k.code)}>Copier</button><button onClick={()=>revokeLicenseKey(k.id)}>Révoquer</button></div>)}</section>
-          </div>
-        </ComingSoonPanel>}
+        {activeModule === "license_keys" && (
+          authMode === "super_admin" ? (
+            <ComingSoonPanel title="Générateur de clés SaaS">
+              <div className="pdi-license-panel">
+                <section className="pdi-license-form"><h3>Créer une clé</h3><label>Type<select value={licenseDraft.type} onChange={e=>setLicenseDraft({...licenseDraft,type:e.target.value})}><option>TRIAL_7</option><option>TRIAL_30</option><option>GUEST</option><option>SOLO_MONTHLY</option><option>SOLO_YEARLY</option><option>PRO_MONTHLY</option><option>PRO_YEARLY</option><option>TEAM_MONTHLY</option><option>TEAM_YEARLY</option><option>ENTERPRISE</option><option>ADMIN_INVITE</option><option>SUPER_ADMIN</option></select></label><label>Plan<select value={licenseDraft.plan} onChange={e=>setLicenseDraft({...licenseDraft,plan:e.target.value})}><option>DEMO</option><option>GUEST</option><option>SOLO</option><option>PRO</option><option>TEAM</option><option>ENTERPRISE</option></select></label><label>Email assigné<input value={licenseDraft.email} onChange={e=>setLicenseDraft({...licenseDraft,email:e.target.value})} placeholder="client@email.com" /></label><button onClick={generateLicenseKey}>Générer clé</button><small>Flux futur : demande → paiement → génération compte → email activation unique.</small></section>
+                <section className="pdi-license-list"><h3>Clés générées</h3>{licenseKeys.length===0?<p>Aucune clé générée.</p>:licenseKeys.map(k=><div key={k.id} className="pdi-license-row"><code>{k.code}</code><span>{k.type}</span><span>{k.plan}</span><span>{k.email || "non assignée"}</span><span>{k.status}</span><span>exp. {k.expiresAt}</span><button onClick={()=>navigator.clipboard?.writeText(k.code)}>Copier</button><button onClick={()=>revokeLicenseKey(k.id)}>Révoquer</button></div>)}</section>
+              </div>
+            </ComingSoonPanel>
+          ) : (
+            <ComingSoonPanel title="Accès non autorisé">
+              <p>Ce générateur de licences est strictement réservé au Super Administrateur authentifié.</p>
+            </ComingSoonPanel>
+          )
+        )}
 
         {/* Écran "Mes projets" avec barre de recherche, sélection multiple & suppression groupée */}
         {activeModule === "projects" && (() => {

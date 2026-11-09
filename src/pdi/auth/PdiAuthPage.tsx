@@ -6,7 +6,6 @@ import {
   registerWithEmailAndPasswordSecure,
   loginWithGoogleSecure,
   activateAccountWithLicenseKey,
-  isSuperAdminEmail,
   sendResetPasswordEmail,
   getCountryRestrictionsFromFirebase,
   PdiUserProfile
@@ -700,9 +699,6 @@ export default function PdiAuthPage({
             <div className="pdi-form-group">
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                 <label>Mot de passe</label>
-                {isSuperAdminEmail(loginEmail) && (
-                  <span style={{ fontSize: 10, color: "#F59E0B", fontWeight: 800 }}>★ Compte Super Admin</span>
-                )}
               </div>
               <div className="pdi-input-pwd-wrap">
                 <input

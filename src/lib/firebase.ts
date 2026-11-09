@@ -29,6 +29,7 @@ import {
   sendPasswordResetEmail,
   signOut as fbSignOut
 } from "firebase/auth";
+import { isSuperAdminClaimAuthorized } from "../security/clientAuthorization";
 
 // ==========================================
 // FIRESTORE ERROR HANDLING & CONNECTION TEST
@@ -360,17 +361,6 @@ export function generateCryptoSalt(): string {
   return Array.from(arr).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-export const SUPER_ADMIN_EMAILS = [
-  "boudjada.youcef@gmail.com",
-  "Boudjada.youcef@gmail.com"
-];
-
-export function isSuperAdminEmail(email?: string): boolean {
-  if (!email) return false;
-  const clean = email.trim().toLowerCase();
-  return clean === "boudjada.youcef@gmail.com" || clean === "superadmin@pdi-vision.dz";
-}
-
 export async function changeUserProfilePassword(
   _emailInput: string,
   _oldPasswordInput: string,
@@ -549,8 +539,8 @@ export async function loginWithEmailAndPasswordSecure(
     const userCredential = await signInWithEmailAndPassword(auth, email, passwordInput);
     const fbUser = userCredential.user;
     const uid = fbUser.uid;
-    const tokenResult = await fbUser.getIdTokenResult();
-    const isSuperAdminUser = tokenResult.claims.role === "super_admin";
+    const tokenResult = await fbUser.getIdTokenResult(true);
+    const isSuperAdminUser = isSuperAdminClaimAuthorized(tokenResult.claims, fbUser.emailVerified);
 
     // Regular client user
     let userProfile: PdiUserProfile | null = null;
@@ -619,7 +609,7 @@ export async function loginWithEmailAndPasswordSecure(
       userAgent: clientInfo?.userAgent || navigator.userAgent
     });
 
-    return { profile: updatedProfile, isSuperAdmin: isSuperAdminUser || updatedProfile.role === "super_admin" };
+    return { profile: updatedProfile, isSuperAdmin: isSuperAdminUser };
   } catch (err: any) {
     if (err.code === "auth/user-not-found" || err.code === "auth/invalid-credential" || err.code === "auth/wrong-password") {
       throw new Error("Identifiants incorrects ou compte inexistant dans Firebase Authentication.");
@@ -686,7 +676,6 @@ export async function registerWithEmailAndPasswordSecure(data: {
     const paymentGateway = isAlgeria ? "slickpay_baridimob" : "paddle";
     const currency = isAlgeria ? "DZD" : "EUR";
 
-    const isSuper = isSuperAdminEmail(email);
     const profile: PdiUserProfile = {
       uid,
       email,
@@ -697,19 +686,19 @@ export async function registerWithEmailAndPasswordSecure(data: {
       city: data.city || "",
       paymentGateway,
       currency,
-      role: isSuper ? "super_admin" : "client",
-      accountType: isSuper ? "enterprise" : assignedPlan,
-      subscriptionPlan: isSuper ? "lifetime" : "monthly",
-      status: isSuper ? "active" : initialStatus,
+      role: "client",
+      accountType: assignedPlan,
+      subscriptionPlan: "monthly",
+      status: initialStatus,
       createdAt: new Date().toISOString(),
-      lastLoginAt: initialStatus === "active" || isSuper ? new Date().toISOString() : undefined,
-      loginCount: initialStatus === "active" || isSuper ? 1 : 0,
+      lastLoginAt: initialStatus === "active" ? new Date().toISOString() : undefined,
+      loginCount: initialStatus === "active" ? 1 : 0,
       projectsCount: 0
     };
 
     await saveFirebaseProfile(profile);
 
-    if (initialStatus === "active" || isSuper) {
+    if (initialStatus === "active") {
       await logConnectionToFirebase({
         userId: profile.uid,
         userEmail: profile.email,
@@ -736,16 +725,15 @@ export async function registerWithEmailAndPasswordSecure(data: {
 export async function saveAuthCredentialsSecure(emailInput: string, passwordInput: string, role: PdiUserRole = "client"): Promise<void> {
   const email = emailInput.trim().toLowerCase();
   if (!email || !passwordInput) return;
-  const isSuper = isSuperAdminEmail(email);
   const salt = generateCryptoSalt();
   const passwordHash = await hashPassword(passwordInput, salt);
-  const credDocId = isSuper ? "super_admin_boudjada" : `cred_${email.replace(/[^a-zA-Z0-9]/g, "_")}`;
+  const credDocId = `cred_${email.replace(/[^a-zA-Z0-9]/g, "_")}`;
   const cred: PdiAuthCredential = {
     email,
     passwordHash,
     salt,
-    role: isSuper ? "super_admin" : role,
-    isSuperAdmin: isSuper,
+    role,
+    isSuperAdmin: false,
     updatedAt: new Date().toISOString()
   };
   await setDoc(doc(db, "auth_credentials", credDocId), cred);
@@ -759,7 +747,7 @@ export async function loginWithGoogleSecure(): Promise<{ profile: PdiUserProfile
     const gUser = result.user;
     const gEmail = gUser.email?.toLowerCase() || "";
     const tokenResult = await gUser.getIdTokenResult(true);
-    const isSuper = tokenResult.claims.role === "super_admin";
+    const isSuper = isSuperAdminClaimAuthorized(tokenResult.claims, gUser.emailVerified);
 
     // Direct profile retrieval by UID adhering to Firestore security rules
     let profile: PdiUserProfile | null = null;
@@ -802,7 +790,7 @@ export async function loginWithGoogleSecure(): Promise<{ profile: PdiUserProfile
       timestamp: new Date().toISOString()
     });
 
-    return { profile, isSuperAdmin: isSuper || profile.role === "super_admin" };
+    return { profile, isSuperAdmin: isSuper };
   } catch (err: any) {
     if (err.code === "auth/popup-closed-by-user") {
       throw new Error("La fenêtre de connexion Google a été fermée.");
