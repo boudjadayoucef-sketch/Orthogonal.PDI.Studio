@@ -1,6 +1,6 @@
 /**
  * ORTHOGONAL - ENG · PIPING DESIGN & ISOMETRICS (PD&I)
- * SEC-01-FIX-05-A-R1 — WEBHOOK AUTHENTICATION & MODULAR ARCHITECTURE TEST SUITE
+ * SEC-01-FIX-05-A-R1 & SEC-01-FIX-05-B — WEBHOOK AUTHENTICATION & MODULAR ARCHITECTURE TEST SUITE
  *
  * Tests:
  * 1. Pure authentication contracts in `src/security/webhookAuth.ts`
@@ -69,6 +69,26 @@ function createSimulatedWebhookStack(options?: {
   paddleSecret?: string;
   slickPaySecret?: string;
 }) {
+  const store = new Map<string, Record<string, unknown>>();
+  store.set("payment_transactions:ORD_PADDLE_VALID_001", {
+    id: "ORD_PADDLE_VALID_001",
+    orderId: "ORD_PADDLE_VALID_001",
+    userId: "uid_for_client@orthogonal.dz",
+    userUid: "uid_for_client@orthogonal.dz",
+    userEmail: "client@orthogonal.dz",
+    userName: "Client Orthogonal",
+    country: "France",
+    countryCode: "FR",
+    plan: "pro",
+    billingCycle: "yearly",
+    amount: 490,
+    currency: "EUR",
+    provider: "paddle",
+    status: "pending",
+    associationStatus: "unassociated",
+    createdAt: "2026-11-11T00:00:00.000Z"
+  });
+
   const setCalls: Array<{
     collection: string;
     docId: string;
@@ -80,7 +100,20 @@ function createSimulatedWebhookStack(options?: {
   const adminDb = {
     collection: vi.fn((colName: string) => ({
       doc: vi.fn((docId: string) => ({
+        get: vi.fn(async () => {
+          const existing = store.get(`${colName}:${docId}`);
+          return {
+            exists: Boolean(existing),
+            id: docId,
+            data: () => (existing ? { ...existing } : undefined)
+          };
+        }),
         set: vi.fn(async (data: Record<string, unknown>, setOpts?: { merge?: boolean }) => {
+          const current = store.get(`${colName}:${docId}`) || {};
+          store.set(
+            `${colName}:${docId}`,
+            setOpts?.merge ? { ...current, ...data } : { ...data }
+          );
           setCalls.push({ collection: colName, docId, data, options: setOpts });
           docSetMock(colName, docId, data, setOpts);
         })
@@ -89,6 +122,11 @@ function createSimulatedWebhookStack(options?: {
   };
 
   const adminAuth = {
+    getUser: vi.fn(async (uid: string) => ({
+      uid,
+      email: "client@orthogonal.dz",
+      disabled: false
+    })),
     getUserByEmail: vi.fn(async (email: string) => ({ uid: `uid_for_${email}` })),
     setCustomUserClaims: vi.fn(async () => undefined)
   };
@@ -144,7 +182,7 @@ describe("SEC-01-FIX-05-A-R1 : Webhook Authentication Hardening & Modular Separa
 
       // Corps brut avec espacement spécifique pour prouver l'utilisation de req.rawBody et non JSON.stringify(req.body)
       const rawBody =
-        '{\n  "event_id": "evt_paddle_valid_001",\n  "event_type": "transaction.completed",\n  "data": { "id": "chk_valid_001", "customer": { "email": "client@orthogonal.dz" } }\n}';
+        '{\n  "event_id": "evt_paddle_valid_001",\n  "event_type": "transaction.completed",\n  "data": { "id": "txn_valid_001", "custom_data": { "orderId": "ORD_PADDLE_VALID_001" }, "customer": { "email": "client@orthogonal.dz" } }\n}';
       const parsedBody = JSON.parse(rawBody);
       const signature = buildPaddleSignature(rawBody, paddleSecret);
 
@@ -158,12 +196,20 @@ describe("SEC-01-FIX-05-A-R1 : Webhook Authentication Hardening & Modular Separa
       await stack.paddleHandler(req, res);
 
       expect(res.statusCode).toBe(200);
-      expect(res.jsonBody).toEqual({ received: true });
+      expect(res.jsonBody).toMatchObject({
+        received: true,
+        associated: true,
+        orderId: "ORD_PADDLE_VALID_001",
+        providerTransactionId: "txn_valid_001"
+      });
       expect(stack.processorSpy.processVerifiedPaddleEvent).toHaveBeenCalledTimes(1);
       expect(stack.processorSpy.processVerifiedPaddleEvent).toHaveBeenCalledWith(parsedBody);
-      expect(stack.docSetMock).toHaveBeenCalled();
-      expect(stack.setCalls[0].collection).toBe("pdi_payment_transactions");
-      expect(stack.setCalls[0].docId).toBe("chk_valid_001");
+      expect(stack.docSetMock).toHaveBeenCalledTimes(1);
+      expect(stack.setCalls[0].collection).toBe("payment_transactions");
+      expect(stack.setCalls[0].docId).toBe("ORD_PADDLE_VALID_001");
+      // SEC-01-FIX-05-B: No premature license/claim activation during order-to-transaction association
+      expect(stack.adminAuth.setCustomUserClaims).not.toHaveBeenCalled();
+      expect(stack.adminAuth.getUserByEmail).not.toHaveBeenCalled();
     });
 
     it("2. Signature Paddle 64-hex invalide -> HTTP 401, processeur métier NON appelé, aucune écriture Firestore/Auth", async () => {
@@ -191,6 +237,7 @@ describe("SEC-01-FIX-05-A-R1 : Webhook Authentication Hardening & Modular Separa
       expect(stack.processorSpy.processVerifiedPaddleEvent).not.toHaveBeenCalled();
       expect(stack.docSetMock).not.toHaveBeenCalled();
       expect(stack.adminDb.collection).not.toHaveBeenCalled();
+      expect(stack.adminAuth.getUser).not.toHaveBeenCalled();
       expect(stack.adminAuth.getUserByEmail).not.toHaveBeenCalled();
       expect(stack.adminAuth.setCustomUserClaims).not.toHaveBeenCalled();
       expect(stack.idempotency.isProcessed("paddle_chk_invalid_sig_002")).toBe(false);
@@ -220,6 +267,7 @@ describe("SEC-01-FIX-05-A-R1 : Webhook Authentication Hardening & Modular Separa
       expect(stack.processorSpy.processVerifiedPaddleEvent).not.toHaveBeenCalled();
       expect(stack.docSetMock).not.toHaveBeenCalled();
       expect(stack.adminDb.collection).not.toHaveBeenCalled();
+      expect(stack.adminAuth.getUser).not.toHaveBeenCalled();
       expect(stack.adminAuth.getUserByEmail).not.toHaveBeenCalled();
       expect(stack.adminAuth.setCustomUserClaims).not.toHaveBeenCalled();
     });
@@ -339,6 +387,7 @@ describe("SEC-01-FIX-05-A-R1 : Webhook Authentication Hardening & Modular Separa
       expect(stack.processorSpy.processVerifiedPaddleEvent).not.toHaveBeenCalled();
       expect(stack.docSetMock).not.toHaveBeenCalled();
       expect(stack.adminDb.collection).not.toHaveBeenCalled();
+      expect(stack.adminAuth.getUser).not.toHaveBeenCalled();
       expect(stack.adminAuth.getUserByEmail).not.toHaveBeenCalled();
       expect(stack.adminAuth.setCustomUserClaims).not.toHaveBeenCalled();
     });
@@ -398,6 +447,7 @@ describe("SEC-01-FIX-05-A-R1 : Webhook Authentication Hardening & Modular Separa
       expect(stack.processorSpy.processVerifiedPaddleEvent).not.toHaveBeenCalled();
       expect(stack.docSetMock).not.toHaveBeenCalled();
       expect(stack.adminDb.collection).not.toHaveBeenCalled();
+      expect(stack.adminAuth.getUser).not.toHaveBeenCalled();
       expect(stack.adminAuth.getUserByEmail).not.toHaveBeenCalled();
       expect(stack.adminAuth.setCustomUserClaims).not.toHaveBeenCalled();
     });
@@ -426,6 +476,7 @@ describe("SEC-01-FIX-05-A-R1 : Webhook Authentication Hardening & Modular Separa
       expect(stack.processorSpy.processVerifiedPaddleEvent).not.toHaveBeenCalled();
       expect(stack.docSetMock).not.toHaveBeenCalled();
       expect(stack.adminDb.collection).not.toHaveBeenCalled();
+      expect(stack.adminAuth.getUser).not.toHaveBeenCalled();
       expect(stack.adminAuth.getUserByEmail).not.toHaveBeenCalled();
       expect(stack.adminAuth.setCustomUserClaims).not.toHaveBeenCalled();
     });
@@ -453,6 +504,7 @@ describe("SEC-01-FIX-05-A-R1 : Webhook Authentication Hardening & Modular Separa
       expect(stack.processorSpy.processVerifiedPaddleEvent).not.toHaveBeenCalled();
       expect(stack.docSetMock).not.toHaveBeenCalled();
       expect(stack.adminDb.collection).not.toHaveBeenCalled();
+      expect(stack.adminAuth.getUser).not.toHaveBeenCalled();
       expect(stack.adminAuth.getUserByEmail).not.toHaveBeenCalled();
       expect(stack.adminAuth.setCustomUserClaims).not.toHaveBeenCalled();
     });
@@ -491,6 +543,7 @@ describe("SEC-01-FIX-05-A-R1 : Webhook Authentication Hardening & Modular Separa
       expect(stack.processorSpy.processVerifiedPaddleEvent).not.toHaveBeenCalled();
       expect(stack.docSetMock).not.toHaveBeenCalled();
       expect(stack.adminDb.collection).not.toHaveBeenCalled();
+      expect(stack.adminAuth.getUser).not.toHaveBeenCalled();
       expect(stack.adminAuth.getUserByEmail).not.toHaveBeenCalled();
       expect(stack.adminAuth.setCustomUserClaims).not.toHaveBeenCalled();
       expect(stack.idempotency.isProcessed("slickpay_INV_SLICK_004")).toBe(false);
@@ -514,11 +567,13 @@ describe("SEC-01-FIX-05-A-R1 : Webhook Authentication Hardening & Modular Separa
       expect(paddleHandlerSource).not.toContain("adminDb");
       expect(paddleHandlerSource).not.toContain("adminAuth");
       expect(paddleHandlerSource).not.toContain("pdi_payment_transactions");
+      expect(paddleHandlerSource).not.toContain("payment_transactions");
       expect(paddleHandlerSource).not.toContain("setCustomUserClaims");
 
       expect(slickPayHandlerSource).not.toContain("adminDb");
       expect(slickPayHandlerSource).not.toContain("adminAuth");
       expect(slickPayHandlerSource).not.toContain("pdi_payment_transactions");
+      expect(slickPayHandlerSource).not.toContain("payment_transactions");
       expect(slickPayHandlerSource).not.toContain("setCustomUserClaims");
     });
 
@@ -531,6 +586,7 @@ describe("SEC-01-FIX-05-A-R1 : Webhook Authentication Hardening & Modular Separa
       expect(webhookAuthSource).not.toContain("adminDb");
       expect(webhookAuthSource).not.toContain("adminAuth");
       expect(webhookAuthSource).not.toContain("pdi_payment_transactions");
+      expect(webhookAuthSource).not.toContain("payment_transactions");
       expect(webhookAuthSource).not.toContain("profiles");
       expect(webhookAuthSource).not.toContain("setCustomUserClaims");
       expect(webhookAuthSource).not.toContain("getUserByEmail");

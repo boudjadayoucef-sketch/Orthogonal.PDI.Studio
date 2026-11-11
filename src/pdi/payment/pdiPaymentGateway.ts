@@ -16,7 +16,9 @@ export interface PdiPlanPricing {
 
 export interface PdiPaymentTransaction {
   id: string;
+  orderId?: string;
   userId?: string;
+  userUid?: string;
   userEmail: string;
   userName: string;
   company?: string;
@@ -29,6 +31,11 @@ export interface PdiPaymentTransaction {
   currency: "DZD" | "EUR" | "USD";
   provider: PdiPaymentProvider;
   status: "pending" | "completed" | "failed" | "refunded";
+  associationStatus?: "unassociated" | "associated";
+  providerTransactionId?: string;
+  lastEventId?: string;
+  lastEventType?: string;
+  associatedAt?: string;
   createdAt: string;
   updatedAt?: string;
   // Provider specific details
