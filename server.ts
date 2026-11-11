@@ -19,10 +19,9 @@ import {
   verifyProductionConfig,
   isSuspiciousRequestPath
 } from "./src/security/sec01SecurityService.ts";
-import {
-  createPaddleWebhookHandler,
-  createSlickPayWebhookHandler
-} from "./src/security/webhookAuth.ts";
+import { createPaymentWebhookProcessor } from "./src/security/webhooks/paymentWebhookProcessor.ts";
+import { createPaddleWebhookHandler } from "./src/security/webhooks/paddleWebhookHandler.ts";
+import { createSlickPayWebhookHandler } from "./src/security/webhooks/slickPayWebhookHandler.ts";
 import { 
   getUserProjects, 
   createOrUpdateProject, 
@@ -202,26 +201,22 @@ app.post("/api/admin/set-user-role", requireAuth, requireSuperAdmin, requireEmai
 });
 
 // ==========================================
-// Slick-Pay & Paddle Webhook IPN Endpoints (SEC-01-FIX-05-A Modular Auth Gateways)
+// Slick-Pay & Paddle Webhook IPN Endpoints (SEC-01-FIX-05-A-R1 Modular Architecture)
 // ==========================================
+const paymentWebhookProcessor = createPaymentWebhookProcessor({
+  adminDb,
+  adminAuth,
+  idempotency: globalWebhookIdempotency
+});
 
 // Slick-Pay Webhook (Algeria - BaridiMob / Edahabia) — Strict Fail-Closed
-app.post(
-  "/api/webhooks/slickpay",
-  createSlickPayWebhookHandler({
-    adminDb,
-    adminAuth,
-    idempotency: globalWebhookIdempotency
-  })
-);
+app.post("/api/webhooks/slickpay", createSlickPayWebhookHandler());
 
 // Paddle Webhook (International EUR/USD) — Strict RawBody Signature Verification
 app.post(
   "/api/webhooks/paddle",
   createPaddleWebhookHandler({
-    adminDb,
-    adminAuth,
-    idempotency: globalWebhookIdempotency
+    processor: paymentWebhookProcessor
   })
 );
 

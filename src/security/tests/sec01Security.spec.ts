@@ -323,6 +323,86 @@ describe("SEC-01-FIX-01 : Sécurité Atomique Frontend / Serveur / Auth / Webhoo
       expect(res.error).toBeDefined();
     });
 
+    it("B2-R1 (SEC-01-FIX-05-A-R1 B1): Paddle - Validation stricte du format HMAC (exactement 64 caractères hexadécimaux) et de la fenêtre anti-rejeu", () => {
+      const rawBody = JSON.stringify({
+        event_id: "evt_paddle_strict_hex_001",
+        event_type: "transaction.completed"
+      });
+      const nowSec = Math.floor(Date.now() / 1000);
+      const ts = nowSec.toString();
+      const validH1 = crypto
+        .createHmac("sha256", testSecret)
+        .update(`${ts}:${rawBody}`, "utf8")
+        .digest("hex");
+
+      // 1. Signature valide de 64 caractères hexadécimaux -> Acceptée
+      expect(validH1).toHaveLength(64);
+      expect(
+        verifyPaddleWebhookSignature(rawBody, `ts=${ts};h1=${validH1}`, testSecret).isValid
+      ).toBe(true);
+
+      // 2. Signature de 63 caractères -> Rejetée avant décodage hex
+      const sig63 = validH1.slice(0, 63);
+      expect(sig63).toHaveLength(63);
+      const res63 = verifyPaddleWebhookSignature(rawBody, `ts=${ts};h1=${sig63}`, testSecret);
+      expect(res63.isValid).toBe(false);
+      expect(res63.error).toContain("64 hex characters");
+
+      // 3. Signature de 65 caractères (64 hex valides + 1 caractère hex que Buffer.from("hex") tronquerait silencieusement !) -> Rejetée
+      const sig65 = `${validH1}a`;
+      expect(sig65).toHaveLength(65);
+      const res65 = verifyPaddleWebhookSignature(rawBody, `ts=${ts};h1=${sig65}`, testSecret);
+      expect(res65.isValid).toBe(false);
+      expect(res65.error).toContain("64 hex characters");
+
+      // 4. Signature de 66 caractères -> Rejetée
+      const sig66 = `${validH1}ab`;
+      expect(sig66).toHaveLength(66);
+      const res66 = verifyPaddleWebhookSignature(rawBody, `ts=${ts};h1=${sig66}`, testSecret);
+      expect(res66.isValid).toBe(false);
+      expect(res66.error).toContain("64 hex characters");
+
+      // 5. Signature de 64 caractères contenant un caractère non hexadécimal -> Rejetée
+      const sigNonHex = `${validH1.slice(0, 63)}g`;
+      expect(sigNonHex).toHaveLength(64);
+      const resNonHex = verifyPaddleWebhookSignature(rawBody, `ts=${ts};h1=${sigNonHex}`, testSecret);
+      expect(resNonHex.isValid).toBe(false);
+      expect(resNonHex.error).toContain("64 hex characters");
+
+      // 6. Signature de 64 caractères hexadécimaux mais HMAC erroné -> Rejetée
+      const wrongHex64 = validH1.startsWith("0") ? `1${validH1.slice(1)}` : `0${validH1.slice(1)}`;
+      const resWrongHmac = verifyPaddleWebhookSignature(rawBody, `ts=${ts};h1=${wrongHex64}`, testSecret);
+      expect(resWrongHmac.isValid).toBe(false);
+      expect(resWrongHmac.error).toContain("signature mismatch");
+
+      // 7. Timestamp hors tolérance (> 600s dans le passé ou le futur) -> Rejeté
+      const expiredTs = (nowSec - 605).toString();
+      const expiredH1 = crypto
+        .createHmac("sha256", testSecret)
+        .update(`${expiredTs}:${rawBody}`, "utf8")
+        .digest("hex");
+      const resExpired = verifyPaddleWebhookSignature(
+        rawBody,
+        `ts=${expiredTs};h1=${expiredH1}`,
+        testSecret
+      );
+      expect(resExpired.isValid).toBe(false);
+      expect(resExpired.error).toContain("out of tolerance window");
+
+      const futureTs = (nowSec + 605).toString();
+      const futureH1 = crypto
+        .createHmac("sha256", testSecret)
+        .update(`${futureTs}:${rawBody}`, "utf8")
+        .digest("hex");
+      const resFuture = verifyPaddleWebhookSignature(
+        rawBody,
+        `ts=${futureTs};h1=${futureH1}`,
+        testSecret
+      );
+      expect(resFuture.isValid).toBe(false);
+      expect(resFuture.error).toContain("out of tolerance window");
+    });
+
     it("B3: Paddle - Secret serveur non configuré -> Rejeté sans tentative d'activation", () => {
       const res = verifyPaddleWebhookSignature("{}", "ts=123;h1=abc", undefined);
       expect(res.isValid).toBe(false);

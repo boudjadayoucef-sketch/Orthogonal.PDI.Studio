@@ -1,29 +1,46 @@
 /**
  * ORTHOGONAL - ENG · PIPING DESIGN & ISOMETRICS (PD&I)
- * SEC-01-FIX-05-A — WEBHOOK AUTHENTICATION HARDENING TEST SUITE
+ * SEC-01-FIX-05-A-R1 — WEBHOOK AUTHENTICATION & MODULAR ARCHITECTURE TEST SUITE
  *
- * Tests both the modular authentication gates and the actual Express HTTP route handlers
- * (`createPaddleWebhookHandler`, `createSlickPayWebhookHandler`) with simulated Firebase
- * dependencies (`adminDb`, `adminAuth`) to verify HTTP responses and guarantee zero
- * unauthenticated Firestore or Auth writes.
+ * Tests:
+ * 1. Pure authentication contracts in `src/security/webhookAuth.ts`
+ * 2. Express HTTP route handlers in `src/security/webhooks/paddleWebhookHandler.ts`
+ *    and `src/security/webhooks/slickPayWebhookHandler.ts`
+ * 3. Business orchestration in `src/security/webhooks/paymentWebhookProcessor.ts`
+ * 4. Strict B1 (64-hex HMAC format validation) and B2 (modular separation & delegation)
  */
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import { WebhookIdempotencyRegistry } from "../sec01SecurityService.ts";
 import {
   authenticatePaddleWebhookRequest,
-  authenticateSlickPayWebhookRequest,
-  createPaddleWebhookHandler,
-  createSlickPayWebhookHandler,
-  type RawBodyWebhookRequest
+  authenticateSlickPayWebhookRequest
 } from "../webhookAuth.ts";
+import {
+  createPaddleWebhookHandler,
+  type RawBodyWebhookRequest
+} from "../webhooks/paddleWebhookHandler.ts";
+import { createSlickPayWebhookHandler } from "../webhooks/slickPayWebhookHandler.ts";
+import {
+  createPaymentWebhookProcessor,
+  type PaymentWebhookProcessor
+} from "../webhooks/paymentWebhookProcessor.ts";
 
 function buildPaddleSignature(rawBody: string, secretKey: string, timestampSec?: number): string {
   const ts = (timestampSec ?? Math.floor(Date.now() / 1000)).toString();
   const signedPayload = `${ts}:${rawBody}`;
   const h1 = crypto.createHmac("sha256", secretKey).update(signedPayload, "utf8").digest("hex");
   return `ts=${ts};h1=${h1}`;
+}
+
+function buildPaddleRawHmac(rawBody: string, secretKey: string, timestampSec: number): string {
+  return crypto
+    .createHmac("sha256", secretKey)
+    .update(`${timestampSec}:${rawBody}`, "utf8")
+    .digest("hex");
 }
 
 function createMockExpressResponse() {
@@ -48,11 +65,16 @@ function createMockExpressResponse() {
   return res;
 }
 
-function createSimulatedFirebaseDeps(options?: {
+function createSimulatedWebhookStack(options?: {
   paddleSecret?: string;
   slickPaySecret?: string;
 }) {
-  const setCalls: Array<{ collection: string; docId: string; data: Record<string, unknown>; options?: { merge?: boolean } }> = [];
+  const setCalls: Array<{
+    collection: string;
+    docId: string;
+    data: Record<string, unknown>;
+    options?: { merge?: boolean };
+  }> = [];
   const docSetMock = vi.fn();
 
   const adminDb = {
@@ -72,19 +94,40 @@ function createSimulatedFirebaseDeps(options?: {
   };
 
   const idempotency = new WebhookIdempotencyRegistry(500);
+  const realProcessor = createPaymentWebhookProcessor({
+    adminDb,
+    adminAuth,
+    idempotency
+  });
+
+  const processorSpy: PaymentWebhookProcessor = {
+    processVerifiedPaddleEvent: vi.fn((payload: Record<string, any>) =>
+      realProcessor.processVerifiedPaddleEvent(payload)
+    )
+  };
+
+  const paddleHandler = createPaddleWebhookHandler({
+    processor: processorSpy,
+    getPaddleSecret: () => options?.paddleSecret
+  });
+
+  const slickPayHandler = createSlickPayWebhookHandler({
+    getSlickPaySecret: () => options?.slickPaySecret
+  });
 
   return {
     adminDb,
     adminAuth,
     idempotency,
+    processorSpy,
+    paddleHandler,
+    slickPayHandler,
     setCalls,
-    docSetMock,
-    getPaddleSecret: () => options?.paddleSecret,
-    getSlickPaySecret: () => options?.slickPaySecret
+    docSetMock
   };
 }
 
-describe("SEC-01-FIX-05-A : Webhook Authentication Hardening (Paddle & Slick-Pay)", () => {
+describe("SEC-01-FIX-05-A-R1 : Webhook Authentication Hardening & Modular Separation", () => {
   const paddleSecret = "pdl_ntfset_01hxyz_strict_webhook_secret_key";
   const slickPaySecret = "slickpay_shared_secret_2026_dz";
 
@@ -93,12 +136,11 @@ describe("SEC-01-FIX-05-A : Webhook Authentication Hardening (Paddle & Slick-Pay
   });
 
   // =========================================================================
-  // A — PADDLE : AUTHENTIFICATION STRICTE SUR req.rawBody
+  // A — PADDLE : AUTHENTIFICATION STRICTE SUR req.rawBody & FORMAT 64-HEX (B1)
   // =========================================================================
-  describe("A — Paddle : Authentification stricte et effets HTTP / Firestore", () => {
-    it("A1: Signature Paddle valide sur req.rawBody exact -> HTTP 200 et écriture contrôlée dans les dépendances simulées", async () => {
-      const deps = createSimulatedFirebaseDeps({ paddleSecret });
-      const handler = createPaddleWebhookHandler(deps);
+  describe("A — Paddle : Authentification stricte, format HMAC 64-hex et délégation contrôlée", () => {
+    it("1. Signature Paddle 64-hex valide sur req.rawBody exact -> authentification réussie et délégation au processeur métier", async () => {
+      const stack = createSimulatedWebhookStack({ paddleSecret });
 
       // Corps brut avec espacement spécifique pour prouver l'utilisation de req.rawBody et non JSON.stringify(req.body)
       const rawBody =
@@ -113,18 +155,19 @@ describe("SEC-01-FIX-05-A : Webhook Authentication Hardening (Paddle & Slick-Pay
       } as unknown as RawBodyWebhookRequest;
       const res = createMockExpressResponse();
 
-      await handler(req, res);
+      await stack.paddleHandler(req, res);
 
       expect(res.statusCode).toBe(200);
       expect(res.jsonBody).toEqual({ received: true });
-      expect(deps.docSetMock).toHaveBeenCalled();
-      expect(deps.setCalls[0].collection).toBe("pdi_payment_transactions");
-      expect(deps.setCalls[0].docId).toBe("chk_valid_001");
+      expect(stack.processorSpy.processVerifiedPaddleEvent).toHaveBeenCalledTimes(1);
+      expect(stack.processorSpy.processVerifiedPaddleEvent).toHaveBeenCalledWith(parsedBody);
+      expect(stack.docSetMock).toHaveBeenCalled();
+      expect(stack.setCalls[0].collection).toBe("pdi_payment_transactions");
+      expect(stack.setCalls[0].docId).toBe("chk_valid_001");
     });
 
-    it("A2: Signature Paddle invalide -> HTTP 401, aucune mutation d'idempotence et AUCUNE écriture Firestore/Auth", async () => {
-      const deps = createSimulatedFirebaseDeps({ paddleSecret });
-      const handler = createPaddleWebhookHandler(deps);
+    it("2. Signature Paddle 64-hex invalide -> HTTP 401, processeur métier NON appelé, aucune écriture Firestore/Auth", async () => {
+      const stack = createSimulatedWebhookStack({ paddleSecret });
 
       const rawBody = JSON.stringify({
         event_id: "evt_paddle_invalid_sig",
@@ -141,21 +184,20 @@ describe("SEC-01-FIX-05-A : Webhook Authentication Hardening (Paddle & Slick-Pay
       } as unknown as RawBodyWebhookRequest;
       const res = createMockExpressResponse();
 
-      await handler(req, res);
+      await stack.paddleHandler(req, res);
 
       expect(res.statusCode).toBe(401);
       expect(res.jsonBody?.received).toBe(false);
-      expect(deps.docSetMock).not.toHaveBeenCalled();
-      expect(deps.adminDb.collection).not.toHaveBeenCalled();
-      expect(deps.adminAuth.getUserByEmail).not.toHaveBeenCalled();
-      expect(deps.adminAuth.setCustomUserClaims).not.toHaveBeenCalled();
-      expect(deps.idempotency.isProcessed("paddle_chk_invalid_sig_002")).toBe(false);
-      expect(deps.idempotency.isInProgress("paddle_chk_invalid_sig_002")).toBe(false);
+      expect(stack.processorSpy.processVerifiedPaddleEvent).not.toHaveBeenCalled();
+      expect(stack.docSetMock).not.toHaveBeenCalled();
+      expect(stack.adminDb.collection).not.toHaveBeenCalled();
+      expect(stack.adminAuth.getUserByEmail).not.toHaveBeenCalled();
+      expect(stack.adminAuth.setCustomUserClaims).not.toHaveBeenCalled();
+      expect(stack.idempotency.isProcessed("paddle_chk_invalid_sig_002")).toBe(false);
     });
 
-    it("A3: Signature Paddle absente -> HTTP 401 et AUCUNE écriture Firestore/Auth", async () => {
-      const deps = createSimulatedFirebaseDeps({ paddleSecret });
-      const handler = createPaddleWebhookHandler(deps);
+    it("3. Signature Paddle absente -> HTTP 401, processeur métier NON appelé, aucune écriture Firestore/Auth", async () => {
+      const stack = createSimulatedWebhookStack({ paddleSecret });
 
       const rawBody = JSON.stringify({
         event_id: "evt_paddle_no_sig",
@@ -171,19 +213,19 @@ describe("SEC-01-FIX-05-A : Webhook Authentication Hardening (Paddle & Slick-Pay
       } as unknown as RawBodyWebhookRequest;
       const res = createMockExpressResponse();
 
-      await handler(req, res);
+      await stack.paddleHandler(req, res);
 
       expect(res.statusCode).toBe(401);
       expect(res.jsonBody?.error).toContain("Missing Paddle-Signature header");
-      expect(deps.docSetMock).not.toHaveBeenCalled();
-      expect(deps.adminDb.collection).not.toHaveBeenCalled();
-      expect(deps.adminAuth.getUserByEmail).not.toHaveBeenCalled();
-      expect(deps.adminAuth.setCustomUserClaims).not.toHaveBeenCalled();
+      expect(stack.processorSpy.processVerifiedPaddleEvent).not.toHaveBeenCalled();
+      expect(stack.docSetMock).not.toHaveBeenCalled();
+      expect(stack.adminDb.collection).not.toHaveBeenCalled();
+      expect(stack.adminAuth.getUserByEmail).not.toHaveBeenCalled();
+      expect(stack.adminAuth.setCustomUserClaims).not.toHaveBeenCalled();
     });
 
-    it("A4: req.rawBody absent (suppression du fallback JSON.stringify(req.body)) -> HTTP 401 même si la signature correspond à JSON.stringify(req.body)", async () => {
-      const deps = createSimulatedFirebaseDeps({ paddleSecret });
-      const handler = createPaddleWebhookHandler(deps);
+    it("4. req.rawBody absent (suppression du fallback JSON.stringify(req.body)) -> HTTP 401, processeur métier NON appelé", async () => {
+      const stack = createSimulatedWebhookStack({ paddleSecret });
 
       const bodyObj = {
         event_id: "evt_paddle_no_raw_body",
@@ -191,7 +233,6 @@ describe("SEC-01-FIX-05-A : Webhook Authentication Hardening (Paddle & Slick-Pay
         checkout_id: "chk_no_raw_body_004",
         email: "attacker@evil.com"
       };
-      // Un attaquant signe JSON.stringify(bodyObj), mais req.rawBody est absent
       const forgedSignatureOnJsonStringify = buildPaddleSignature(
         JSON.stringify(bodyObj),
         paddleSecret
@@ -204,23 +245,20 @@ describe("SEC-01-FIX-05-A : Webhook Authentication Hardening (Paddle & Slick-Pay
       } as unknown as RawBodyWebhookRequest;
       const res = createMockExpressResponse();
 
-      await handler(req, res);
+      await stack.paddleHandler(req, res);
 
       expect(res.statusCode).toBe(401);
       expect(res.jsonBody?.error).toContain("Missing raw request body");
-      expect(deps.docSetMock).not.toHaveBeenCalled();
-      expect(deps.adminDb.collection).not.toHaveBeenCalled();
-      expect(deps.adminAuth.getUserByEmail).not.toHaveBeenCalled();
-      expect(deps.adminAuth.setCustomUserClaims).not.toHaveBeenCalled();
+      expect(stack.processorSpy.processVerifiedPaddleEvent).not.toHaveBeenCalled();
+      expect(stack.docSetMock).not.toHaveBeenCalled();
+      expect(stack.adminDb.collection).not.toHaveBeenCalled();
     });
 
-    it("A5: Signature calculée sur JSON.stringify(req.body) alors que req.rawBody diffère par le formatage -> HTTP 401 et aucune écriture Firestore", async () => {
-      const deps = createSimulatedFirebaseDeps({ paddleSecret });
-      const handler = createPaddleWebhookHandler(deps);
+    it("5. Corps JSON reconstruit différent de req.rawBody -> HTTP 401, processeur métier NON appelé", async () => {
+      const stack = createSimulatedWebhookStack({ paddleSecret });
 
       const rawBody = '{ "checkout_id" : "chk_005" , "event_type" : "payment_succeeded" }';
       const parsedBody = JSON.parse(rawBody);
-      // Signature calculée sur JSON.stringify(parsedBody) au lieu des octets originaux de req.rawBody
       const signatureOverReserialized = buildPaddleSignature(
         JSON.stringify(parsedBody),
         paddleSecret
@@ -240,11 +278,96 @@ describe("SEC-01-FIX-05-A : Webhook Authentication Hardening (Paddle & Slick-Pay
       } as unknown as RawBodyWebhookRequest;
       const res = createMockExpressResponse();
 
-      await handler(req, res);
+      await stack.paddleHandler(req, res);
 
       expect(res.statusCode).toBe(401);
-      expect(deps.docSetMock).not.toHaveBeenCalled();
-      expect(deps.adminDb.collection).not.toHaveBeenCalled();
+      expect(stack.processorSpy.processVerifiedPaddleEvent).not.toHaveBeenCalled();
+      expect(stack.docSetMock).not.toHaveBeenCalled();
+      expect(stack.adminDb.collection).not.toHaveBeenCalled();
+    });
+
+    it("6. Signature malformée (63 caractères) -> HTTP 401, processeur métier NON appelé, zéro effet métier", async () => {
+      const stack = createSimulatedWebhookStack({ paddleSecret });
+      const rawBody = JSON.stringify({
+        event_id: "evt_paddle_63_chars",
+        event_type: "transaction.completed",
+        checkout_id: "chk_63_chars"
+      });
+      const ts = Math.floor(Date.now() / 1000);
+      const validH1 = buildPaddleRawHmac(rawBody, paddleSecret, ts);
+      const sig63 = `ts=${ts};h1=${validH1.slice(0, 63)}`;
+
+      const req = {
+        rawBody,
+        body: JSON.parse(rawBody),
+        headers: { "paddle-signature": sig63 }
+      } as unknown as RawBodyWebhookRequest;
+      const res = createMockExpressResponse();
+
+      await stack.paddleHandler(req, res);
+
+      expect(res.statusCode).toBe(401);
+      expect(res.jsonBody?.error).toContain("64 hex characters");
+      expect(stack.processorSpy.processVerifiedPaddleEvent).not.toHaveBeenCalled();
+      expect(stack.docSetMock).not.toHaveBeenCalled();
+      expect(stack.adminDb.collection).not.toHaveBeenCalled();
+    });
+
+    it("7. Signature malformée (65 caractères : HMAC valide + 1 caractère hex) -> HTTP 401, processeur métier NON appelé, zéro effet métier", async () => {
+      const stack = createSimulatedWebhookStack({ paddleSecret });
+      const rawBody = JSON.stringify({
+        event_id: "evt_paddle_65_chars",
+        event_type: "transaction.completed",
+        checkout_id: "chk_65_chars",
+        email: "attacker@evil.com"
+      });
+      const ts = Math.floor(Date.now() / 1000);
+      const validH1 = buildPaddleRawHmac(rawBody, paddleSecret, ts);
+      const sig65 = `ts=${ts};h1=${validH1}f`;
+
+      const req = {
+        rawBody,
+        body: JSON.parse(rawBody),
+        headers: { "paddle-signature": sig65 }
+      } as unknown as RawBodyWebhookRequest;
+      const res = createMockExpressResponse();
+
+      await stack.paddleHandler(req, res);
+
+      expect(res.statusCode).toBe(401);
+      expect(res.jsonBody?.error).toContain("64 hex characters");
+      expect(stack.processorSpy.processVerifiedPaddleEvent).not.toHaveBeenCalled();
+      expect(stack.docSetMock).not.toHaveBeenCalled();
+      expect(stack.adminDb.collection).not.toHaveBeenCalled();
+      expect(stack.adminAuth.getUserByEmail).not.toHaveBeenCalled();
+      expect(stack.adminAuth.setCustomUserClaims).not.toHaveBeenCalled();
+    });
+
+    it("8. Signature malformée (66 caractères) -> HTTP 401, processeur métier NON appelé, zéro effet métier", async () => {
+      const stack = createSimulatedWebhookStack({ paddleSecret });
+      const rawBody = JSON.stringify({
+        event_id: "evt_paddle_66_chars",
+        event_type: "transaction.completed",
+        checkout_id: "chk_66_chars"
+      });
+      const ts = Math.floor(Date.now() / 1000);
+      const validH1 = buildPaddleRawHmac(rawBody, paddleSecret, ts);
+      const sig66 = `ts=${ts};h1=${validH1}ab`;
+
+      const req = {
+        rawBody,
+        body: JSON.parse(rawBody),
+        headers: { "paddle-signature": sig66 }
+      } as unknown as RawBodyWebhookRequest;
+      const res = createMockExpressResponse();
+
+      await stack.paddleHandler(req, res);
+
+      expect(res.statusCode).toBe(401);
+      expect(res.jsonBody?.error).toContain("64 hex characters");
+      expect(stack.processorSpy.processVerifiedPaddleEvent).not.toHaveBeenCalled();
+      expect(stack.docSetMock).not.toHaveBeenCalled();
+      expect(stack.adminDb.collection).not.toHaveBeenCalled();
     });
   });
 
@@ -252,9 +375,8 @@ describe("SEC-01-FIX-05-A : Webhook Authentication Hardening (Paddle & Slick-Pay
   // B — SLICK-PAY : COMPORTEMENT FAIL-CLOSED STRICT
   // =========================================================================
   describe("B — Slick-Pay : Comportement Fail-Closed et blocage de toute écriture ou activation non authentifiée", () => {
-    it("B1: Slick-Pay - Secret absent -> HTTP 401, isAuthentic: false, canAutoActivate: false, aucune écriture Firestore/Auth", async () => {
-      const deps = createSimulatedFirebaseDeps({ slickPaySecret: undefined });
-      const handler = createSlickPayWebhookHandler(deps);
+    it("9. Slick-Pay sans secret -> HTTP 401, isAuthentic: false, canAutoActivate: false, zéro effet métier", async () => {
+      const stack = createSimulatedWebhookStack({ slickPaySecret: undefined });
 
       const req = {
         body: {
@@ -267,21 +389,21 @@ describe("SEC-01-FIX-05-A : Webhook Authentication Hardening (Paddle & Slick-Pay
       } as unknown as RawBodyWebhookRequest;
       const res = createMockExpressResponse();
 
-      await handler(req, res);
+      await stack.slickPayHandler(req, res);
 
       expect(res.statusCode).toBe(401);
       expect(res.jsonBody?.received).toBe(false);
       expect(res.jsonBody?.isAuthentic).toBe(false);
       expect(res.jsonBody?.canAutoActivate).toBe(false);
-      expect(deps.docSetMock).not.toHaveBeenCalled();
-      expect(deps.adminDb.collection).not.toHaveBeenCalled();
-      expect(deps.adminAuth.getUserByEmail).not.toHaveBeenCalled();
-      expect(deps.adminAuth.setCustomUserClaims).not.toHaveBeenCalled();
+      expect(stack.processorSpy.processVerifiedPaddleEvent).not.toHaveBeenCalled();
+      expect(stack.docSetMock).not.toHaveBeenCalled();
+      expect(stack.adminDb.collection).not.toHaveBeenCalled();
+      expect(stack.adminAuth.getUserByEmail).not.toHaveBeenCalled();
+      expect(stack.adminAuth.setCustomUserClaims).not.toHaveBeenCalled();
     });
 
-    it("B2: Slick-Pay - Header de signature absent -> HTTP 401, isAuthentic: false, canAutoActivate: false, aucune écriture Firestore/Auth", async () => {
-      const deps = createSimulatedFirebaseDeps({ slickPaySecret });
-      const handler = createSlickPayWebhookHandler(deps);
+    it("10. Slick-Pay avec header absent -> HTTP 401, isAuthentic: false, canAutoActivate: false, zéro effet métier", async () => {
+      const stack = createSimulatedWebhookStack({ slickPaySecret });
 
       const req = {
         body: {
@@ -294,22 +416,22 @@ describe("SEC-01-FIX-05-A : Webhook Authentication Hardening (Paddle & Slick-Pay
       } as unknown as RawBodyWebhookRequest;
       const res = createMockExpressResponse();
 
-      await handler(req, res);
+      await stack.slickPayHandler(req, res);
 
       expect(res.statusCode).toBe(401);
       expect(res.jsonBody?.received).toBe(false);
       expect(res.jsonBody?.isAuthentic).toBe(false);
       expect(res.jsonBody?.canAutoActivate).toBe(false);
       expect(res.jsonBody?.error).toContain("Missing Slick-Pay signature header");
-      expect(deps.docSetMock).not.toHaveBeenCalled();
-      expect(deps.adminDb.collection).not.toHaveBeenCalled();
-      expect(deps.adminAuth.getUserByEmail).not.toHaveBeenCalled();
-      expect(deps.adminAuth.setCustomUserClaims).not.toHaveBeenCalled();
+      expect(stack.processorSpy.processVerifiedPaddleEvent).not.toHaveBeenCalled();
+      expect(stack.docSetMock).not.toHaveBeenCalled();
+      expect(stack.adminDb.collection).not.toHaveBeenCalled();
+      expect(stack.adminAuth.getUserByEmail).not.toHaveBeenCalled();
+      expect(stack.adminAuth.setCustomUserClaims).not.toHaveBeenCalled();
     });
 
-    it("B3: Slick-Pay - Header incorrect -> HTTP 401, isAuthentic: false, canAutoActivate: false, aucune écriture Firestore/Auth", async () => {
-      const deps = createSimulatedFirebaseDeps({ slickPaySecret });
-      const handler = createSlickPayWebhookHandler(deps);
+    it("11. Slick-Pay avec header faux -> HTTP 401, isAuthentic: false, canAutoActivate: false, zéro effet métier", async () => {
+      const stack = createSimulatedWebhookStack({ slickPaySecret });
 
       const req = {
         body: {
@@ -322,21 +444,21 @@ describe("SEC-01-FIX-05-A : Webhook Authentication Hardening (Paddle & Slick-Pay
       } as unknown as RawBodyWebhookRequest;
       const res = createMockExpressResponse();
 
-      await handler(req, res);
+      await stack.slickPayHandler(req, res);
 
       expect(res.statusCode).toBe(401);
       expect(res.jsonBody?.received).toBe(false);
       expect(res.jsonBody?.isAuthentic).toBe(false);
       expect(res.jsonBody?.canAutoActivate).toBe(false);
-      expect(deps.docSetMock).not.toHaveBeenCalled();
-      expect(deps.adminDb.collection).not.toHaveBeenCalled();
-      expect(deps.adminAuth.getUserByEmail).not.toHaveBeenCalled();
-      expect(deps.adminAuth.setCustomUserClaims).not.toHaveBeenCalled();
+      expect(stack.processorSpy.processVerifiedPaddleEvent).not.toHaveBeenCalled();
+      expect(stack.docSetMock).not.toHaveBeenCalled();
+      expect(stack.adminDb.collection).not.toHaveBeenCalled();
+      expect(stack.adminAuth.getUserByEmail).not.toHaveBeenCalled();
+      expect(stack.adminAuth.setCustomUserClaims).not.toHaveBeenCalled();
     });
 
-    it("B4: Slick-Pay - Même si le header correspond exactement au secret partagé, la comparaison directe est refusée (isAuthentic: false, canAutoActivate: false, HTTP 401, zéro écriture Firestore et zéro activation)", async () => {
-      const deps = createSimulatedFirebaseDeps({ slickPaySecret });
-      const handler = createSlickPayWebhookHandler(deps);
+    it("12. Slick-Pay avec header égal au secret partagé -> HTTP 401, isAuthentic: false, canAutoActivate: false, zéro effet métier", async () => {
+      const stack = createSimulatedWebhookStack({ slickPaySecret });
 
       const authResult = authenticateSlickPayWebhookRequest({
         payload: { invoice_id: "INV_SLICK_004", status: "completed" },
@@ -360,17 +482,58 @@ describe("SEC-01-FIX-05-A : Webhook Authentication Hardening (Paddle & Slick-Pay
       } as unknown as RawBodyWebhookRequest;
       const res = createMockExpressResponse();
 
-      await handler(req, res);
+      await stack.slickPayHandler(req, res);
 
       expect(res.statusCode).toBe(401);
       expect(res.jsonBody?.received).toBe(false);
       expect(res.jsonBody?.isAuthentic).toBe(false);
       expect(res.jsonBody?.canAutoActivate).toBe(false);
-      expect(deps.docSetMock).not.toHaveBeenCalled();
-      expect(deps.adminDb.collection).not.toHaveBeenCalled();
-      expect(deps.adminAuth.getUserByEmail).not.toHaveBeenCalled();
-      expect(deps.adminAuth.setCustomUserClaims).not.toHaveBeenCalled();
-      expect(deps.idempotency.isProcessed("slickpay_INV_SLICK_004")).toBe(false);
+      expect(stack.processorSpy.processVerifiedPaddleEvent).not.toHaveBeenCalled();
+      expect(stack.docSetMock).not.toHaveBeenCalled();
+      expect(stack.adminDb.collection).not.toHaveBeenCalled();
+      expect(stack.adminAuth.getUserByEmail).not.toHaveBeenCalled();
+      expect(stack.adminAuth.setCustomUserClaims).not.toHaveBeenCalled();
+      expect(stack.idempotency.isProcessed("slickpay_INV_SLICK_004")).toBe(false);
+    });
+  });
+
+  // =========================================================================
+  // C — GARANTIES ARCHITECTURALES B2 : SÉPARATION STRICTE DES RESPONSABILITÉS
+  // =========================================================================
+  describe("C — Séparation modulaire B2 (webhookAuth, HTTP handlers, paymentWebhookProcessor)", () => {
+    it("13. Les handlers HTTP ne contiennent aucune orchestration directe Firestore / Auth et délèguent exclusivement après authentification", () => {
+      const paddleHandlerSource = fs.readFileSync(
+        path.resolve(process.cwd(), "src/security/webhooks/paddleWebhookHandler.ts"),
+        "utf8"
+      );
+      const slickPayHandlerSource = fs.readFileSync(
+        path.resolve(process.cwd(), "src/security/webhooks/slickPayWebhookHandler.ts"),
+        "utf8"
+      );
+
+      expect(paddleHandlerSource).not.toContain("adminDb");
+      expect(paddleHandlerSource).not.toContain("adminAuth");
+      expect(paddleHandlerSource).not.toContain("pdi_payment_transactions");
+      expect(paddleHandlerSource).not.toContain("setCustomUserClaims");
+
+      expect(slickPayHandlerSource).not.toContain("adminDb");
+      expect(slickPayHandlerSource).not.toContain("adminAuth");
+      expect(slickPayHandlerSource).not.toContain("pdi_payment_transactions");
+      expect(slickPayHandlerSource).not.toContain("setCustomUserClaims");
+    });
+
+    it("14. webhookAuth.ts ne contient aucune opération métier, aucun accès Firestore et aucune mutation Custom Claims", () => {
+      const webhookAuthSource = fs.readFileSync(
+        path.resolve(process.cwd(), "src/security/webhookAuth.ts"),
+        "utf8"
+      );
+
+      expect(webhookAuthSource).not.toContain("adminDb");
+      expect(webhookAuthSource).not.toContain("adminAuth");
+      expect(webhookAuthSource).not.toContain("pdi_payment_transactions");
+      expect(webhookAuthSource).not.toContain("profiles");
+      expect(webhookAuthSource).not.toContain("setCustomUserClaims");
+      expect(webhookAuthSource).not.toContain("getUserByEmail");
     });
   });
 });

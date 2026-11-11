@@ -209,8 +209,19 @@ export function verifyPaddleWebhookSignature(
   const timestamp = parts["ts"];
   const receivedHash = parts["h1"];
 
-  if (!timestamp || !receivedHash || !/^\d+$/.test(timestamp) || !/^[0-9a-fA-F]+$/.test(receivedHash)) {
-    return { isValid: false, error: "Malformed Paddle-Signature header (missing or invalid ts or h1)" };
+  // SEC-01-FIX-05-A-R1 (B1): Strictly require digits for ts and EXACTLY 64 hexadecimal characters for h1
+  // before any Buffer.from(..., "hex") call (which would otherwise silently truncate a 65-char hex string).
+  if (
+    !timestamp ||
+    !receivedHash ||
+    !/^\d+$/.test(timestamp) ||
+    receivedHash.length !== 64 ||
+    !/^[0-9a-fA-F]{64}$/.test(receivedHash)
+  ) {
+    return {
+      isValid: false,
+      error: "Malformed Paddle-Signature header (ts must be digits and h1 must be exactly 64 hex characters)"
+    };
   }
 
   // Replay tolerance: check timestamp within 10 minutes (600 seconds)
