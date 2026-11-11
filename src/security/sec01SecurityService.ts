@@ -176,36 +176,41 @@ export function createEmailAntiBombingThrottler(options?: EmailThrottleOptions):
  * Official Paddle Billing Webhook Signature Verification (HMAC-SHA256).
  * Header format: `ts=<timestamp>;h1=<hmac_sha256_hash>`
  * Signed payload: `<timestamp>:<rawRequestBody>`
+ * SEC-01-FIX-05-A: Must operate strictly on the original raw HTTP body bytes (never JSON.stringify(req.body)).
  */
 export function verifyPaddleWebhookSignature(
   rawBody: string | undefined,
   signatureHeader: string | undefined,
   secretKey: string | undefined
 ): { isValid: boolean; error?: string } {
-  if (!secretKey || secretKey.trim().length === 0) {
+  if (!secretKey || typeof secretKey !== "string" || secretKey.trim().length === 0) {
     return { isValid: false, error: "Paddle webhook secret key not configured on server" };
   }
 
-  if (!rawBody) {
+  if (typeof rawBody !== "string" || rawBody.length === 0) {
     return { isValid: false, error: "Missing raw request body for Paddle signature verification" };
   }
 
-  if (!signatureHeader) {
+  if (!signatureHeader || typeof signatureHeader !== "string" || signatureHeader.trim().length === 0) {
     return { isValid: false, error: "Missing Paddle-Signature header" };
   }
 
   // Parse header components: ts=123456789;h1=abcdef...
   const parts = signatureHeader.split(";").reduce<Record<string, string>>((acc, part) => {
-    const [k, v] = part.split("=");
-    if (k && v) acc[k.trim()] = v.trim();
+    const eqIdx = part.indexOf("=");
+    if (eqIdx > 0) {
+      const k = part.slice(0, eqIdx).trim();
+      const v = part.slice(eqIdx + 1).trim();
+      if (k && v) acc[k] = v;
+    }
     return acc;
   }, {});
 
   const timestamp = parts["ts"];
   const receivedHash = parts["h1"];
 
-  if (!timestamp || !receivedHash) {
-    return { isValid: false, error: "Malformed Paddle-Signature header (missing ts or h1)" };
+  if (!timestamp || !receivedHash || !/^\d+$/.test(timestamp) || !/^[0-9a-fA-F]+$/.test(receivedHash)) {
+    return { isValid: false, error: "Malformed Paddle-Signature header (missing or invalid ts or h1)" };
   }
 
   // Replay tolerance: check timestamp within 10 minutes (600 seconds)
@@ -240,60 +245,51 @@ export function verifyPaddleWebhookSignature(
 }
 
 /**
- * Slick-Pay Webhook Verification Layer.
- * RÈGLE STRICTE DU TICKET :
- * Ne pas inventer un faux algorithme Slick-Pay.
- * Si une signature/clé officielle est configurée, vérifier.
- * Si AUCUNE signature officielle n'est configurée, NE JAMAIS auto-activer de rôle/licence/abonnement.
+ * Slick-Pay Webhook Verification Layer (SEC-01-FIX-05-A — Strict Fail-Closed).
+ *
+ * RÈGLE STRICTE SEC-01-FIX-05-A :
+ * - La comparaison directe d'un header avec un secret partagé n'est PAS confirmée comme protocole officiel Slick-Pay.
+ * - Ne jamais retourner `isAuthentic: true` sur cette seule base.
+ * - Forcer `canAutoActivate: false` tant que le protocole officiel n'est pas documenté et vérifié.
+ * - Ne pas inventer de mécanisme de signature ni de documentation fournisseur.
  */
 export function verifySlickPayWebhook(
-  _payload: any,
-  headers: Record<string, any>,
+  _payload: unknown,
+  headers: Record<string, unknown> | undefined,
   configuredSecret: string | undefined
 ): { isAuthentic: boolean; canAutoActivate: boolean; reason: string } {
-  if (!configuredSecret || configuredSecret.trim().length === 0) {
+  if (!configuredSecret || typeof configuredSecret !== "string" || configuredSecret.trim().length === 0) {
     return {
       isAuthentic: false,
       canAutoActivate: false,
-      reason: "No official Slick-Pay webhook secret configured. Webhook must be held in safe pending state without auto-activation."
+      reason: "No official Slick-Pay webhook secret configured. Webhook rejected in fail-closed mode without auto-activation."
     };
   }
 
-  const signature = headers["x-slickpay-signature"] || headers["x-signature"];
-  if (!signature) {
+  const safeHeaders = headers && typeof headers === "object" ? headers : {};
+  const rawSignature =
+    safeHeaders["x-slickpay-signature"] ??
+    safeHeaders["X-SlickPay-Signature"] ??
+    safeHeaders["x-signature"] ??
+    safeHeaders["X-Signature"];
+
+  const signature = Array.isArray(rawSignature) ? rawSignature[0] : rawSignature;
+  if (!signature || typeof signature !== "string" || signature.trim().length === 0) {
     return {
       isAuthentic: false,
       canAutoActivate: false,
-      reason: "Missing Slick-Pay signature header."
+      reason: "Missing Slick-Pay signature header. Webhook rejected in fail-closed mode."
     };
   }
 
-  // If a shared secret token is configured, do a constant-time comparison
-  try {
-    const sigStr = String(signature).trim();
-    const secretStr = configuredSecret.trim();
-
-    if (sigStr.length !== secretStr.length) {
-      return {
-        isAuthentic: false,
-        canAutoActivate: false,
-        reason: "Slick-Pay signature mismatch."
-      };
-    }
-
-    const matches = crypto.timingSafeEqual(Buffer.from(sigStr), Buffer.from(secretStr));
-    return {
-      isAuthentic: matches,
-      canAutoActivate: matches,
-      reason: matches ? "Verified Slick-Pay signature" : "Slick-Pay signature mismatch."
-    };
-  } catch {
-    return {
-      isAuthentic: false,
-      canAutoActivate: false,
-      reason: "Error evaluating Slick-Pay signature."
-    };
-  }
+  // SEC-01-FIX-05-A: Direct comparison of a header with a shared secret is NOT sufficient proof of authenticity.
+  // Even if the header matches configuredSecret, both isAuthentic and canAutoActivate MUST remain false.
+  return {
+    isAuthentic: false,
+    canAutoActivate: false,
+    reason:
+      "Unverified Slick-Pay webhook protocol: direct shared-secret header comparison is not accepted as proof of authenticity. Webhook held fail-closed without auto-activation."
+  };
 }
 
 // =========================================================================

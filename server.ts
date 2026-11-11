@@ -15,12 +15,14 @@ import { requireAuth, requireSuperAdmin, requireEmailVerified, AuthRequest } fro
 import { adminAuth, adminDb } from "./src/lib/firebase-admin.ts";
 import { 
   createBoundedRateLimiter,
-  verifyPaddleWebhookSignature,
-  verifySlickPayWebhook,
   globalWebhookIdempotency,
   verifyProductionConfig,
   isSuspiciousRequestPath
 } from "./src/security/sec01SecurityService.ts";
+import {
+  createPaddleWebhookHandler,
+  createSlickPayWebhookHandler
+} from "./src/security/webhookAuth.ts";
 import { 
   getUserProjects, 
   createOrUpdateProject, 
@@ -200,180 +202,28 @@ app.post("/api/admin/set-user-role", requireAuth, requireSuperAdmin, requireEmai
 });
 
 // ==========================================
-// Slick-Pay & Paddle Webhook IPN Endpoints
+// Slick-Pay & Paddle Webhook IPN Endpoints (SEC-01-FIX-05-A Modular Auth Gateways)
 // ==========================================
 
-// Slick-Pay Webhook (Algeria - BaridiMob / Edahabia) — Section B3, B4, B5
-app.post("/api/webhooks/slickpay", async (req: RequestWithRawBody, res) => {
-  try {
-    const payload = req.body;
-    const invoiceId = payload?.invoice_id || payload?.id || payload?.order_id || payload?.data?.id;
+// Slick-Pay Webhook (Algeria - BaridiMob / Edahabia) — Strict Fail-Closed
+app.post(
+  "/api/webhooks/slickpay",
+  createSlickPayWebhookHandler({
+    adminDb,
+    adminAuth,
+    idempotency: globalWebhookIdempotency
+  })
+);
 
-    if (!invoiceId) {
-      return res.status(400).json({ received: false, error: "Missing invoice_id in payload" });
-    }
-
-    const eventKey = `slickpay_${invoiceId}`;
-
-    // Anti-Replay: Idempotency guard (Section B4)
-    if (globalWebhookIdempotency.isProcessed(eventKey)) {
-      return res.status(200).json({ received: true, status: "already_processed" });
-    }
-    if (!globalWebhookIdempotency.markInProgress(eventKey)) {
-      return res.status(409).json({ error: "Webhook event currently in progress" });
-    }
-
-    try {
-      // Vérification explicite Slick-Pay (Section B3)
-      const verification = verifySlickPayWebhook(
-        payload,
-        req.headers,
-        process.env.SLICKPAY_WEBHOOK_SECRET
-      );
-
-      const paymentStatus = payload?.status || payload?.event || payload?.data?.status;
-      const amount = payload?.amount || payload?.data?.amount;
-      const customerEmail = payload?.user?.email || payload?.customer_email || payload?.data?.user?.email;
-      const isPaid = paymentStatus === "completed" || paymentStatus === "paid" || paymentStatus === "success" || paymentStatus === "COMPLETED";
-
-      // Minimal logging without sensitive payload dump (Section B5)
-      console.log(`[Webhook Slick-Pay] Invoice ${invoiceId} processed (Status: ${paymentStatus}, Verified: ${verification.isAuthentic})`);
-
-      // Update or insert transaction record in Firestore
-      const txRef = adminDb.collection("pdi_payment_transactions").doc(String(invoiceId));
-      await txRef.set({
-        id: `TX_SLICKPAY_${invoiceId}`,
-        provider: "slickpay_baridimob",
-        status: isPaid ? (verification.canAutoActivate ? "completed" : "pending_verification") : "pending",
-        amount: Number(amount) || 49000,
-        currency: "DZD",
-        userEmail: customerEmail ? String(customerEmail).toLowerCase() : "client@pdi-pipeline.dz",
-        updatedAt: new Date().toISOString(),
-        verificationStatus: verification.isAuthentic ? "authentic" : "unverified"
-      }, { merge: true });
-
-      // RÈGLE STRICTE (Section B1 & B3) : JAMAIS d'auto-activation sans authentification vérifiée
-      if (isPaid && customerEmail && verification.canAutoActivate) {
-        try {
-          const userRecord = await adminAuth.getUserByEmail(customerEmail);
-          if (userRecord?.uid) {
-            await adminAuth.setCustomUserClaims(userRecord.uid, {
-              role: "client",
-              plan: "pro",
-              activeUntil: new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString()
-            });
-            await adminDb.collection("pdi_user_profiles").doc(userRecord.uid).set({
-              plan: "pro",
-              status: "active",
-              activatedAt: new Date().toISOString(),
-              expiresAt: new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString(),
-              subscriptionProvider: "slickpay"
-            }, { merge: true });
-            console.log(`[Webhook Slick-Pay] Pro subscription activated for UID: ${userRecord.uid}`);
-          }
-        } catch {
-          console.warn(`[Webhook Slick-Pay] User not registered yet in Auth, saved pending.`);
-        }
-      }
-
-      globalWebhookIdempotency.markCompleted(eventKey);
-      return res.status(200).json({ 
-        received: true, 
-        status: isPaid ? (verification.canAutoActivate ? "completed" : "pending_verification") : "pending" 
-      });
-    } catch (innerErr) {
-      globalWebhookIdempotency.releaseInProgress(eventKey);
-      throw innerErr;
-    }
-  } catch (err: any) {
-    console.error("[Webhook Slick-Pay Error]:", err?.message || err);
-    return res.status(500).json({ error: err?.message || "Webhook processing failed" });
-  }
-});
-
-// Paddle Webhook (International EUR/USD) — Section B2, B4, B5
-app.post("/api/webhooks/paddle", async (req: RequestWithRawBody, res) => {
-  try {
-    const rawBody = req.rawBody || JSON.stringify(req.body);
-    const signatureHeader = (req.headers["paddle-signature"] || req.headers["Paddle-Signature"]) as string | undefined;
-    const paddleSecret = process.env.PADDLE_WEBHOOK_SECRET_KEY || process.env.PADDLE_WEBHOOK_SECRET;
-
-    // RÈGLE STRICTE (Section B2) : Vérification officielle de signature Paddle uniquement
-    const sigVerification = verifyPaddleWebhookSignature(rawBody, signatureHeader, paddleSecret);
-
-    if (!sigVerification.isValid) {
-      console.warn(`[Webhook Paddle Rejected] Unauthorized webhook attempt: ${sigVerification.error}`);
-      return res.status(401).json({ error: sigVerification.error || "Invalid Paddle signature" });
-    }
-
-    const payload = req.body;
-    const eventType = payload?.alert_name || payload?.event_type || payload?.type;
-    const checkoutId = payload?.checkout_id || payload?.data?.id || payload?.order_id || payload?.event_id;
-
-    if (!checkoutId) {
-      return res.status(400).json({ error: "Missing event/checkout ID in Paddle webhook" });
-    }
-
-    const eventKey = `paddle_${checkoutId}`;
-
-    // Anti-Replay Idempotency Guard (Section B4)
-    if (globalWebhookIdempotency.isProcessed(eventKey)) {
-      return res.status(200).json({ received: true, status: "already_processed" });
-    }
-    if (!globalWebhookIdempotency.markInProgress(eventKey)) {
-      return res.status(409).json({ error: "Webhook event currently in progress" });
-    }
-
-    try {
-      console.log(`[Webhook Paddle Verified] Processing event: ${eventType} (ID: ${checkoutId})`);
-
-      const customerEmail = payload?.email || payload?.data?.customer?.email || payload?.data?.user?.email;
-      const isSuccess = eventType === "payment_succeeded" || eventType === "transaction.completed" || eventType === "subscription_created";
-
-      const txRef = adminDb.collection("pdi_payment_transactions").doc(String(checkoutId));
-      await txRef.set({
-        id: `TX_PADDLE_${checkoutId}`,
-        provider: "paddle_international",
-        status: isSuccess ? "completed" : "pending",
-        userEmail: customerEmail ? String(customerEmail).toLowerCase() : "international@client.com",
-        updatedAt: new Date().toISOString(),
-        eventType
-      }, { merge: true });
-
-      if (isSuccess && customerEmail) {
-        try {
-          const userRecord = await adminAuth.getUserByEmail(customerEmail);
-          if (userRecord?.uid) {
-            await adminAuth.setCustomUserClaims(userRecord.uid, {
-              role: "client",
-              plan: "pro",
-              activeUntil: new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString()
-            });
-            await adminDb.collection("pdi_user_profiles").doc(userRecord.uid).set({
-              plan: "pro",
-              status: "active",
-              activatedAt: new Date().toISOString(),
-              expiresAt: new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString(),
-              subscriptionProvider: "paddle"
-            }, { merge: true });
-            console.log(`[Webhook Paddle] Pro subscription activated for UID: ${userRecord.uid}`);
-          }
-        } catch {
-          console.warn("[Webhook Paddle] User not found in Auth, saved pending.");
-        }
-      }
-
-      globalWebhookIdempotency.markCompleted(eventKey);
-      return res.status(200).json({ received: true });
-    } catch (innerErr) {
-      globalWebhookIdempotency.releaseInProgress(eventKey);
-      throw innerErr;
-    }
-  } catch (err: any) {
-    console.error("[Webhook Paddle Error]:", err?.message || err);
-    return res.status(500).json({ error: err?.message || "Paddle webhook processing failed" });
-  }
-});
+// Paddle Webhook (International EUR/USD) — Strict RawBody Signature Verification
+app.post(
+  "/api/webhooks/paddle",
+  createPaddleWebhookHandler({
+    adminDb,
+    adminAuth,
+    idempotency: globalWebhookIdempotency
+  })
+);
 
 app.get("/api/projects", requireAuth, async (req: AuthRequest, res) => {
   try {

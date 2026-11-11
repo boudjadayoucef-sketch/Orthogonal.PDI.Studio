@@ -329,7 +329,7 @@ describe("SEC-01-FIX-01 : Sécurité Atomique Frontend / Serveur / Auth / Webhoo
       expect(res.error).toContain("not configured");
     });
 
-    it("B4: Slick-Pay - RÈGLE STRICTE B3 : Sans configuration officielle, JAMAIS d'auto-activation", () => {
+    it("B4: Slick-Pay - RÈGLE STRICTE B3 & FIX-05-A : Sans configuration officielle, JAMAIS d'auto-activation", () => {
       const res = verifySlickPayWebhook(
         { invoice_id: "12345", status: "completed" },
         {},
@@ -339,6 +339,19 @@ describe("SEC-01-FIX-01 : Sécurité Atomique Frontend / Serveur / Auth / Webhoo
       expect(res.isAuthentic).toBe(false);
       expect(res.canAutoActivate).toBe(false);
       expect(res.reason).toContain("No official Slick-Pay webhook secret configured");
+    });
+
+    it("B4-bis (SEC-01-FIX-05-A): Slick-Pay - Comparaison directe header === secret non reconnue comme preuve officielle (isAuthentic: false, canAutoActivate: false)", () => {
+      const sharedSecret = "slickpay_shared_secret_token_2026";
+      const resMatchingHeader = verifySlickPayWebhook(
+        { invoice_id: "12345", status: "completed" },
+        { "x-slickpay-signature": sharedSecret },
+        sharedSecret
+      );
+
+      expect(resMatchingHeader.isAuthentic).toBe(false);
+      expect(resMatchingHeader.canAutoActivate).toBe(false);
+      expect(resMatchingHeader.reason).toContain("Unverified Slick-Pay webhook protocol");
     });
 
     it("B5: Anti-Rejeu : un même identifiant d'événement provider ne peut être traité qu'une seule fois", () => {
