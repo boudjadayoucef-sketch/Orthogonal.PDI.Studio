@@ -427,101 +427,76 @@ export function buildFirestoreProfileUpdatePayload(
 }
 
 function buildSafeLocalCacheProfile(
-  profile: PdiUserProfile,
+  validatedPresentationOrCreate: Record<string, string>,
   authenticatedUid: string,
   authenticatedEmail: string,
   authoritativeBase?: Partial<PdiUserProfile> | null
 ): PdiUserProfile {
-  const safeProfile: PdiUserProfile = {
+  if (authoritativeBase) {
+    const safeProfile: PdiUserProfile = {
+      uid: authenticatedUid,
+      email: authenticatedEmail,
+      name: validatedPresentationOrCreate.name ?? authoritativeBase.name ?? "",
+      company: validatedPresentationOrCreate.company ?? authoritativeBase.company ?? "",
+      country: validatedPresentationOrCreate.country ?? authoritativeBase.country ?? "",
+      countryCode: validatedPresentationOrCreate.countryCode ?? authoritativeBase.countryCode ?? "DZ",
+      city: validatedPresentationOrCreate.city ?? authoritativeBase.city ?? "",
+      role: "client",
+      accountType: authoritativeBase.accountType ?? "basic",
+      subscriptionPlan: authoritativeBase.subscriptionPlan ?? "monthly",
+      status: authoritativeBase.status ?? "pending_activation",
+      createdAt: authoritativeBase.createdAt || new Date().toISOString()
+    };
+
+    if (authoritativeBase.paymentGateway !== undefined) {
+      safeProfile.paymentGateway = authoritativeBase.paymentGateway;
+    }
+    if (authoritativeBase.currency !== undefined) {
+      safeProfile.currency = authoritativeBase.currency;
+    }
+    if (authoritativeBase.lastLoginAt !== undefined) {
+      safeProfile.lastLoginAt = authoritativeBase.lastLoginAt;
+    }
+    if (authoritativeBase.loginCount !== undefined) {
+      safeProfile.loginCount = authoritativeBase.loginCount;
+    }
+    if (authoritativeBase.projectsCount !== undefined) {
+      safeProfile.projectsCount = authoritativeBase.projectsCount;
+    }
+    if (authoritativeBase.storageUsedKb !== undefined) {
+      safeProfile.storageUsedKb = authoritativeBase.storageUsedKb;
+    }
+
+    return safeProfile;
+  }
+
+  const createdProfile: PdiUserProfile = {
     uid: authenticatedUid,
     email: authenticatedEmail,
-    name: profile.name,
-    company: profile.company ?? authoritativeBase?.company ?? "",
-    country: profile.country ?? authoritativeBase?.country ?? "",
-    countryCode: profile.countryCode ?? authoritativeBase?.countryCode ?? "DZ",
-    city: profile.city ?? authoritativeBase?.city ?? "",
-    paymentGateway: authoritativeBase?.paymentGateway ?? profile.paymentGateway,
-    currency: authoritativeBase?.currency ?? profile.currency,
+    name: validatedPresentationOrCreate.name ?? "",
+    company: validatedPresentationOrCreate.company ?? "",
+    country: validatedPresentationOrCreate.country ?? "",
+    countryCode: validatedPresentationOrCreate.countryCode ?? "DZ",
+    city: validatedPresentationOrCreate.city ?? "",
     role: "client",
-    accountType: authoritativeBase?.accountType ?? "basic",
-    subscriptionPlan: authoritativeBase?.subscriptionPlan ?? "monthly",
-    status: authoritativeBase?.status ?? "pending_activation",
-    createdAt: authoritativeBase?.createdAt || profile.createdAt || new Date().toISOString()
+    accountType: "basic",
+    subscriptionPlan: "monthly",
+    status: "pending_activation",
+    createdAt: validatedPresentationOrCreate.createdAt || new Date().toISOString()
   };
 
-  if (authoritativeBase?.lastLoginAt !== undefined) {
-    safeProfile.lastLoginAt = authoritativeBase.lastLoginAt;
+  if (validatedPresentationOrCreate.paymentGateway !== undefined) {
+    createdProfile.paymentGateway = validatedPresentationOrCreate.paymentGateway;
   }
-  if (authoritativeBase?.loginCount !== undefined) {
-    safeProfile.loginCount = authoritativeBase.loginCount;
-  }
-  if (authoritativeBase?.projectsCount !== undefined) {
-    safeProfile.projectsCount = authoritativeBase.projectsCount;
-  }
-  if (authoritativeBase?.storageUsedKb !== undefined) {
-    safeProfile.storageUsedKb = authoritativeBase.storageUsedKb;
+  if (validatedPresentationOrCreate.currency !== undefined) {
+    createdProfile.currency = validatedPresentationOrCreate.currency;
   }
 
-  return safeProfile;
-}
-
-function assertNoClientServerFieldMutation(
-  profile: PdiUserProfile,
-  authoritativeData: Record<string, unknown>
-): void {
-  const raw = profile as unknown as Record<string, unknown>;
-
-  for (const key of FORBIDDEN_CLIENT_PROFILE_KEYS) {
-    if (key in raw && raw[key] !== undefined) {
-      throw new Error(`Sauvegarde Firestore refusée : le champ d'autorisation '${key}' est interdit côté client.`);
-    }
-  }
-
-  if (raw.role !== undefined && raw.role !== "client" && raw.role !== authoritativeData.role) {
-    throw new Error("Sauvegarde Firestore refusée : le champ serveur 'role' ne peut pas être modifié par le client.");
-  }
-
-  if (
-    raw.status !== undefined &&
-    authoritativeData.status !== undefined &&
-    raw.status !== authoritativeData.status
-  ) {
-    throw new Error("Sauvegarde Firestore refusée : le champ serveur 'status' ne peut pas être modifié par le client.");
-  }
-
-  if (
-    raw.accountType !== undefined &&
-    authoritativeData.accountType !== undefined &&
-    raw.accountType !== authoritativeData.accountType
-  ) {
-    throw new Error("Sauvegarde Firestore refusée : le champ serveur 'accountType' ne peut pas être modifié par le client.");
-  }
-
-  if (
-    raw.subscriptionPlan !== undefined &&
-    authoritativeData.subscriptionPlan !== undefined &&
-    raw.subscriptionPlan !== authoritativeData.subscriptionPlan
-  ) {
-    throw new Error("Sauvegarde Firestore refusée : le champ serveur 'subscriptionPlan' ne peut pas être modifié par le client.");
-  }
-
-  if (
-    raw.createdAt !== undefined &&
-    authoritativeData.createdAt !== undefined &&
-    raw.createdAt !== authoritativeData.createdAt
-  ) {
-    throw new Error("Sauvegarde Firestore refusée : le champ 'createdAt' est immuable.");
-  }
-
-  for (const key of SERVER_COUNTER_AND_AUDIT_KEYS) {
-    if (raw[key] !== undefined && raw[key] !== authoritativeData[key]) {
-      throw new Error(`Sauvegarde Firestore refusée : le champ serveur '${key}' ne peut pas être modifié par le client.`);
-    }
-  }
+  return createdProfile;
 }
 
 export async function saveFirebaseProfile(profile: PdiUserProfile): Promise<void> {
-  // 1. Validation de l'authentification et de l'identité (aucune lecture ni écriture localStorage)
+  // 1. Authentification et validation de l'identité et des champs de présentation (aucune lecture/écriture localStorage)
   const currentUser = auth.currentUser;
   if (!currentUser || !profile || typeof profile.uid !== "string" || currentUser.uid !== profile.uid) {
     throw new Error("Sauvegarde Firestore refusée : l'UID du profil ne correspond pas à l'utilisateur authentifié.");
@@ -533,23 +508,11 @@ export async function saveFirebaseProfile(profile: PdiUserProfile): Promise<void
   }
 
   validateProfilePresentationFields(profile, true);
-  const raw = profile as unknown as Record<string, unknown>;
-  for (const key of FORBIDDEN_CLIENT_PROFILE_KEYS) {
-    if (key in raw && raw[key] !== undefined) {
-      throw new Error(`Sauvegarde Firestore refusée : le champ d'autorisation '${key}' est interdit côté client.`);
-    }
-  }
-  if (raw.role !== undefined && raw.role !== "client") {
-    throw new Error("Sauvegarde Firestore refusée : aucun rôle privilégié ne peut être attribué par le client.");
-  }
 
-  // 2. Lecture du document Firestore existant — Firestore est l'unique source d'autorité (SEC-01-FIX-04-R2 B1)
+  // 2. Lecture Firestore — le document Firestore est l'unique source d'autorité (SEC-01-FIX-04-R3 B1)
   const profileRef = doc(db, "profiles", currentUser.uid);
   const existingSnap = await getDoc(profileRef);
 
-  // 3. Validation du payload par rapport au document Firestore autoritatif
-  // 4. Exécution de l'opération Firestore autorisée (updateDoc ou setDoc)
-  // 5. Synchronisation atomique du cache local UNIQUEMENT après le succès de l'écriture Firestore (SEC-01-FIX-04-R2 B2)
   if (existingSnap.exists()) {
     const existingData = existingSnap.data();
     if (existingData.uid && existingData.uid !== profile.uid) {
@@ -559,26 +522,29 @@ export async function saveFirebaseProfile(profile: PdiUserProfile): Promise<void
       throw new Error("Sauvegarde Firestore refusée : l'email d'un profil ne peut pas être modifié après création.");
     }
 
-    assertNoClientServerFieldMutation(profile, existingData);
-
+    // 3. Construction du payload de présentation par projection explicite et contrôlée (B1-A & B1-B)
     const updatePayload = buildFirestoreProfileUpdatePayload(profile);
+
+    // 4. Écriture Firestore (exclusivement les champs de présentation autorisés)
     if (Object.keys(updatePayload).length > 0) {
       await updateDoc(profileRef, updatePayload);
     }
 
+    // 5. Après succès seulement, synchronisation du cache local à partir des données autoritaires Firestore (B1-C)
     const synchronizedLocalProfile = buildSafeLocalCacheProfile(
-      profile,
+      updatePayload,
       currentUser.uid,
       tokenEmail,
       existingData as Partial<PdiUserProfile>
     );
     saveProfileToLocalCache(synchronizedLocalProfile);
   } else {
+    // Création initiale : préservation intégrale des protections R2 (B1-D)
     const createPayload = buildFirestoreProfileCreatePayload(profile, currentUser.uid, tokenEmail);
     await setDoc(profileRef, createPayload);
 
     const createdLocalProfile = buildSafeLocalCacheProfile(
-      profile,
+      createPayload,
       currentUser.uid,
       tokenEmail,
       null

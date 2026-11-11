@@ -440,20 +440,23 @@ describe("SEC-01-FIX-04-R1 : Persistance des profils Firestore, cohérence d'ins
     };
     saveProfileToLocalCache(existingFirestoreDoc);
 
-    firestoreMocks.getDoc.mockResolvedValue({
+    firestoreMocks.getDoc.mockResolvedValueOnce({
       exists: () => true,
       data: () => ({ ...existingFirestoreDoc })
     });
+    firestoreMocks.updateDoc.mockResolvedValueOnce(undefined);
 
-    await expect(
-      saveFirebaseProfile({
-        ...existingFirestoreDoc,
-        status: "active"
-      })
-    ).rejects.toThrow(/status/);
+    await saveFirebaseProfile({
+      ...existingFirestoreDoc,
+      name: "Youcef Ingénieur Modifié",
+      status: "active"
+    });
 
-    expect(firestoreMocks.updateDoc).not.toHaveBeenCalled();
+    expect(firestoreMocks.updateDoc).toHaveBeenCalledTimes(1);
+    const [, sentPayload] = firestoreMocks.updateDoc.mock.calls[0];
+    expect("status" in sentPayload).toBe(false);
     expect(getProfileFromLocalCache("user_123")?.status).toBe("pending_activation");
+    expect(getProfileFromLocalCache("user_123")?.name).toBe("Youcef Ingénieur Modifié");
   });
 
   // =========================================================================
@@ -585,7 +588,7 @@ describe("SEC-01-FIX-04-R1 : Persistance des profils Firestore, cohérence d'ins
   // =========================================================================
   // 9. Interdiction de modifier les champs d'identité ou d'autorisation
   // =========================================================================
-  it("09. Un utilisateur ne peut pas modifier les champs d'identité (uid, email) ni d'autorisation ou compteurs serveur", async () => {
+  it("09. Un utilisateur ne peut pas modifier les champs d'identité (uid, email) et toute tentative de création avec privilèges ou compteurs serveur est rejetée", async () => {
     const existingDoc: PdiUserProfile = {
       uid: "user_123",
       email: "ingenieur@orthogonal.dz",
@@ -619,37 +622,57 @@ describe("SEC-01-FIX-04-R1 : Persistance des profils Firestore, cohérence d'ins
       saveFirebaseProfile({ ...existingDoc, email: "autre@orthogonal.dz" })
     ).rejects.toThrow(/email/);
 
-    // Tentative d'élévation de rôle
+    expect(firestoreMocks.updateDoc).not.toHaveBeenCalled();
+
+    // Sur le chemin de création (document inexistant), toute injection de rôle, plan, statut ou compteur serveur est rejetée
+    firestoreMocks.getDoc.mockResolvedValue({
+      exists: () => false
+    });
+
+    const baseCreateDoc: PdiUserProfile = {
+      uid: "user_123",
+      email: "ingenieur@orthogonal.dz",
+      name: "Youcef Ingénieur",
+      company: "Orthogonal Studio",
+      country: "Algérie",
+      countryCode: "DZ",
+      city: "Alger",
+      role: "client",
+      accountType: "basic",
+      subscriptionPlan: "monthly",
+      status: "pending_activation",
+      createdAt: "2026-04-12T10:00:00.000Z"
+    };
+
     await expect(
-      saveFirebaseProfile({ ...existingDoc, role: "super_admin" })
+      saveFirebaseProfile({ ...baseCreateDoc, role: "super_admin" })
     ).rejects.toThrow(/rôle privilégié/);
 
-    // Tentative de modification de accountType
     await expect(
-      saveFirebaseProfile({ ...existingDoc, accountType: "enterprise" })
-    ).rejects.toThrow(/accountType/);
+      saveFirebaseProfile({ ...baseCreateDoc, accountType: "enterprise" })
+    ).rejects.toThrow(/basic/);
 
-    // Tentative de modification de subscriptionPlan
     await expect(
-      saveFirebaseProfile({ ...existingDoc, subscriptionPlan: "lifetime" })
-    ).rejects.toThrow(/subscriptionPlan/);
+      saveFirebaseProfile({ ...baseCreateDoc, subscriptionPlan: "lifetime" })
+    ).rejects.toThrow(/monthly/);
 
-    // Tentative de modification de loginCount
     await expect(
-      saveFirebaseProfile({ ...existingDoc, loginCount: 99 })
+      saveFirebaseProfile({ ...baseCreateDoc, status: "active" })
+    ).rejects.toThrow(/pending_activation/);
+
+    await expect(
+      saveFirebaseProfile({ ...baseCreateDoc, loginCount: 99 })
     ).rejects.toThrow(/loginCount/);
 
-    // Tentative de modification de projectsCount
     await expect(
-      saveFirebaseProfile({ ...existingDoc, projectsCount: 0 })
+      saveFirebaseProfile({ ...baseCreateDoc, projectsCount: 0 })
     ).rejects.toThrow(/projectsCount/);
 
-    // Tentative de modification de storageUsedKb
     await expect(
-      saveFirebaseProfile({ ...existingDoc, storageUsedKb: 0 })
+      saveFirebaseProfile({ ...baseCreateDoc, storageUsedKb: 0 })
     ).rejects.toThrow(/storageUsedKb/);
 
-    expect(firestoreMocks.updateDoc).not.toHaveBeenCalled();
+    expect(firestoreMocks.setDoc).not.toHaveBeenCalled();
   });
 
   // =========================================================================
@@ -731,15 +754,15 @@ describe("SEC-01-FIX-04-R1 : Persistance des profils Firestore, cohérence d'ins
   });
 
   // =========================================================================
-  // 11. SEC-01-FIX-04-R2 — B1 : Firestore est l'unique source d'autorité
+  // 11. SEC-01-FIX-04-R3 — Test B1-1 : Profil client obsolète construit depuis le cache local
   // =========================================================================
-  it("11. (B1) Un cache local obsolète contenant des champs serveur différents ne bloque jamais une mise à jour légitime validée par Firestore", async () => {
-    // Le cache local est resté obsolète (pending_activation / basic / monthly / loginCount: 1)
+  it("11. (Test B1-1) Un profil client construit à partir des anciennes métadonnées du cache local met à jour la présentation sans erreur et synchronise le cache avec les valeurs serveur de Firestore", async () => {
+    // Cache local obsolète : pending_activation / basic / monthly / loginCount: 1
     const staleLocalCache: PdiUserProfile = {
       uid: "user_123",
       email: "ingenieur@orthogonal.dz",
       name: "Ancien Nom Cache",
-      company: "Ancienne Société",
+      company: "Ancienne Société Cache",
       country: "Algérie",
       countryCode: "DZ",
       city: "Alger",
@@ -754,20 +777,23 @@ describe("SEC-01-FIX-04-R1 : Persistance des profils Firestore, cohérence d'ins
     };
     saveProfileToLocalCache(staleLocalCache);
 
-    // Le document Firestore autoritatif a été activé côté serveur (active / pro / yearly / loginCount: 8)
-    const authoritativeFirestoreDoc: PdiUserProfile = {
+    // Document Firestore autoritatif : active / pro / annual / loginCount: 8
+    const authoritativeFirestoreDoc = {
       uid: "user_123",
       email: "ingenieur@orthogonal.dz",
-      name: "Youcef Ingénieur",
-      company: "Orthogonal Studio",
+      name: "Ancien Nom Cache",
+      company: "Ancienne Société Cache",
       country: "Algérie",
       countryCode: "DZ",
       city: "Alger",
+      paymentGateway: "slickpay_cib",
+      currency: "DZD",
       role: "client",
       accountType: "pro",
-      subscriptionPlan: "yearly",
+      subscriptionPlan: "annual" as unknown as PdiUserProfile["subscriptionPlan"],
       status: "active",
       createdAt: "2026-04-12T10:00:00.000Z",
+      lastLoginAt: "2026-05-01T08:30:00.000Z",
       loginCount: 8,
       projectsCount: 4,
       storageUsedKb: 1024
@@ -779,28 +805,52 @@ describe("SEC-01-FIX-04-R1 : Persistance des profils Firestore, cohérence d'ins
     });
     firestoreMocks.updateDoc.mockResolvedValueOnce(undefined);
 
-    // L'utilisateur soumet son profil courant (conforme à Firestore, mais différent du cache local obsolète)
-    await expect(
-      saveFirebaseProfile({
-        ...authoritativeFirestoreDoc,
-        name: "Youcef Boudjada Mis À Jour",
-        city: "Oran"
-      })
-    ).resolves.toBeUndefined();
+    // L'objet transmis à saveFirebaseProfile() est réellement construit à partir du cache obsolète (staleLocalCache)
+    const staleClientProfileInput: PdiUserProfile = {
+      ...staleLocalCache,
+      name: "Youcef Boudjada Mis À Jour",
+      company: "Orthogonal PD&I Engineering"
+    };
 
+    await expect(saveFirebaseProfile(staleClientProfileInput)).resolves.toBeUndefined();
+
+    // updateDoc() reçoit exclusivement les champs de présentation autorisés
     expect(firestoreMocks.updateDoc).toHaveBeenCalledTimes(1);
+    const [, sentUpdatePayload] = firestoreMocks.updateDoc.mock.calls[0];
+    expect(sentUpdatePayload).toEqual({
+      name: "Youcef Boudjada Mis À Jour",
+      company: "Orthogonal PD&I Engineering",
+      country: "Algérie",
+      countryCode: "DZ",
+      city: "Alger"
+    });
+    expect("status" in sentUpdatePayload).toBe(false);
+    expect("accountType" in sentUpdatePayload).toBe(false);
+    expect("subscriptionPlan" in sentUpdatePayload).toBe(false);
+    expect("loginCount" in sentUpdatePayload).toBe(false);
+    expect("role" in sentUpdatePayload).toBe(false);
+
+    // Le cache local après succès conserve les valeurs serveur actuelles de Firestore (jamais écrasées par staleLocalCache)
     const cachedAfter = getProfileFromLocalCache("user_123");
+    expect(cachedAfter).not.toBeNull();
     expect(cachedAfter?.name).toBe("Youcef Boudjada Mis À Jour");
-    expect(cachedAfter?.city).toBe("Oran");
+    expect(cachedAfter?.company).toBe("Orthogonal PD&I Engineering");
     expect(cachedAfter?.status).toBe("active");
     expect(cachedAfter?.accountType).toBe("pro");
-    expect(cachedAfter?.subscriptionPlan).toBe("yearly");
+    expect(cachedAfter?.subscriptionPlan).toBe("annual");
     expect(cachedAfter?.loginCount).toBe(8);
+    expect(cachedAfter?.projectsCount).toBe(4);
+    expect(cachedAfter?.storageUsedKb).toBe(1024);
+    expect(cachedAfter?.lastLoginAt).toBe("2026-05-01T08:30:00.000Z");
+    expect(cachedAfter?.paymentGateway).toBe("slickpay_cib");
+    expect(cachedAfter?.currency).toBe("DZD");
   });
 
-  it("12. (B1) Un cache local manipulé ne peut jamais autoriser la modification d'un champ protégé par rapport à Firestore", async () => {
-    // Un attaquant falsifie localStorage avec status='active', accountType='enterprise', loginCount=999
-    const forgedLocalCache: PdiUserProfile = {
+  // =========================================================================
+  // 12. SEC-01-FIX-04-R3 — Test B1-2 : Tentative de falsification des champs serveur
+  // =========================================================================
+  it("12. (Test B1-2) La transmission d'un profil contenant des champs serveur falsifiés n'inclut aucun champ serveur dans updateDoc() et ne remplace aucune valeur autoritaire dans le cache", async () => {
+    const authoritativeFirestoreDoc: PdiUserProfile = {
       uid: "user_123",
       email: "ingenieur@orthogonal.dz",
       name: "Youcef Ingénieur",
@@ -808,54 +858,114 @@ describe("SEC-01-FIX-04-R1 : Persistance des profils Firestore, cohérence d'ins
       country: "Algérie",
       countryCode: "DZ",
       city: "Alger",
-      role: "client",
-      accountType: "enterprise",
-      subscriptionPlan: "lifetime",
-      status: "active",
-      createdAt: "2026-04-12T10:00:00.000Z",
-      loginCount: 999
-    };
-    saveProfileToLocalCache(forgedLocalCache);
-    const snapshotBefore = getProfileFromLocalCache("user_123");
-
-    // Le document réel dans Firestore est pending_activation / basic / monthly / loginCount=1
-    const realFirestoreDoc: PdiUserProfile = {
-      uid: "user_123",
-      email: "ingenieur@orthogonal.dz",
-      name: "Youcef Ingénieur",
-      company: "Orthogonal Studio",
-      country: "Algérie",
-      countryCode: "DZ",
-      city: "Alger",
+      paymentGateway: "slickpay_baridimob",
+      currency: "DZD",
       role: "client",
       accountType: "basic",
       subscriptionPlan: "monthly",
       status: "pending_activation",
       createdAt: "2026-04-12T10:00:00.000Z",
-      loginCount: 1
+      lastLoginAt: "2026-04-12T11:00:00.000Z",
+      loginCount: 2,
+      projectsCount: 1,
+      storageUsedKb: 128
     };
+    saveProfileToLocalCache(authoritativeFirestoreDoc);
 
-    firestoreMocks.getDoc.mockResolvedValue({
+    firestoreMocks.getDoc.mockResolvedValueOnce({
       exists: () => true,
-      data: () => ({ ...realFirestoreDoc })
+      data: () => ({ ...authoritativeFirestoreDoc })
     });
+    firestoreMocks.updateDoc.mockResolvedValueOnce(undefined);
 
-    // Même si l'objet passé correspond au cache falsifié, la comparaison avec Firestore rejette la mutation
-    await expect(
-      saveFirebaseProfile({
-        ...forgedLocalCache,
-        name: "Tentative Bypass Par Cache"
-      })
-    ).rejects.toThrow(/status/);
+    // Objet client contenant des valeurs falsifiées pour les champs serveur et indicateurs admin
+    const tamperedClientProfile = {
+      uid: "user_123",
+      email: "ingenieur@orthogonal.dz",
+      name: "Youcef Présentation Légitime",
+      company: "Orthogonal Process",
+      country: "Algérie",
+      countryCode: "DZ",
+      city: "Oran",
+      role: "super_admin" as const,
+      status: "active" as const,
+      accountType: "enterprise" as const,
+      subscriptionPlan: "lifetime" as const,
+      paymentGateway: "forged_gateway",
+      currency: "EUR",
+      createdAt: "1999-01-01T00:00:00.000Z",
+      lastLoginAt: "2099-01-01T00:00:00.000Z",
+      loginCount: 9999,
+      projectsCount: 500,
+      storageUsedKb: 999999,
+      isAdmin: true,
+      isSuperAdmin: true,
+      permissions: ["*"],
+      isActivated: true,
+      admin: true
+    } as unknown as PdiUserProfile;
 
-    expect(firestoreMocks.updateDoc).not.toHaveBeenCalled();
-    expect(getProfileFromLocalCache("user_123")).toEqual(snapshotBefore);
+    await expect(saveFirebaseProfile(tamperedClientProfile)).resolves.toBeUndefined();
+
+    // 1. Aucun champ serveur ou admin ne figure dans le payload updateDoc()
+    expect(firestoreMocks.updateDoc).toHaveBeenCalledTimes(1);
+    const [, sentUpdatePayload] = firestoreMocks.updateDoc.mock.calls[0];
+    expect(sentUpdatePayload).toEqual({
+      name: "Youcef Présentation Légitime",
+      company: "Orthogonal Process",
+      country: "Algérie",
+      countryCode: "DZ",
+      city: "Oran"
+    });
+    for (const forbiddenKey of [
+      "role",
+      "status",
+      "accountType",
+      "subscriptionPlan",
+      "paymentGateway",
+      "currency",
+      "createdAt",
+      "lastLoginAt",
+      "loginCount",
+      "projectsCount",
+      "storageUsedKb",
+      "isAdmin",
+      "isSuperAdmin",
+      "permissions",
+      "isActivated",
+      "admin"
+    ]) {
+      expect(forbiddenKey in sentUpdatePayload).toBe(false);
+    }
+
+    // 2. Aucune valeur falsifiée ne remplace les valeurs autoritaires dans le cache local
+    const cachedAfter = getProfileFromLocalCache("user_123") as unknown as Record<string, unknown>;
+    expect(cachedAfter).not.toBeNull();
+    expect(cachedAfter.name).toBe("Youcef Présentation Légitime");
+    expect(cachedAfter.company).toBe("Orthogonal Process");
+    expect(cachedAfter.city).toBe("Oran");
+    expect(cachedAfter.role).toBe("client");
+    expect(cachedAfter.status).toBe("pending_activation");
+    expect(cachedAfter.accountType).toBe("basic");
+    expect(cachedAfter.subscriptionPlan).toBe("monthly");
+    expect(cachedAfter.paymentGateway).toBe("slickpay_baridimob");
+    expect(cachedAfter.currency).toBe("DZD");
+    expect(cachedAfter.createdAt).toBe("2026-04-12T10:00:00.000Z");
+    expect(cachedAfter.lastLoginAt).toBe("2026-04-12T11:00:00.000Z");
+    expect(cachedAfter.loginCount).toBe(2);
+    expect(cachedAfter.projectsCount).toBe(1);
+    expect(cachedAfter.storageUsedKb).toBe(128);
+    expect(cachedAfter.isAdmin).toBeUndefined();
+    expect(cachedAfter.isSuperAdmin).toBeUndefined();
+    expect(cachedAfter.permissions).toBeUndefined();
+    expect(cachedAfter.isActivated).toBeUndefined();
+    expect(cachedAfter.admin).toBeUndefined();
   });
 
   // =========================================================================
-  // 13. SEC-01-FIX-04-R2 — B2 : Synchronisation atomique du cache (Tests B2-1 à B2-6)
+  // 13. SEC-01-FIX-04-R3 — Test B1-3 & B2 : Synchronisation atomique du cache et identité exacte des erreurs
   // =========================================================================
-  it("13. (Test B2-1) Échec de getDoc() -> cache local strictement inchangé et erreur originale propagée", async () => {
+  it("13. (Test B1-3 / B2-1) Échec de getDoc() -> cache local strictement identique et instance d'erreur originale propagée (rejects.toBe)", async () => {
     const previousCache: PdiUserProfile = {
       uid: "user_123",
       email: "ingenieur@orthogonal.dz",
@@ -880,14 +990,14 @@ describe("SEC-01-FIX-04-R1 : Persistance des profils Firestore, cohérence d'ins
         ...previousCache,
         name: "Nouveau Nom Non Persisté"
       })
-    ).rejects.toThrow(getDocError);
+    ).rejects.toBe(getDocError);
 
     expect(firestoreMocks.updateDoc).not.toHaveBeenCalled();
     expect(firestoreMocks.setDoc).not.toHaveBeenCalled();
     expect(getProfileFromLocalCache("user_123")).toEqual(previousCache);
   });
 
-  it("14. (Test B2-2) Échec de updateDoc() -> cache local strictement inchangé et erreur originale propagée", async () => {
+  it("14. (Test B1-3 / B2-2) Échec de updateDoc() -> cache local strictement identique et instance d'erreur originale propagée (rejects.toBe)", async () => {
     const previousCache: PdiUserProfile = {
       uid: "user_123",
       email: "ingenieur@orthogonal.dz",
@@ -917,13 +1027,27 @@ describe("SEC-01-FIX-04-R1 : Persistance des profils Firestore, cohérence d'ins
         name: "Modification Rejetée Par UpdateDoc",
         city: "Constantine"
       })
-    ).rejects.toThrow(updateError);
+    ).rejects.toBe(updateError);
 
     expect(getProfileFromLocalCache("user_123")).toEqual(previousCache);
   });
 
-  it("15. (Test B2-3) Échec de setDoc() -> cache local strictement inchangé et erreur originale propagée", async () => {
-    localStorage.removeItem("pdi_user_profile");
+  it("15. (Test B1-3 / B2-3) Échec de setDoc() -> cache local préexistant strictement identique et instance d'erreur originale propagée (rejects.toBe)", async () => {
+    const preExistingCache: PdiUserProfile = {
+      uid: "user_123",
+      email: "ingenieur@orthogonal.dz",
+      name: "Profil Cache Préexistant Avant SetDoc",
+      company: "Orthogonal Cache Initial",
+      country: "Algérie",
+      countryCode: "DZ",
+      city: "Alger",
+      role: "client",
+      accountType: "basic",
+      subscriptionPlan: "monthly",
+      status: "pending_activation",
+      createdAt: "2026-04-12T09:00:00.000Z"
+    };
+    saveProfileToLocalCache(preExistingCache);
 
     firestoreMocks.getDoc.mockResolvedValueOnce({
       exists: () => false
@@ -935,10 +1059,10 @@ describe("SEC-01-FIX-04-R1 : Persistance des profils Firestore, cohérence d'ins
       uid: "user_123",
       email: "ingenieur@orthogonal.dz",
       name: "Nouveau Profil Création Échouée",
-      company: "Orthogonal",
+      company: "Orthogonal Nouvelle Création",
       country: "Algérie",
       countryCode: "DZ",
-      city: "Alger",
+      city: "Oran",
       role: "client",
       accountType: "basic",
       subscriptionPlan: "monthly",
@@ -946,9 +1070,9 @@ describe("SEC-01-FIX-04-R1 : Persistance des profils Firestore, cohérence d'ins
       createdAt: "2026-04-12T10:00:00.000Z"
     };
 
-    await expect(saveFirebaseProfile(newProfile)).rejects.toThrow(setDocError);
+    await expect(saveFirebaseProfile(newProfile)).rejects.toBe(setDocError);
 
-    expect(getProfileFromLocalCache("user_123")).toBeNull();
+    expect(getProfileFromLocalCache("user_123")).toEqual(preExistingCache);
   });
 
   it("16. (Test B2-4) Succès de updateDoc() -> le cache local est mis à jour UNIQUEMENT après la résolution de updateDoc()", async () => {
