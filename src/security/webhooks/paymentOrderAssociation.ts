@@ -29,6 +29,9 @@ import type {
 export interface PaymentOrderAssociationDeps {
   repository: PendingOrderRepository;
   adminAuth: WebhookAdminAuth;
+  /** Active lease token held by the current worker in `payment_webhook_events` (SEC-01-FIX-06-R2 B1) */
+  leaseToken?: string;
+  nowMs?: () => number;
 }
 
 function extractNonEmptyString(value: unknown): string | undefined {
@@ -342,39 +345,37 @@ export async function validateAndAssociatePaddleOrder(
     };
   }
 
-  if (isAlreadyAssociatedForExactSameEvent) {
-    return {
-      ok: true,
-      statusCode: 200,
-      alreadyAssociatedForSameEvent: true,
-      order,
-      identifiers: {
-        orderId: extracted.orderId,
-        providerTransactionId: extracted.providerTransactionId,
-        eventId: extracted.eventId,
-        eventType: eventPolicyResult.eventType,
-        userUid: authoritativeUserUid
-      }
-    };
-  }
-
-  // STEP 7: Persist the validated association in the authoritative repository
-  const updatedOrder = await deps.repository.recordOrderTransactionAssociation({
+  // STEP 7 (SEC-01-FIX-06-R2 — B1): Atomically verify lease ownership (`status === "processing"`,
+  // matching `leaseToken`, non-expired `leaseExpiresAt`) and order invariants inside a single
+  // Firestore transaction before persisting the association in `payment_transactions`.
+  const fencedResult = await deps.repository.associateOrderWithLeaseFencing({
+    provider: "paddle",
+    eventId: extracted.eventId,
+    leaseToken: deps.leaseToken,
     orderId: extracted.orderId,
     userUid: authoritativeUserUid,
-    provider: "paddle",
     providerTransactionId: extracted.providerTransactionId,
-    eventId: extracted.eventId,
     eventType: eventPolicyResult.eventType,
+    customDataUserUid: extracted.customDataUserUid,
     checkoutId: extracted.checkoutId,
-    webhookCustomerEmail: extracted.untrustedWebhookEmail
+    webhookCustomerEmail: extracted.untrustedWebhookEmail,
+    nowMs: deps.nowMs
   });
+
+  if (fencedResult.ok === false) {
+    return {
+      ok: false,
+      statusCode: fencedResult.statusCode,
+      code: fencedResult.code,
+      error: fencedResult.error
+    };
+  }
 
   return {
     ok: true,
     statusCode: 200,
-    alreadyAssociatedForSameEvent: false,
-    order: updatedOrder,
+    alreadyAssociatedForSameEvent: fencedResult.alreadyAssociatedForSameEvent,
+    order: fencedResult.order,
     identifiers: {
       orderId: extracted.orderId,
       providerTransactionId: extracted.providerTransactionId,

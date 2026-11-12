@@ -196,10 +196,43 @@ export interface RecordOrderAssociationInput {
   providerTransactionId: string;
   eventId: string;
   eventType: string;
+  /** Unique lease token held by the current worker in `payment_webhook_events` (SEC-01-FIX-06-R2 B1) */
+  leaseToken?: string;
+  customDataUserUid?: string;
   checkoutId?: string;
   webhookCustomerEmail?: string;
   associatedAt?: string;
+  nowMs?: () => number;
 }
+
+export interface FencedOrderAssociationInput {
+  provider: "paddle";
+  eventId: string;
+  leaseToken: string | undefined;
+  orderId: string;
+  userUid: string;
+  providerTransactionId: string;
+  eventType: string;
+  customDataUserUid?: string;
+  checkoutId?: string;
+  webhookCustomerEmail?: string;
+  associatedAt?: string;
+  nowMs?: () => number;
+}
+
+export type FencedOrderAssociationResult =
+  | {
+      ok: true;
+      statusCode: 200;
+      alreadyAssociatedForSameEvent: boolean;
+      order: AuthoritativePendingOrder;
+    }
+  | {
+      ok: false;
+      statusCode: 400 | 403 | 404 | 409 | 422;
+      code: OrderAssociationErrorCode;
+      error: string;
+    };
 
 export interface ExtractedPaddleWebhookIdentifiers {
   /** Internal pending order ID passed in checkout custom_data (NEVER fallback to event_id, data.id, checkout_id, or order_id) */
@@ -236,7 +269,8 @@ export type OrderAssociationErrorCode =
   | "ORDER_INVALID_STATUS"
   | "PROVIDER_TRANSACTION_ID_MISMATCH"
   | "TRANSACTION_ALREADY_ASSOCIATED_TO_ANOTHER_ORDER"
-  | "USER_IDENTITY_NOT_FOUND";
+  | "USER_IDENTITY_NOT_FOUND"
+  | "LEASE_CONFLICT";
 
 export type OrderAssociationValidationResult =
   | {
@@ -258,3 +292,4 @@ export type OrderAssociationValidationResult =
       code: OrderAssociationErrorCode;
       error: string;
     };
+

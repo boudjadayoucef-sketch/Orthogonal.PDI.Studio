@@ -22,7 +22,11 @@ import {
   deriveWebhookEventDocumentId,
   type WebhookIdempotencyRepository
 } from "../webhooks/webhookIdempotencyRepository.ts";
-import { createPendingOrderRepository } from "../webhooks/pendingOrderRepository.ts";
+import {
+  createPendingOrderRepository,
+  executeFencedOrderAssociationTransaction
+} from "../webhooks/pendingOrderRepository.ts";
+import { validateAndAssociatePaddleOrder } from "../webhooks/paymentOrderAssociation.ts";
 import { createPaymentWebhookProcessor } from "../webhooks/paymentWebhookProcessor.ts";
 import {
   createPaddleWebhookHandler,
@@ -90,6 +94,7 @@ function createTransactionalFirestoreBackingStore() {
   let failAllTransactions = false;
   let failIdempotencyTransactions = false;
   let failOrderReads = false;
+  let failTransactionalOrderReads = false;
   let failOrderWrites = false;
 
   // Mutex chain ensuring atomic transaction execution across concurrent promises
@@ -131,15 +136,15 @@ function createTransactionalFirestoreBackingStore() {
               };
             }),
             set: vi.fn(async (data: Record<string, unknown>, options?: { merge?: boolean }) => {
+              if (colName === AUTHORITATIVE_PENDING_ORDER_COLLECTION && failOrderWrites) {
+                throw new Error("Simulated Firestore write outage on payment_transactions");
+              }
               docWrites.push({
                 collection: colName,
                 docId,
                 inTransaction: false,
                 data: cloneRecord(data) || {}
               });
-              if (colName === AUTHORITATIVE_PENDING_ORDER_COLLECTION && failOrderWrites) {
-                throw new Error("Simulated Firestore write outage on payment_transactions");
-              }
               const current = documents.get(fullKey) || {};
               const next = options?.merge
                 ? { ...cloneRecord(current), ...cloneRecord(data) }
@@ -192,12 +197,28 @@ function createTransactionalFirestoreBackingStore() {
           try {
             const tx: WebhookFirestoreTransaction = {
               async get(docRef: WebhookFirestoreDocRef): Promise<WebhookFirestoreDocSnapshot> {
+                // Enforce Firestore invariant: all reads must execute before any writes in a transaction
+                if (stagedWrites.size > 0) {
+                  throw new Error(
+                    "Firestore transactions require all reads to be executed before all writes."
+                  );
+                }
+
                 const pathParts = (docRef.path || "").split("/");
                 const colName = pathParts[0] || PAYMENT_WEBHOOK_EVENTS_COLLECTION;
                 const docId = docRef.id || pathParts[1] || "";
                 const fullKey = `${colName}:${docId}`;
 
                 docReads.push({ collection: colName, docId, inTransaction: true });
+
+                if (
+                  colName === AUTHORITATIVE_PENDING_ORDER_COLLECTION &&
+                  (failOrderReads || failTransactionalOrderReads)
+                ) {
+                  throw new Error(
+                    "Simulated Firestore transactional read outage on payment_transactions"
+                  );
+                }
 
                 const staged = stagedWrites.get(fullKey);
                 if (staged) {
@@ -224,6 +245,12 @@ function createTransactionalFirestoreBackingStore() {
                 const colName = pathParts[0] || PAYMENT_WEBHOOK_EVENTS_COLLECTION;
                 const docId = docRef.id || pathParts[1] || "";
                 const fullKey = `${colName}:${docId}`;
+
+                if (colName === AUTHORITATIVE_PENDING_ORDER_COLLECTION && failOrderWrites) {
+                  throw new Error(
+                    "Simulated Firestore transactional write outage on payment_transactions"
+                  );
+                }
 
                 const base = stagedWrites.get(fullKey)?.data ?? documents.get(fullKey) ?? {};
                 const next = options?.merge
@@ -290,7 +317,8 @@ function createTransactionalFirestoreBackingStore() {
       });
 
     const pendingOrderRepository = createPendingOrderRepository({
-      adminDb
+      adminDb,
+      nowMs: () => currentClockMs
     });
 
     const processor = createPaymentWebhookProcessor({
@@ -351,6 +379,9 @@ function createTransactionalFirestoreBackingStore() {
     },
     setFailOrderReads: (v: boolean) => {
       failOrderReads = v;
+    },
+    setFailTransactionalOrderReads: (v: boolean) => {
+      failTransactionalOrderReads = v;
     },
     setFailOrderWrites: (v: boolean) => {
       failOrderWrites = v;
@@ -739,6 +770,251 @@ describe("SEC-01-FIX-06-R1 — Durable Webhook Idempotency (T1 à T12)", () => {
   });
 
   // =========================================================================
+  // SEC-01-FIX-06-R2 — B1 : Fencing atomique au moment exact de l'écriture d'association
+  // =========================================================================
+  it("B1 — Scénario de reprise de lease (15 étapes) : Worker A dont la lease a expiré et été reprise par Worker B est rejeté atomiquement lors de la tentative d'association métier et ne modifie jamais payment_transactions", async () => {
+    const store = createTransactionalFirestoreBackingStore();
+    const workerA = store.createServerInstance();
+    const workerB = store.createServerInstance();
+    workerA.registerUser("uid_b1_fenced_user", "b1@orthogonal.fr");
+    workerB.registerUser("uid_b1_fenced_user", "b1@orthogonal.fr");
+
+    const order = await workerA.pendingOrderRepository.createPendingOrder({
+      verifiedUserUid: "uid_b1_fenced_user",
+      verifiedUserEmail: "b1@orthogonal.fr",
+      plan: "pro",
+      billingCycle: "yearly",
+      amount: 490,
+      currency: "EUR",
+      provider: "paddle",
+      countryCode: "FR"
+    });
+
+    // Étape 1 : Créer un événement webhook
+    const eventId = "evt_b1_fenced_takeover_001";
+    const webhookPayload = {
+      event_id: eventId,
+      event_type: "transaction.completed",
+      data: {
+        id: "txn_b1_fenced_001",
+        custom_data: { orderId: order.orderId }
+      }
+    };
+
+    // Étapes 2 & 3 : Faire acquérir la lease par Worker A et conserver le token A
+    const acqA = await workerA.idempotencyRepository.acquireEventLease({
+      provider: "paddle",
+      eventId,
+      eventType: "transaction.completed",
+      leaseDurationMs: 20_000
+    });
+    expect(acqA.outcome).toBe("acquired");
+    const tokenA = acqA.outcome === "acquired" ? acqA.leaseToken : "";
+    expect(tokenA).toMatch(/^lease_[0-9a-f]{32}$/);
+
+    // Étape 4 : Simuler l'expiration de la lease avec une horloge contrôlée
+    store.advanceClockMs(25_000);
+
+    // Vérifier aussi qu'avant même la reprise par B, une lease expirée est rejetée à l'écriture (R2-04)
+    const expiredAssocAttempt = await executeFencedOrderAssociationTransaction(
+      workerA.adminDb,
+      {
+        provider: "paddle",
+        eventId,
+        leaseToken: tokenA,
+        orderId: order.orderId,
+        userUid: "uid_b1_fenced_user",
+        providerTransactionId: "txn_b1_fenced_001",
+        eventType: "transaction.completed",
+        nowMs: () => store.getClockMs()
+      }
+    );
+    expect(expiredAssocAttempt.ok).toBe(false);
+    if (expiredAssocAttempt.ok === false) {
+      expect(expiredAssocAttempt.statusCode).toBe(409);
+      expect(expiredAssocAttempt.code).toBe("LEASE_CONFLICT");
+    }
+    expect(store.getOrderDoc(order.orderId)?.associationStatus).toBe("unassociated");
+
+    // Étapes 5 & 6 : Faire reprendre la lease par Worker B et conserver le token B
+    const acqB = await workerB.idempotencyRepository.acquireEventLease({
+      provider: "paddle",
+      eventId,
+      eventType: "transaction.completed",
+      leaseDurationMs: 60_000
+    });
+    expect(acqB.outcome).toBe("acquired");
+    const tokenB = acqB.outcome === "acquired" ? acqB.leaseToken : "";
+    expect(tokenB).toMatch(/^lease_[0-9a-f]{32}$/);
+
+    // Étape 7 : Vérifier que A et B possèdent des tokens distincts
+    expect(tokenA).not.toBe(tokenB);
+
+    const orderWritesBeforeStaleWorkerA = store.docWrites.filter(
+      (w) => w.collection === AUTHORITATIVE_PENDING_ORDER_COLLECTION
+    ).length;
+
+    // Étape 8 : Faire tenter à A l'association métier avec son ancien token A
+    const assocAttemptA = await validateAndAssociatePaddleOrder(webhookPayload, {
+      repository: workerA.pendingOrderRepository,
+      adminAuth: workerA.adminAuth,
+      leaseToken: tokenA,
+      nowMs: () => store.getClockMs()
+    });
+
+    // Étape 9 : Vérifier que l'opération d'association de A échoue atomiquement (LEASE_CONFLICT)
+    expect(assocAttemptA.ok).toBe(false);
+    if (assocAttemptA.ok === false) {
+      expect(assocAttemptA.statusCode).toBe(409);
+      expect(assocAttemptA.code).toBe("LEASE_CONFLICT");
+    }
+
+    // Étape 10 : Vérifier que payment_transactions n'a PAS été modifié par A
+    const orderWritesAfterStaleWorkerA = store.docWrites.filter(
+      (w) => w.collection === AUTHORITATIVE_PENDING_ORDER_COLLECTION
+    ).length;
+    expect(orderWritesAfterStaleWorkerA).toBe(orderWritesBeforeStaleWorkerA);
+    expect(store.getOrderDoc(order.orderId)?.associationStatus).toBe("unassociated");
+    expect(store.getOrderDoc(order.orderId)?.providerTransactionId).toBeUndefined();
+    expect(store.getOrderDoc(order.orderId)?.lastEventId).toBeUndefined();
+
+    // Étape 11 : Faire tenter à B l'association métier avec son token valide B
+    const assocAttemptB = await validateAndAssociatePaddleOrder(webhookPayload, {
+      repository: workerB.pendingOrderRepository,
+      adminAuth: workerB.adminAuth,
+      leaseToken: tokenB,
+      nowMs: () => store.getClockMs()
+    });
+
+    // Étape 12 : Vérifier que B réussit et que payment_transactions est mis à jour par B
+    expect(assocAttemptB.ok).toBe(true);
+    const persistedOrderAfterB = store.getOrderDoc(order.orderId);
+    expect(persistedOrderAfterB?.status).toBe("pending");
+    expect(persistedOrderAfterB?.associationStatus).toBe("associated");
+    expect(persistedOrderAfterB?.providerTransactionId).toBe("txn_b1_fenced_001");
+    expect(persistedOrderAfterB?.lastEventId).toBe(eventId);
+    expect(persistedOrderAfterB?.userUid).toBe("uid_b1_fenced_user");
+
+    // Étape 13 : Faire tenter à A de finaliser l'événement avec son ancien token A
+    const completeAttemptA = await workerA.idempotencyRepository.completeEventLease({
+      provider: "paddle",
+      eventId,
+      leaseToken: tokenA
+    });
+
+    // Étape 14 : Vérifier que A ne peut pas finaliser l'événement
+    expect(completeAttemptA.ok).toBe(false);
+    if (completeAttemptA.ok === false) {
+      expect(completeAttemptA.code).toBe("LEASE_CONFLICT");
+    }
+    expect(store.getIdempotencyDoc(eventId)?.status).toBe("processing");
+    expect(store.getIdempotencyDoc(eventId)?.leaseToken).toBe(tokenB);
+
+    // Étape 15 : Worker B finalise l'événement ; vérifier qu'il n'y a qu'une seule association et que l'événement est completed
+    const completeAttemptB = await workerB.idempotencyRepository.completeEventLease({
+      provider: "paddle",
+      eventId,
+      leaseToken: tokenB
+    });
+    expect(completeAttemptB.ok).toBe(true);
+
+    const finalEventDoc = store.getIdempotencyDoc(eventId);
+    expect(finalEventDoc?.status).toBe("completed");
+    expect(finalEventDoc?.attemptCount).toBe(2);
+    expect(finalEventDoc?.leaseToken).toBeNull();
+    expect(finalEventDoc?.completedAt).toBeInstanceOf(Timestamp);
+
+    const associationWriteEntries = store.docWrites.filter(
+      (w) =>
+        w.collection === AUTHORITATIVE_PENDING_ORDER_COLLECTION &&
+        w.data.associationStatus === "associated"
+    );
+    expect(associationWriteEntries).toHaveLength(1);
+    expect(associationWriteEntries[0].inTransaction).toBe(true);
+  });
+
+  it("B1 (Bout-en-bout Processeur) — Si Worker A est suspendu pendant son traitement métier jusqu'après expiration et reprise par Worker B, le processeur de A est bloqué par la transaction d'association (409 LEASE_CONFLICT)", async () => {
+    const store = createTransactionalFirestoreBackingStore();
+    const workerA = store.createServerInstance();
+    const workerB = store.createServerInstance();
+    workerA.registerUser("uid_b1_e2e_user", "b1e2e@orthogonal.fr");
+    workerB.registerUser("uid_b1_e2e_user", "b1e2e@orthogonal.fr");
+
+    const order = await workerA.pendingOrderRepository.createPendingOrder({
+      verifiedUserUid: "uid_b1_e2e_user",
+      verifiedUserEmail: "b1e2e@orthogonal.fr",
+      plan: "pro",
+      billingCycle: "yearly",
+      amount: 490,
+      currency: "EUR",
+      provider: "paddle",
+      countryCode: "FR"
+    });
+
+    const payload = {
+      event_id: "evt_b1_e2e_pause_race",
+      event_type: "transaction.completed",
+      data: {
+        id: "txn_b1_e2e_001",
+        custom_data: { orderId: order.orderId }
+      }
+    };
+
+    // Suspendre Worker A pendant l'appel adminAuth.getUser (après acquireEventLease, juste avant la transaction d'association)
+    let releaseWorkerAAuth!: () => void;
+    let notifyWorkerAPaused!: () => void;
+    const workerAPausedPromise = new Promise<void>((resolve) => {
+      notifyWorkerAPaused = resolve;
+    });
+    const workerAResumeGate = new Promise<void>((resolve) => {
+      releaseWorkerAAuth = resolve;
+    });
+
+    workerA.adminAuth.getUser.mockImplementationOnce(async (uid: string) => {
+      notifyWorkerAPaused();
+      await workerAResumeGate;
+      return { uid, email: "b1e2e@orthogonal.fr", disabled: false };
+    });
+
+    // Lancer le traitement de Worker A (il acquiert la lease A puis se met en pause dans getUser)
+    const workerAProcessPromise = workerA.processor.processVerifiedPaddleEvent(payload);
+    await workerAPausedPromise;
+
+    // La lease de Worker A (60s) expire pendant qu'il est suspendu
+    store.advanceClockMs(65_000);
+
+    // Worker B reçoit l'événement, reprend la lease expirée, associe la commande et finalise l'événement
+    const workerBResult = await workerB.processor.processVerifiedPaddleEvent(payload);
+    expect(workerBResult.statusCode).toBe(200);
+    expect(store.getIdempotencyDoc("evt_b1_e2e_pause_race")?.status).toBe("completed");
+    expect(store.getOrderDoc(order.orderId)?.associationStatus).toBe("associated");
+
+    const orderWritesAfterB = store.docWrites.filter(
+      (w) => w.collection === AUTHORITATIVE_PENDING_ORDER_COLLECTION
+    ).length;
+
+    // Débloquer Worker A : il atteint la transaction d'association et est rejeté atomiquement (409 LEASE_CONFLICT)
+    releaseWorkerAAuth();
+    const workerAResult = await workerA.processor.processVerifiedPaddleEvent(payload);
+    // Note: workerAProcessPromise est l'appel en cours qui a été repris
+    const pausedWorkerAResult = await workerAProcessPromise;
+    expect(pausedWorkerAResult.statusCode).toBe(409);
+    if (pausedWorkerAResult.statusCode !== 200) {
+      expect(pausedWorkerAResult.body.code).toBe("LEASE_CONFLICT");
+    }
+    expect(workerAResult.statusCode).toBe(200);
+    if (workerAResult.statusCode === 200) {
+      expect(workerAResult.body.status).toBe("already_processed");
+    }
+
+    // Aucune écriture supplémentaire sur payment_transactions n'a été commise par Worker A
+    const orderWritesAfterA = store.docWrites.filter(
+      (w) => w.collection === AUTHORITATIVE_PENDING_ORDER_COLLECTION
+    ).length;
+    expect(orderWritesAfterA).toBe(orderWritesAfterB);
+  });
+
+  // =========================================================================
   // T8 — Échec métier et reprise contrôlée
   // =========================================================================
   it("T8 — Échec métier : le traitement échoue -> l'état devient 'failed' (lease invalidée) et une nouvelle tentative contrôlée est possible", async () => {
@@ -831,6 +1107,170 @@ describe("SEC-01-FIX-06-R1 — Durable Webhook Idempotency (T1 à T12)", () => {
     const { res: resRecovered } = await instance.sendSignedWebhook(payload);
     expect(resRecovered.statusCode).toBe(200);
     expect(resRecovered.jsonBody?.associated).toBe(true);
+  });
+
+  // =========================================================================
+  // SEC-01-FIX-06-R2 — T9-A : Échec réel de lecture de payment_transactions
+  // =========================================================================
+  it("T9-A — Échec de lecture de payment_transactions pendant l'association transactionnelle -> HTTP 500, aucune association, événement marqué 'failed' (jamais 'completed'), aucune activation ni fallback mémoire, et reprise possible", async () => {
+    const store = createTransactionalFirestoreBackingStore();
+    const instance = store.createServerInstance();
+    instance.registerUser("uid_t9a_user", "t9a@orthogonal.fr");
+
+    const order = await instance.pendingOrderRepository.createPendingOrder({
+      verifiedUserUid: "uid_t9a_user",
+      verifiedUserEmail: "t9a@orthogonal.fr",
+      plan: "pro",
+      billingCycle: "yearly",
+      amount: 490,
+      currency: "EUR",
+      provider: "paddle",
+      countryCode: "FR"
+    });
+
+    const payload = {
+      event_id: "evt_t9a_read_failure",
+      event_type: "transaction.completed",
+      data: {
+        id: "txn_t9a_001",
+        custom_data: { orderId: order.orderId }
+      }
+    };
+
+    const orderWritesBefore = store.docWrites.filter(
+      (w) => w.collection === AUTHORITATIVE_PENDING_ORDER_COLLECTION
+    ).length;
+
+    // 1. Simuler une erreur réelle de lecture du document payment_transactions pendant la transaction d'association
+    store.setFailTransactionalOrderReads(true);
+    const { res: resTxReadFail } = await instance.sendSignedWebhook(payload);
+
+    expect(resTxReadFail.statusCode).toBe(500);
+    expect(resTxReadFail.jsonBody?.code).toBe("INTERNAL_PERSISTENCE_ERROR");
+    expect(resTxReadFail.jsonBody?.received).not.toBe(true);
+
+    // Vérifier qu'aucune association n'a été réalisée et qu'aucun événement n'est marqué 'completed'
+    const orderAfterTxReadFail = store.getOrderDoc(order.orderId);
+    expect(orderAfterTxReadFail?.status).toBe("pending");
+    expect(orderAfterTxReadFail?.associationStatus).toBe("unassociated");
+    expect(orderAfterTxReadFail?.providerTransactionId).toBeUndefined();
+
+    const eventAfterTxReadFail = store.getIdempotencyDoc("evt_t9a_read_failure");
+    expect(eventAfterTxReadFail?.status).toBe("failed");
+    expect(eventAfterTxReadFail?.completedAt).toBeNull();
+    expect(eventAfterTxReadFail?.leaseToken).toBeNull();
+    expect(eventAfterTxReadFail?.lastErrorCode).toBe("INTERNAL_PERSISTENCE_ERROR");
+    expect(instance.adminAuth.setCustomUserClaims).not.toHaveBeenCalled();
+
+    const orderWritesAfterTxReadFail = store.docWrites.filter(
+      (w) => w.collection === AUTHORITATIVE_PENDING_ORDER_COLLECTION
+    ).length;
+    expect(orderWritesAfterTxReadFail).toBe(orderWritesBefore);
+
+    // 2. Simuler également une panne de lecture directe de payment_transactions (setFailOrderReads)
+    store.setFailTransactionalOrderReads(false);
+    store.setFailOrderReads(true);
+    const { res: resDirectReadFail } = await instance.sendSignedWebhook(payload);
+
+    expect(resDirectReadFail.statusCode).toBe(500);
+    expect(resDirectReadFail.jsonBody?.code).toBe("INTERNAL_PERSISTENCE_ERROR");
+    expect(resDirectReadFail.jsonBody?.received).not.toBe(true);
+    expect(store.getOrderDoc(order.orderId)?.associationStatus).toBe("unassociated");
+    expect(store.getIdempotencyDoc("evt_t9a_read_failure")?.status).toBe("failed");
+    expect(store.getIdempotencyDoc("evt_t9a_read_failure")?.attemptCount).toBe(2);
+    expect(instance.adminAuth.setCustomUserClaims).not.toHaveBeenCalled();
+
+    // 3. Rétablissement de la lecture de payment_transactions -> la nouvelle tentative réussit proprement
+    store.setFailOrderReads(false);
+    const { res: resRecovered } = await instance.sendSignedWebhook(payload);
+    expect(resRecovered.statusCode).toBe(200);
+    expect(resRecovered.jsonBody?.associated).toBe(true);
+
+    expect(store.getOrderDoc(order.orderId)?.associationStatus).toBe("associated");
+    expect(store.getOrderDoc(order.orderId)?.providerTransactionId).toBe("txn_t9a_001");
+    expect(store.getIdempotencyDoc("evt_t9a_read_failure")?.status).toBe("completed");
+    expect(store.getIdempotencyDoc("evt_t9a_read_failure")?.attemptCount).toBe(3);
+  });
+
+  // =========================================================================
+  // SEC-01-FIX-06-R2 — T9-B : Échec réel d'écriture de payment_transactions
+  // =========================================================================
+  it("T9-B — Échec d'écriture de payment_transactions pendant l'association transactionnelle -> HTTP 500, aucune association partielle, événement marqué 'failed' (jamais 'completed'), aucun fallback mémoire, et reprise contrôlée possible", async () => {
+    const store = createTransactionalFirestoreBackingStore();
+    const instance = store.createServerInstance();
+    instance.registerUser("uid_t9b_user", "t9b@orthogonal.fr");
+
+    const order = await instance.pendingOrderRepository.createPendingOrder({
+      verifiedUserUid: "uid_t9b_user",
+      verifiedUserEmail: "t9b@orthogonal.fr",
+      plan: "pro",
+      billingCycle: "yearly",
+      amount: 490,
+      currency: "EUR",
+      provider: "paddle",
+      countryCode: "FR"
+    });
+
+    const payload = {
+      event_id: "evt_t9b_write_failure",
+      event_type: "transaction.completed",
+      data: {
+        id: "txn_t9b_001",
+        custom_data: { orderId: order.orderId }
+      }
+    };
+
+    const orderWritesBefore = store.docWrites.filter(
+      (w) => w.collection === AUTHORITATIVE_PENDING_ORDER_COLLECTION
+    ).length;
+
+    // 1. Simuler une erreur réelle d'écriture sur payment_transactions lors de la transaction d'association
+    store.setFailOrderWrites(true);
+    const { res: resWriteFail } = await instance.sendSignedWebhook(payload);
+
+    expect(resWriteFail.statusCode).toBe(500);
+    expect(resWriteFail.jsonBody?.code).toBe("INTERNAL_PERSISTENCE_ERROR");
+    expect(resWriteFail.jsonBody?.received).not.toBe(true);
+
+    // Vérifier qu'aucune écriture partielle n'a été commise dans payment_transactions
+    const orderWritesAfterFail = store.docWrites.filter(
+      (w) => w.collection === AUTHORITATIVE_PENDING_ORDER_COLLECTION
+    ).length;
+    expect(orderWritesAfterFail).toBe(orderWritesBefore);
+
+    const orderAfterWriteFail = store.getOrderDoc(order.orderId);
+    expect(orderAfterWriteFail?.status).toBe("pending");
+    expect(orderAfterWriteFail?.associationStatus).toBe("unassociated");
+    expect(orderAfterWriteFail?.providerTransactionId).toBeUndefined();
+    expect(orderAfterWriteFail?.lastEventId).toBeUndefined();
+
+    // Vérifier que l'événement est en état 'failed' (jamais 'completed') et que le verrou est relâché
+    const eventAfterWriteFail = store.getIdempotencyDoc("evt_t9b_write_failure");
+    expect(eventAfterWriteFail?.status).toBe("failed");
+    expect(eventAfterWriteFail?.attemptCount).toBe(1);
+    expect(eventAfterWriteFail?.completedAt).toBeNull();
+    expect(eventAfterWriteFail?.leaseToken).toBeNull();
+    expect(eventAfterWriteFail?.leaseExpiresAt).toBeNull();
+    expect(eventAfterWriteFail?.lastErrorCode).toBe("INTERNAL_PERSISTENCE_ERROR");
+    expect(instance.adminAuth.setCustomUserClaims).not.toHaveBeenCalled();
+
+    // 2. Rétablissement de l'écriture sur payment_transactions -> reprise contrôlée réussie
+    store.setFailOrderWrites(false);
+    const { res: resRecovered } = await instance.sendSignedWebhook(payload);
+
+    expect(resRecovered.statusCode).toBe(200);
+    expect(resRecovered.jsonBody?.associated).toBe(true);
+
+    const orderAfterRecovery = store.getOrderDoc(order.orderId);
+    expect(orderAfterRecovery?.status).toBe("pending");
+    expect(orderAfterRecovery?.associationStatus).toBe("associated");
+    expect(orderAfterRecovery?.providerTransactionId).toBe("txn_t9b_001");
+    expect(orderAfterRecovery?.lastEventId).toBe("evt_t9b_write_failure");
+
+    const eventAfterRecovery = store.getIdempotencyDoc("evt_t9b_write_failure");
+    expect(eventAfterRecovery?.status).toBe("completed");
+    expect(eventAfterRecovery?.attemptCount).toBe(2);
+    expect(eventAfterRecovery?.leaseToken).toBeNull();
   });
 
   // =========================================================================
@@ -932,7 +1372,8 @@ describe("SEC-01-FIX-06-R1 — Durable Webhook Idempotency (T1 à T12)", () => {
       provider: "paddle",
       providerTransactionId: "txn_t11_exact",
       eventId: "evt_t11_interrupted",
-      eventType: "transaction.completed"
+      eventType: "transaction.completed",
+      leaseToken: acq1.outcome === "acquired" ? acq1.leaseToken : ""
     });
 
     // Vérifier l'état interrompu : commande associée, mais événement toujours en "processing"

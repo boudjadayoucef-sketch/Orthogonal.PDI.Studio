@@ -216,11 +216,16 @@ export function createPaymentWebhookProcessor(
 
       const activeLeaseToken = leaseAcquisition.leaseToken;
 
-      // STEP 10: If acquired, execute order validation and association
+      // STEP 10: If acquired, execute order validation and atomic lease-fenced association
       try {
         const associationResult = await validateAndAssociatePaddleOrder(payload, {
           repository,
-          adminAuth: deps.adminAuth
+          adminAuth: deps.adminAuth,
+          leaseToken: activeLeaseToken,
+          nowMs:
+            typeof idempotencyRepository.getNowMs === "function"
+              ? () => idempotencyRepository.getNowMs!()
+              : undefined
         });
 
         // STEP 12: If association fails, record controlled failure in durable idempotency store
@@ -229,6 +234,18 @@ export function createPaymentWebhookProcessor(
             typeof associationResult,
             { ok: false }
           >;
+
+          // SEC-01-FIX-06-R2 (B1): If association was rejected atomically due to LEASE_CONFLICT,
+          // this worker no longer owns the active lease and must not mutate the event document.
+          if (failedResult.code === "LEASE_CONFLICT") {
+            return {
+              statusCode: 409,
+              body: {
+                error: failedResult.error,
+                code: "LEASE_CONFLICT"
+              }
+            };
+          }
 
           try {
             await idempotencyRepository.failEventLease({

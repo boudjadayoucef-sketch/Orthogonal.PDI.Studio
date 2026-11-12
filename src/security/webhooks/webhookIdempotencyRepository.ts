@@ -17,6 +17,10 @@
 import crypto from "node:crypto";
 import { Timestamp } from "firebase-admin/firestore";
 import {
+  deriveWebhookEventDocumentId,
+  parseFirestoreTimeMs
+} from "./pendingOrderRepository.ts";
+import {
   PAYMENT_WEBHOOK_EVENTS_COLLECTION,
   type AcquireWebhookEventLeaseInput,
   type AcquireWebhookEventLeaseResult,
@@ -32,10 +36,13 @@ import {
   type WebhookIdempotencyEventStatus
 } from "./webhookTypes.ts";
 
+export { deriveWebhookEventDocumentId, parseFirestoreTimeMs };
+
 export const DEFAULT_WEBHOOK_LEASE_DURATION_MS = 60_000;
 
 export interface WebhookIdempotencyRepository {
   deriveDocumentId(provider: "paddle", eventId: string): string;
+  getNowMs?(): number;
   acquireEventLease(input: AcquireWebhookEventLeaseInput): Promise<AcquireWebhookEventLeaseResult>;
   completeEventLease(
     input: CompleteWebhookEventLeaseInput
@@ -54,30 +61,6 @@ export interface WebhookIdempotencyRepositoryDeps {
   generateLeaseToken?: () => string;
 }
 
-/**
- * Derives a deterministic, non-ambiguous Firestore document key from `provider` and `eventId`
- * using SHA-256 (`paddle_<64-char-sha256>`).
- * Never uses `providerTransactionId` as the idempotency key.
- */
-export function deriveWebhookEventDocumentId(provider: "paddle", eventId: string): string {
-  const cleanProvider = typeof provider === "string" ? provider.trim().toLowerCase() : "";
-  const cleanEventId = typeof eventId === "string" ? eventId.trim() : "";
-
-  if (cleanProvider !== "paddle") {
-    throw new Error(`Unsupported webhook provider for idempotency key: '${String(provider)}'`);
-  }
-  if (!cleanEventId) {
-    throw new Error("Cannot derive webhook idempotency document key from an empty eventId.");
-  }
-
-  const digest = crypto
-    .createHash("sha256")
-    .update(`${cleanProvider}:${cleanEventId}`, "utf8")
-    .digest("hex");
-
-  return `${cleanProvider}_${digest}`;
-}
-
 export function generateSecureLeaseToken(): string {
   return `lease_${crypto.randomBytes(16).toString("hex")}`;
 }
@@ -88,38 +71,6 @@ function isDocSnapshotExisting(snap: WebhookFirestoreDocSnapshot | null | undefi
     return Boolean(snap.exists());
   }
   return Boolean(snap.exists);
-}
-
-/**
- * Converts a stored Firestore Timestamp, Date, ISO string, or epoch millisecond value
- * into epoch milliseconds for deterministic lease expiration comparison inside transactions.
- */
-export function parseFirestoreTimeMs(value: unknown): number | null {
-  if (value === null || value === undefined) return null;
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return value;
-  }
-  if (value instanceof Date) {
-    const ms = value.getTime();
-    return Number.isFinite(ms) ? ms : null;
-  }
-  if (typeof (value as any)?.toMillis === "function") {
-    const ms = Number((value as any).toMillis());
-    return Number.isFinite(ms) ? ms : null;
-  }
-  if (
-    typeof value === "object" &&
-    typeof (value as any).seconds === "number" &&
-    Number.isFinite((value as any).seconds)
-  ) {
-    const nanos = typeof (value as any).nanoseconds === "number" ? (value as any).nanoseconds : 0;
-    return (value as any).seconds * 1000 + Math.floor(nanos / 1_000_000);
-  }
-  if (typeof value === "string" && value.trim().length > 0) {
-    const parsed = Date.parse(value);
-    return Number.isFinite(parsed) ? parsed : null;
-  }
-  return null;
 }
 
 function buildFirestoreTimestamp(ms: number): Timestamp {
@@ -204,6 +155,10 @@ export function createWebhookIdempotencyRepository(
   return {
     deriveDocumentId(provider: "paddle", eventId: string): string {
       return deriveWebhookEventDocumentId(provider, eventId);
+    },
+
+    getNowMs(): number {
+      return nowMs();
     },
 
     async acquireEventLease(
@@ -381,21 +336,24 @@ export function createWebhookIdempotencyRepository(
 
         const existingData = snap.data() || {};
         const existingRecord = normalizeStoredRecord(existingData, "paddle", eventId);
+        const currentTimeMs = nowMs();
+        const leaseExpiresMs = parseFirestoreTimeMs(existingRecord.leaseExpiresAt);
 
-        // Verify strict leaseToken ownership before finalizing
+        // Verify strict leaseToken ownership and active non-expired lease before finalizing
         if (
           existingRecord.status !== "processing" ||
           !existingRecord.leaseToken ||
-          existingRecord.leaseToken !== leaseToken
+          existingRecord.leaseToken !== leaseToken ||
+          leaseExpiresMs === null ||
+          leaseExpiresMs <= currentTimeMs
         ) {
           return {
             ok: false as const,
             code: "LEASE_CONFLICT" as const,
-            error: `Lease conflict for webhook event '${eventId}': leaseToken is no longer owned by this instance.`
+            error: `Lease conflict for webhook event '${eventId}': leaseToken is no longer owned or has expired.`
           };
         }
 
-        const currentTimeMs = nowMs();
         const nowTimestamp = buildFirestoreTimestamp(currentTimeMs);
 
         const completedRecord: WebhookIdempotencyEventRecord = {
