@@ -23,8 +23,7 @@ import { createPendingOrderRepository } from "./src/security/webhooks/pendingOrd
 import { createPaymentWebhookProcessor } from "./src/security/webhooks/paymentWebhookProcessor.ts";
 import { createPaddleWebhookHandler } from "./src/security/webhooks/paddleWebhookHandler.ts";
 import { createSlickPayWebhookHandler } from "./src/security/webhooks/slickPayWebhookHandler.ts";
-import { getPaymentConfigForCountry } from "./src/pdi/payment/pdiPaymentGateway.ts";
-import type { PdiAccountType, PdiSubscriptionPlan } from "./src/lib/firebase.ts";
+import { createPendingOrderRoute } from "./src/security/payments/pendingOrderRoute.ts";
 import { 
   getUserProjects, 
   createOrUpdateProject, 
@@ -218,49 +217,12 @@ const paymentWebhookProcessor = createPaymentWebhookProcessor({
 });
 
 // Authoritative Pending Order Creation (Server-side UID & unguessable orderId)
-app.post("/api/payments/orders", requireAuth, requireEmailVerified, async (req: AuthRequest, res) => {
-  try {
-    const verifiedUid = req.user?.uid;
-    const verifiedEmail = req.user?.email;
-    if (!verifiedUid || !verifiedEmail) {
-      return res.status(401).json({ error: "Authenticated user identity required." });
-    }
-
-    const validPlans: PdiAccountType[] = ["basic", "pro", "team", "enterprise"];
-    const validCycles: PdiSubscriptionPlan[] = ["monthly", "yearly"];
-    const plan = req.body?.plan as PdiAccountType;
-    const billingCycle = (req.body?.billingCycle || "yearly") as PdiSubscriptionPlan;
-    const countryCode = typeof req.body?.countryCode === "string" ? req.body.countryCode.trim().toUpperCase() : "FR";
-
-    if (!validPlans.includes(plan) || !validCycles.includes(billingCycle)) {
-      return res.status(400).json({ error: "Invalid subscription plan or billingCycle." });
-    }
-
-    const paymentConfig = getPaymentConfigForCountry(countryCode);
-    const pricing = paymentConfig.pricingTable[plan];
-    const amount = billingCycle === "yearly" ? pricing.yearlyPrice : pricing.monthlyPrice;
-
-    const order = await pendingOrderRepository.createPendingOrder({
-      verifiedUserUid: verifiedUid,
-      verifiedUserEmail: verifiedEmail,
-      userName: typeof req.body?.userName === "string" ? req.body.userName : req.user?.name,
-      company: typeof req.body?.company === "string" ? req.body.company : "",
-      country: typeof req.body?.country === "string" ? req.body.country : undefined,
-      countryCode,
-      city: typeof req.body?.city === "string" ? req.body.city : "",
-      plan,
-      billingCycle,
-      amount,
-      currency: paymentConfig.currency,
-      provider: paymentConfig.provider
-    });
-
-    return res.status(201).json({ order });
-  } catch (err: any) {
-    console.error("[Orders API Error]:", err?.message || err);
-    return res.status(500).json({ error: "Failed to create authoritative pending order." });
-  }
-});
+app.post(
+  "/api/payments/orders",
+  ...createPendingOrderRoute({
+    pendingOrderRepository
+  })
+);
 
 // Slick-Pay Webhook (Algeria - BaridiMob / Edahabia) — Strict Fail-Closed
 app.post("/api/webhooks/slickpay", createSlickPayWebhookHandler());

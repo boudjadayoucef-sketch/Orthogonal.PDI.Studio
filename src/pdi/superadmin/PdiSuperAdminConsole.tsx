@@ -22,7 +22,6 @@ import {
   saveCountryRestrictionsToFirebase,
   toggleCountryAllowedStatus,
   getPaymentTransactionsFromFirebase,
-  savePaymentTransactionToFirebase,
   updatePaymentTransactionStatus,
   approveAndActivateTransaction,
   getPaymentGatewayConfigFromFirebase,
@@ -33,10 +32,10 @@ import { PdiCountryConfig, PDI_DEFAULT_COUNTRIES } from "../data/pdiGeoData";
 import {
   PdiPaymentTransaction,
   getPaymentConfigForCountry,
-  generateTransactionId,
   PDI_PRICING_DZD,
   PDI_PRICING_INTERNATIONAL
 } from "../payment/pdiPaymentGateway";
+import { initiateAuthoritativeOrderCheckout } from "../../security/payments/pendingOrderClient";
 import { PDI_PATCH_VERSION } from "../pdiVersion";
 import { pdiAlert } from "../ui/PdiNotice";
 import { pdiConfirm } from "../ui/PdiConfirm";
@@ -172,58 +171,8 @@ export function PdiSuperAdminConsole({
       setCountries(cRestrictions);
       setGatewayConfig(gConfig);
 
-      // Seed sample transactions if none exists
-      if (pTxList.length === 0) {
-        const sampleTxDZ: PdiPaymentTransaction = {
-          id: "TX_SLICKPAY_DZ_DEMO_01",
-          userEmail: "engineering.skikda@sonatrach.dz",
-          userName: "Ingénierie Tuyauterie Skikda",
-          company: "Sonatrach RTO",
-          country: "Algérie",
-          countryCode: "DZ",
-          city: "21 - Skikda",
-          plan: "pro",
-          billingCycle: "yearly",
-          amount: 49000,
-          currency: "DZD",
-          provider: "slickpay_baridimob",
-          status: "pending",
-          createdAt: new Date(Date.now() - 3600000 * 5).toISOString(),
-          slickPayDetails: {
-            invoiceId: "INV-SLICKPAY-DZ-2026-0089",
-            baridiMobRip: "00799999000123456789",
-            slickPayUrl: "https://pay.slick-pay.com/invoice/pdi-sonatrach-skikda",
-            transferReference: "CCP-VIR-998822"
-          }
-        };
-        const sampleTxIntl: PdiPaymentTransaction = {
-          id: "TX_PADDLE_FR_DEMO_02",
-          userEmail: "pierre.valentin@technip-energies.com",
-          userName: "Pierre Valentin",
-          company: "Technip Energies Paris",
-          country: "France",
-          countryCode: "FR",
-          city: "Paris",
-          plan: "team",
-          billingCycle: "yearly",
-          amount: 1200,
-          currency: "EUR",
-          provider: "paddle",
-          status: "completed",
-          createdAt: new Date(Date.now() - 3600000 * 24).toISOString(),
-          paddleDetails: {
-            checkoutId: "chk_paddle_99182312",
-            paddleOrderId: "ord_pdl_7781290",
-            customerEmail: "pierre.valentin@technip-energies.com",
-            subscriptionId: "sub_paddle_live_001"
-          }
-        };
-        await savePaymentTransactionToFirebase(sampleTxDZ);
-        await savePaymentTransactionToFirebase(sampleTxIntl);
-        setPaymentTransactions([sampleTxDZ, sampleTxIntl]);
-      } else {
-        setPaymentTransactions(pTxList);
-      }
+      // Payment transactions are created exclusively via authoritative server routes (POST /api/payments/orders)
+      setPaymentTransactions(pTxList);
 
       // If profiles in Firebase is empty, seed with Super Admin Youcef and default sample accounts
       if (pList.length === 0) {
@@ -433,47 +382,31 @@ export function PdiSuperAdminConsole({
 
   const handleRunPaymentSimulation = async (e: React.FormEvent) => {
     e.preventDefault();
-    const config = getPaymentConfigForCountry(simDraft.countryCode);
-    const pricing = config.pricingTable[simDraft.plan];
-    const amount = simDraft.billingCycle === "yearly" ? pricing.yearlyPrice : pricing.monthlyPrice;
-    const txId = generateTransactionId(config.provider);
     const countryObj = countries.find(c => c.code === simDraft.countryCode) || PDI_DEFAULT_COUNTRIES[0];
 
-    const newTx: PdiPaymentTransaction = {
-      id: txId,
-      userEmail: simDraft.email.trim().toLowerCase(),
-      userName: simDraft.name.trim(),
-      company: simDraft.company.trim(),
-      country: countryObj.name,
-      countryCode: simDraft.countryCode,
-      city: simDraft.city,
-      plan: simDraft.plan,
-      billingCycle: simDraft.billingCycle,
-      amount,
-      currency: config.currency,
-      provider: config.provider,
-      status: "pending",
-      createdAt: new Date().toISOString(),
-      slickPayDetails: config.provider === "slickpay_baridimob" ? {
-        invoiceId: `INV-SLICKPAY-${Date.now().toString(36).toUpperCase()}`,
-        baridiMobRip: gatewayConfig?.slickPayAccountId || "00799999000123456789",
-        slickPayUrl: `https://pay.slick-pay.com/checkout/${(txId || "").toLowerCase()}`,
-        transferReference: `VIR-BMOB-${Math.random().toString(36).slice(2, 8).toUpperCase()}`
-      } : undefined,
-      paddleDetails: config.provider === "paddle" ? {
-        checkoutId: `chk_pdl_${Date.now().toString(36)}`,
-        customerEmail: simDraft.email ? simDraft.email.trim().toLowerCase() : "",
-        paddleOrderId: `ord_pdl_${Math.random().toString(36).slice(2, 8)}`
-      } : undefined
-    };
-
     try {
-      await savePaymentTransactionToFirebase(newTx);
-      setPaymentTransactions([newTx, ...paymentTransactions]);
-      setSimulatedTx(newTx);
-      await pdiAlert(`Simulation réussie !\nUne transaction ${config.provider === "slickpay_baridimob" ? "Slick-Pay BaridiMob (DZD)" : "Paddle Checkout (EUR)"} a été générée avec l'ID ${newTx.id}.`);
+      const checkoutInitiation = await initiateAuthoritativeOrderCheckout({
+        plan: simDraft.plan,
+        accountType: simDraft.plan,
+        billingCycle: simDraft.billingCycle,
+        countryCode: simDraft.countryCode,
+        country: countryObj.name,
+        city: simDraft.city,
+        userName: simDraft.name.trim(),
+        company: simDraft.company.trim()
+      });
+
+      const createdOrder = checkoutInitiation.order;
+      setPaymentTransactions([createdOrder, ...paymentTransactions]);
+      setSimulatedTx(createdOrder);
+      await pdiAlert(
+        `Commande serveur créée avec succès !\nUne commande ${
+          createdOrder.provider === "slickpay_baridimob" ? "Slick-Pay BaridiMob (DZD)" : "Paddle Checkout (EUR)"
+        } a été enregistrée côté serveur avec l'orderId ${createdOrder.orderId || createdOrder.id}.`
+      );
     } catch (err: any) {
-      await pdiAlert("Erreur de simulation : " + err.message);
+      setSimulatedTx(null);
+      await pdiAlert("Erreur de création de commande serveur : " + (err?.message || "Échec serveur."));
     }
   };
 

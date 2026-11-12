@@ -1275,27 +1275,11 @@ export async function toggleCountryAllowedStatus(countryCode: string, allowed: b
 // ------------------------------------------
 // PAYMENT TRANSACTIONS & CHECKOUT ROUTER API
 // ------------------------------------------
-export async function savePaymentTransactionToFirebase(transaction: PdiPaymentTransaction): Promise<void> {
-  // Always update local storage cache for transaction resilience
-  try {
-    const raw = localStorage.getItem("pdi_payment_transactions");
-    const existing: PdiPaymentTransaction[] = raw ? JSON.parse(raw) : [];
-    const idx = existing.findIndex((t) => t.id === transaction.id);
-    if (idx >= 0) {
-      existing[idx] = transaction;
-    } else {
-      existing.unshift(transaction);
-    }
-    localStorage.setItem("pdi_payment_transactions", JSON.stringify(existing.slice(0, 50)));
-  } catch {
-    // Ignore
-  }
-
-  try {
-    await setDoc(doc(db, "payment_transactions", transaction.id), transaction, { merge: true });
-  } catch (err) {
-    console.warn("Could not write payment transaction to Firestore (cached locally):", err);
-  }
+export async function savePaymentTransactionToFirebase(_transaction: PdiPaymentTransaction): Promise<void> {
+  throw new Error(
+    "Client-side creation or mutation in payment_transactions is forbidden (FR-15 Zero-Trust). " +
+      "Create pending orders exclusively via the authenticated server endpoint POST /api/payments/orders."
+  );
 }
 
 export async function getPaymentTransactionsFromFirebase(limitCount = 100): Promise<PdiPaymentTransaction[]> {

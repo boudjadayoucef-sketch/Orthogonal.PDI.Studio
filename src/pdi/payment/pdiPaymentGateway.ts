@@ -26,6 +26,7 @@ export interface PdiPaymentTransaction {
   countryCode: string;
   city?: string;
   plan: PdiAccountType;
+  accountType?: PdiAccountType;
   billingCycle: PdiSubscriptionPlan;
   amount: number;
   currency: "DZD" | "EUR" | "USD";

@@ -1,17 +1,21 @@
 /**
  * ORTHOGONAL - ENG · PIPING DESIGN & ISOMETRICS (PD&I)
- * SEC-01-FIX-05-B — PENDING ORDER & PADDLE TRANSACTION ASSOCIATION SERVICE
+ * SEC-01-FIX-05-B-R1 — PENDING ORDER & PADDLE TRANSACTION ASSOCIATION SERVICE
  *
  * Responsibility:
  * - Explicitly separates internal `orderId`, external `providerTransactionId`, and Paddle `eventId`.
- * - Never accepts `checkout_id`, `data.id`, `order_id`, or `event_id` as interchangeable substitutes
- *   for the internal pending `orderId`.
- * - Enforces all order, transaction, and user identity invariants (UID from authoritative order,
- *   never from webhook email or arbitrary webhook UID).
- * - Persists the validated association via `PendingOrderRepository` without performing any
- *   license or subscription activation (deferred to SEC-01-FIX-05-C).
+ * - Enforces the strict B2 event policy (`evaluatePaddleEventPolicy`) BEFORE any Firestore read or write.
+ * - Follows the mandatory processing order:
+ *   1. Webhook authentication (performed upstream in `paddleWebhookHandler.ts`).
+ *   2. Required identifiers presence & distinctness (`orderId`, `providerTransactionId`, `eventId`).
+ *   3. Event type policy validation (`evaluatePaddleEventPolicy`).
+ *   4. Pending order existence & internal ID integrity (`getOrderById`).
+ *   5. Transaction ID consistency & cross-order uniqueness (`findOrderByProviderTransactionId`).
+ *   6. Owner UID & payment provider verification (`adminAuth.getUser(userUid)` & `provider === "paddle"`).
+ *   7. Recording the authorized association (`recordOrderTransactionAssociation`) with `status: "pending"`.
  */
 
+import { evaluatePaddleEventPolicy } from "./paddleEventPolicy.ts";
 import {
   isValidInternalOrderIdFormat,
   type PendingOrderRepository
@@ -38,6 +42,7 @@ function extractNonEmptyString(value: unknown): string | undefined {
  * 1. `orderId` (internal pending order ID from `custom_data.orderId` / `data.custom_data.orderId`)
  * 2. `providerTransactionId` (Paddle transaction ID from `data.id` or `transaction_id` / `provider_transaction_id`)
  * 3. `eventId` (Paddle webhook notification ID from `event_id` / `notification_id` / `alert_id`)
+ * 4. `eventType` (Paddle event type from `event_type` / `alert_name` / `type`, undefined if absent)
  *
  * Never uses `checkout_id`, `data.id`, `order_id`, or `event_id` as a fallback for `orderId`.
  */
@@ -73,11 +78,11 @@ export function extractPaddleWebhookIdentifiers(
     extractNonEmptyString(safePayload.notification_id) ??
     extractNonEmptyString(safePayload.alert_id);
 
+  // 4. Paddle event type: undefined if missing (never defaults silently)
   const eventType =
     extractNonEmptyString(safePayload.event_type) ??
     extractNonEmptyString(safePayload.alert_name) ??
-    extractNonEmptyString(safePayload.type) ??
-    "unknown";
+    extractNonEmptyString(safePayload.type);
 
   const checkoutId =
     extractNonEmptyString(safePayload.checkout_id) ??
@@ -115,7 +120,7 @@ export function extractPaddleWebhookIdentifiers(
 
 /**
  * Validates and records the association between an authenticated Paddle webhook event
- * and an authoritative pending order.
+ * and an authoritative pending order following the mandatory 7-step order (Section 3.3).
  */
 export async function validateAndAssociatePaddleOrder(
   payload: Record<string, any>,
@@ -123,7 +128,7 @@ export async function validateAndAssociatePaddleOrder(
 ): Promise<OrderAssociationValidationResult> {
   const extracted = extractPaddleWebhookIdentifiers(payload);
 
-  // 1. Internal orderId presence & format check (before any Firestore read)
+  // STEP 2: Verify presence and distinctness of required identifiers (before any Firestore read)
   if (!extracted.orderId) {
     return {
       ok: false,
@@ -142,7 +147,6 @@ export async function validateAndAssociatePaddleOrder(
     };
   }
 
-  // 2. External providerTransactionId presence check
   if (!extracted.providerTransactionId) {
     return {
       ok: false,
@@ -152,7 +156,6 @@ export async function validateAndAssociatePaddleOrder(
     };
   }
 
-  // 3. Paddle eventId presence & distinctness check
   if (!extracted.eventId) {
     return {
       ok: false,
@@ -176,7 +179,22 @@ export async function validateAndAssociatePaddleOrder(
     };
   }
 
-  // 4. Fetch authoritative pending order from repository
+  // STEP 3: Verify event type against explicit Paddle Event Policy (before any Firestore read or write)
+  const eventPolicyResult = evaluatePaddleEventPolicy(extracted.eventType);
+  if (!eventPolicyResult.allowed) {
+    const deniedPolicy = eventPolicyResult as Extract<
+      typeof eventPolicyResult,
+      { allowed: false }
+    >;
+    return {
+      ok: false,
+      statusCode: deniedPolicy.statusCode,
+      code: deniedPolicy.code,
+      error: deniedPolicy.error
+    };
+  }
+
+  // STEP 4: Verify existence and integrity of the pending order in the authoritative repository
   const order = await deps.repository.getOrderById(extracted.orderId);
   if (!order) {
     return {
@@ -187,7 +205,6 @@ export async function validateAndAssociatePaddleOrder(
     };
   }
 
-  // 5. Verify stored internal order ID integrity
   const storedId = extractNonEmptyString(order.id);
   const storedOrderId = extractNonEmptyString(order.orderId) ?? storedId;
   if (
@@ -205,7 +222,7 @@ export async function validateAndAssociatePaddleOrder(
     };
   }
 
-  // 6. Verify authoritative owner UID on the stored order
+  // Verify owner and provider integrity on the stored order
   const rawUserId = extractNonEmptyString(order.userId);
   const rawUserUid = extractNonEmptyString(order.userUid);
   if (rawUserId && rawUserUid && rawUserId !== rawUserUid) {
@@ -227,7 +244,6 @@ export async function validateAndAssociatePaddleOrder(
     };
   }
 
-  // Prevent cross-user order reattribution if checkout custom_data carried a different userUid
   if (extracted.customDataUserUid && extracted.customDataUserUid !== authoritativeUserUid) {
     return {
       ok: false,
@@ -237,7 +253,6 @@ export async function validateAndAssociatePaddleOrder(
     };
   }
 
-  // 7. Verify payment provider matches Paddle
   if (order.provider !== "paddle") {
     return {
       ok: false,
@@ -247,7 +262,7 @@ export async function validateAndAssociatePaddleOrder(
     };
   }
 
-  // 8. Verify external providerTransactionId consistency with order (before status check so mismatched txId is caught explicitly)
+  // STEP 5: Verify external transaction identifier consistency & cross-order uniqueness
   const expectedOrExistingTxId =
     extractNonEmptyString(order.providerTransactionId) ??
     extractNonEmptyString(order.paddleDetails?.paddleOrderId);
@@ -261,7 +276,6 @@ export async function validateAndAssociatePaddleOrder(
     };
   }
 
-  // 9. Verify order status allows payment association ("pending" and not already associated)
   if (order.status !== "pending" || order.associationStatus === "associated") {
     return {
       ok: false,
@@ -271,13 +285,14 @@ export async function validateAndAssociatePaddleOrder(
     };
   }
 
-  // 10. Verify providerTransactionId is not already associated with a different order
   const otherOrderWithSameTx = await deps.repository.findOrderByProviderTransactionId(
     "paddle",
     extracted.providerTransactionId
   );
   if (otherOrderWithSameTx) {
-    const otherId = extractNonEmptyString(otherOrderWithSameTx.orderId) ?? extractNonEmptyString(otherOrderWithSameTx.id);
+    const otherId =
+      extractNonEmptyString(otherOrderWithSameTx.orderId) ??
+      extractNonEmptyString(otherOrderWithSameTx.id);
     if (otherId && otherId !== extracted.orderId) {
       return {
         ok: false,
@@ -288,7 +303,7 @@ export async function validateAndAssociatePaddleOrder(
     }
   }
 
-  // 11. Verify that the authoritative userUid still exists and is active in Firebase Authentication
+  // STEP 6: Verify owner identity in Firebase Authentication strictly by UID
   // Note: Identity verification is performed strictly by UID (never by email or webhook fields).
   let verifiedUser = null;
   try {
@@ -311,14 +326,14 @@ export async function validateAndAssociatePaddleOrder(
     };
   }
 
-  // 12. Persist the validated association in the authoritative repository
+  // STEP 7: Persist the validated association in the authoritative repository
   const updatedOrder = await deps.repository.recordOrderTransactionAssociation({
     orderId: extracted.orderId,
     userUid: authoritativeUserUid,
     provider: "paddle",
     providerTransactionId: extracted.providerTransactionId,
     eventId: extracted.eventId,
-    eventType: extracted.eventType,
+    eventType: eventPolicyResult.eventType,
     checkoutId: extracted.checkoutId,
     webhookCustomerEmail: extracted.untrustedWebhookEmail
   });
@@ -331,7 +346,7 @@ export async function validateAndAssociatePaddleOrder(
       orderId: extracted.orderId,
       providerTransactionId: extracted.providerTransactionId,
       eventId: extracted.eventId,
-      eventType: extracted.eventType,
+      eventType: eventPolicyResult.eventType,
       userUid: authoritativeUserUid
     }
   };

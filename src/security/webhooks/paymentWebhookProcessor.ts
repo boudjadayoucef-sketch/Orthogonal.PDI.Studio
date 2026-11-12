@@ -1,21 +1,24 @@
 /**
  * ORTHOGONAL - ENG · PIPING DESIGN & ISOMETRICS (PD&I)
- * SEC-01-FIX-05-B — PAYMENT WEBHOOK BUSINESS PROCESSOR
+ * SEC-01-FIX-05-B-R1 — PAYMENT WEBHOOK BUSINESS PROCESSOR
  *
  * Responsibility:
  * - Orchestrates post-authentication Paddle webhook processing by delegating order lookup
- *   to `PendingOrderRepository` and association validation to `validateAndAssociatePaddleOrder`.
- * - Enforces event-level idempotency via `WebhookIdempotencyRegistry`.
+ *   to `PendingOrderRepository`, event policy evaluation to `evaluatePaddleEventPolicy`,
+ *   and association validation to `validateAndAssociatePaddleOrder`.
+ * - Enforces event-level idempotency via `WebhookIdempotencyRegistry` for valid association events.
  * - Never creates arbitrary orders from webhook data, never resolves users by webhook email,
- *   and never activates subscriptions or Custom Claims in SEC-01-FIX-05-B.
+ *   and never activates subscriptions or Custom Claims in SEC-01-FIX-05-B-R1.
  */
 
 import {
   WebhookIdempotencyRegistry,
   globalWebhookIdempotency
 } from "../sec01SecurityService.ts";
+import { evaluatePaddleEventPolicy } from "./paddleEventPolicy.ts";
 import {
   createPendingOrderRepository,
+  isValidInternalOrderIdFormat,
   type PendingOrderRepository
 } from "./pendingOrderRepository.ts";
 import {
@@ -82,11 +85,17 @@ export function createPaymentWebhookProcessor(
       payload: Record<string, any>
     ): Promise<PaddleWebhookProcessResult> {
       const extracted = extractPaddleWebhookIdentifiers(payload);
+      const policyCheck = evaluatePaddleEventPolicy(extracted.eventType);
+
       const eventKey =
+        policyCheck.allowed &&
         extracted.eventId &&
         extracted.orderId &&
+        isValidInternalOrderIdFormat(extracted.orderId) &&
         extracted.providerTransactionId &&
-        extracted.eventId !== extracted.providerTransactionId
+        extracted.eventId !== extracted.providerTransactionId &&
+        extracted.providerTransactionId !== extracted.orderId &&
+        extracted.eventId !== extracted.orderId
           ? `paddle_evt_${extracted.eventId}`
           : null;
 

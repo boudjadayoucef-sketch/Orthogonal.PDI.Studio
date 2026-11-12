@@ -49,24 +49,15 @@ export function generateAuthoritativeOrderId(provider: PdiPaymentProvider): stri
 }
 
 /**
- * Validates that an internal order identifier has a well-formed structure and is not
- * a raw Paddle notification/transaction/checkout identifier (`evt_`, `txn_`, `chk_`, `sub_`).
+ * Validates that an internal order identifier has a well-formed server-issued structure
+ * (`ORD_PADDLE_...` or `ORD_SLICKPAY_...`) and is never a client-generated `TX_...` / `DEMO_...`
+ * or raw Paddle notification/transaction/checkout identifier (`evt_`, `txn_`, `chk_`, `sub_`).
  */
 export function isValidInternalOrderIdFormat(orderId: unknown): orderId is string {
   if (typeof orderId !== "string") return false;
   const trimmed = orderId.trim();
-  if (trimmed.length < 6 || trimmed.length > 128) return false;
-  if (!/^[A-Za-z0-9_-]+$/.test(trimmed)) return false;
-  const lower = trimmed.toLowerCase();
-  if (
-    lower.startsWith("evt_") ||
-    lower.startsWith("txn_") ||
-    lower.startsWith("chk_") ||
-    lower.startsWith("sub_") ||
-    lower.startsWith("ntf_")
-  ) {
-    return false;
-  }
+  if (trimmed.length < 12 || trimmed.length > 128) return false;
+  if (!/^ORD_(PADDLE|SLICKPAY)_[A-Za-z0-9_-]{1,110}$/.test(trimmed)) return false;
   return true;
 }
 
@@ -132,6 +123,7 @@ export function createPendingOrderRepository(
         countryCode: (input.countryCode || (input.provider === "slickpay_baridimob" ? "DZ" : "FR")).toUpperCase(),
         city: input.city || "",
         plan: input.plan,
+        accountType: input.plan,
         billingCycle: input.billingCycle,
         amount: input.amount,
         currency: input.currency,

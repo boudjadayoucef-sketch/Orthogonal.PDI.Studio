@@ -1,6 +1,6 @@
 /**
  * ORTHOGONAL - ENG · PIPING DESIGN & ISOMETRICS (PD&I)
- * SEC-01-FIX-05-B — SHARED WEBHOOK & PENDING ORDER ASSOCIATION TYPES
+ * SEC-01-FIX-05-B-R1 — SHARED WEBHOOK & PENDING ORDER ASSOCIATION TYPES
  *
  * Responsibility:
  * - Defines pure TypeScript interfaces for authoritative pending orders,
@@ -64,6 +64,7 @@ export interface AuthoritativePendingOrder extends PdiPaymentTransaction {
   orderId: string;
   userId: string;
   userUid: string;
+  accountType: PdiAccountType;
   provider: PdiPaymentProvider;
   status: "pending" | "completed" | "failed" | "refunded";
   associationStatus?: "unassociated" | "associated";
@@ -111,8 +112,8 @@ export interface ExtractedPaddleWebhookIdentifiers {
   providerTransactionId: string | undefined;
   /** Paddle notification/event ID from event_id or alert_id */
   eventId: string | undefined;
-  /** Paddle event type (e.g. transaction.completed, payment_succeeded) */
-  eventType: string;
+  /** Paddle event type (undefined when missing from payload) */
+  eventType: string | undefined;
   /** Optional Paddle checkout session ID */
   checkoutId: string | undefined;
   /** Optional userUid carried in custom_data (used ONLY to detect cross-user order tampering, never as authority) */
@@ -129,6 +130,8 @@ export type OrderAssociationErrorCode =
   | "MISSING_PROVIDER_TRANSACTION_ID"
   | "MISSING_EVENT_ID"
   | "EVENT_ID_EQUALS_TRANSACTION_ID"
+  | "MISSING_EVENT_TYPE"
+  | "UNSUPPORTED_OR_EARLY_EVENT_TYPE"
   | "ORDER_NOT_FOUND"
   | "ORDER_INVALID_ID"
   | "ORDER_MISSING_UID"
