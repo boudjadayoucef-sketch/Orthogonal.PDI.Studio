@@ -42,7 +42,7 @@ function extractNonEmptyString(value: unknown): string | undefined {
  * 1. `orderId` (internal pending order ID from `custom_data.orderId` / `data.custom_data.orderId`)
  * 2. `providerTransactionId` (Paddle transaction ID from `data.id` or `transaction_id` / `provider_transaction_id`)
  * 3. `eventId` (Paddle webhook notification ID from `event_id` / `notification_id` / `alert_id`)
- * 4. `eventType` (Paddle event type from `event_type` / `alert_name` / `type`, undefined if absent)
+ * 4. `eventType` (Paddle event type ONLY from canonical `event_type`, undefined if absent; never fallback to `alert_name` or `type`)
  *
  * Never uses `checkout_id`, `data.id`, `order_id`, or `event_id` as a fallback for `orderId`.
  */
@@ -78,11 +78,8 @@ export function extractPaddleWebhookIdentifiers(
     extractNonEmptyString(safePayload.notification_id) ??
     extractNonEmptyString(safePayload.alert_id);
 
-  // 4. Paddle event type: undefined if missing (never defaults silently)
-  const eventType =
-    extractNonEmptyString(safePayload.event_type) ??
-    extractNonEmptyString(safePayload.alert_name) ??
-    extractNonEmptyString(safePayload.type);
+  // 4. Paddle event type: ONLY from canonical `event_type` (never fallback to `alert_name` or `type`)
+  const eventType = extractNonEmptyString(safePayload.event_type);
 
   const checkoutId =
     extractNonEmptyString(safePayload.checkout_id) ??

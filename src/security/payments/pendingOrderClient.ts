@@ -245,10 +245,9 @@ export async function initiateAuthoritativeOrderCheckout(
       typeof globalThis !== "undefined" &&
       typeof (globalThis as any).Paddle?.Checkout?.open === "function"
     ) {
-      (globalThis as any).Paddle.Checkout.open({
-        customer: paddleCheckout.customer,
-        customData: paddleCheckout.customData
-      });
+      throw new Error(
+        "BLOCKED — PADDLE CHECKOUT CONFIGURATION MISSING: Cannot call Paddle.Checkout.open() without an authoritative Paddle transactionId or configured priceId items."
+      );
     }
 
     return {

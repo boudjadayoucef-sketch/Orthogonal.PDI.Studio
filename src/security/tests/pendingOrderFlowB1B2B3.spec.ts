@@ -677,10 +677,53 @@ describe("SEC-01-FIX-05-B-R1 — Correctifs B1 / B2 / B3", () => {
       expect(onLaunchPaddleCheckout).not.toHaveBeenCalled();
       expect(env.orderStore.size).toBe(0);
     });
+
+    it("B1.11 L'ouverture directe de Paddle.Checkout.open sans transactionId ni priceId serveur est bloquée (BLOCKED — PADDLE CHECKOUT CONFIGURATION MISSING)", async () => {
+      const env = createSimulatedBackendEnv();
+      env.registerAuthenticatedUser({
+        token: "token_b1_11",
+        uid: "uid_b1_11",
+        email: "b1_11@orthogonal.fr",
+        email_verified: true
+      });
+      activeServer = await startTestExpressOrderServer(env);
+
+      const openSpy = vi.fn();
+      const previousPaddle = (globalThis as any).Paddle;
+      (globalThis as any).Paddle = {
+        Checkout: {
+          open: openSpy
+        }
+      };
+
+      try {
+        await expect(
+          initiateAuthoritativeOrderCheckout(
+            {
+              plan: "pro",
+              billingCycle: "yearly",
+              countryCode: "FR"
+            },
+            {
+              apiEndpoint: `${activeServer.baseUrl}/api/payments/orders`,
+              getIdToken: async () => "token_b1_11"
+            }
+          )
+        ).rejects.toThrow(/BLOCKED — PADDLE CHECKOUT CONFIGURATION MISSING/i);
+
+        expect(openSpy).not.toHaveBeenCalled();
+      } finally {
+        if (previousPaddle === undefined) {
+          delete (globalThis as any).Paddle;
+        } else {
+          (globalThis as any).Paddle = previousPaddle;
+        }
+      }
+    });
   });
 
   // =========================================================================
-  // B2 — VALIDATION STRICTE DES TYPES D'ÉVÉNEMENTS PADDLE (Tests 1 à 12)
+  // B2 — VALIDATION STRICTE DES TYPES D'ÉVÉNEMENTS PADDLE (Tests 1 à 12 + B2.3 R2)
   // =========================================================================
   describe("B2 — Validation stricte des types d'événements Paddle (Tests 1 à 12)", () => {
     it("B2.1 transaction.completed autorisé et associe la commande", async () => {
@@ -1080,6 +1123,213 @@ describe("SEC-01-FIX-05-B-R1 — Correctifs B1 / B2 / B3", () => {
       expect(res.statusCode).toBe(200);
       expect(env.adminAuth.setCustomUserClaims).not.toHaveBeenCalled();
       expect(env.setCalls.every((c) => c.collection === "payment_transactions")).toBe(true);
+    });
+
+    it("B2.13 (R2 B2.3 #2 & #3) event_type vide ou numérique -> rejeté (400 MISSING_EVENT_TYPE) sans écriture Firestore ni verrou d'idempotence", async () => {
+      const env = createSimulatedBackendEnv();
+      const order = await env.repository.createPendingOrder({
+        verifiedUserUid: "uid_b2_13",
+        verifiedUserEmail: "b2_13@orthogonal.fr",
+        plan: "pro",
+        billingCycle: "yearly",
+        amount: 490,
+        currency: "EUR",
+        provider: "paddle",
+        countryCode: "FR"
+      });
+      env.getCalls.length = 0;
+      env.setCalls.length = 0;
+      const acquireLockSpy = vi.spyOn(env.idempotency, "markInProgress");
+
+      // Cas #2 : event_type vide ("   ")
+      const { res: resEmpty } = await env.sendSignedPaddleWebhook({
+        event_id: "evt_b2_13_empty",
+        event_type: "   ",
+        data: {
+          id: "txn_b2_13_empty",
+          custom_data: { orderId: order.orderId }
+        }
+      });
+      expect(resEmpty.statusCode).toBe(400);
+      expect(resEmpty.jsonBody?.code).toBe("MISSING_EVENT_TYPE");
+
+      // Cas #3 : event_type numérique (12345)
+      const { res: resNumeric } = await env.sendSignedPaddleWebhook({
+        event_id: "evt_b2_13_numeric",
+        event_type: 12345 as any,
+        data: {
+          id: "txn_b2_13_numeric",
+          custom_data: { orderId: order.orderId }
+        }
+      });
+      expect(resNumeric.statusCode).toBe(400);
+      expect(resNumeric.jsonBody?.code).toBe("MISSING_EVENT_TYPE");
+
+      expect(env.getCalls).toHaveLength(0);
+      expect(env.setCalls).toHaveLength(0);
+      expect(acquireLockSpy).not.toHaveBeenCalled();
+      expect(env.idempotency.isInProgress("paddle_evt_evt_b2_13_empty")).toBe(false);
+      expect(env.idempotency.isProcessed("paddle_evt_evt_b2_13_empty")).toBe(false);
+      expect(env.idempotency.isInProgress("paddle_evt_evt_b2_13_numeric")).toBe(false);
+      expect(env.idempotency.isProcessed("paddle_evt_evt_b2_13_numeric")).toBe(false);
+    });
+
+    it("B2.14 (R2 B2.3 #5 IMPÉRATIF) alert_name: 'transaction.completed' sans event_type -> rejeté (400 MISSING_EVENT_TYPE), aucun fallback sur alert_name", async () => {
+      const env = createSimulatedBackendEnv();
+      env.registerAuthenticatedUser({
+        token: "token_b2_14",
+        uid: "uid_b2_14",
+        email: "b2_14@orthogonal.fr"
+      });
+      const order = await env.repository.createPendingOrder({
+        verifiedUserUid: "uid_b2_14",
+        verifiedUserEmail: "b2_14@orthogonal.fr",
+        plan: "pro",
+        billingCycle: "yearly",
+        amount: 490,
+        currency: "EUR",
+        provider: "paddle",
+        countryCode: "FR"
+      });
+      env.getCalls.length = 0;
+      env.setCalls.length = 0;
+      const acquireLockSpy = vi.spyOn(env.idempotency, "markInProgress");
+
+      const { res } = await env.sendSignedPaddleWebhook({
+        event_id: "evt_b2_14_alert_name_only",
+        alert_name: "transaction.completed",
+        data: {
+          id: "txn_b2_14",
+          custom_data: { orderId: order.orderId }
+        }
+      });
+
+      expect(res.statusCode).toBe(400);
+      expect(res.jsonBody?.code).toBe("MISSING_EVENT_TYPE");
+      expect(env.getCalls).toHaveLength(0);
+      expect(env.setCalls).toHaveLength(0);
+      expect(acquireLockSpy).not.toHaveBeenCalled();
+      expect(env.idempotency.isInProgress("paddle_evt_evt_b2_14_alert_name_only")).toBe(false);
+      expect(env.idempotency.isProcessed("paddle_evt_evt_b2_14_alert_name_only")).toBe(false);
+    });
+
+    it("B2.15 (R2 B2.3 #6 IMPÉRATIF) type: 'transaction.completed' sans event_type -> rejeté (400 MISSING_EVENT_TYPE), aucun fallback sur type", async () => {
+      const env = createSimulatedBackendEnv();
+      env.registerAuthenticatedUser({
+        token: "token_b2_15",
+        uid: "uid_b2_15",
+        email: "b2_15@orthogonal.fr"
+      });
+      const order = await env.repository.createPendingOrder({
+        verifiedUserUid: "uid_b2_15",
+        verifiedUserEmail: "b2_15@orthogonal.fr",
+        plan: "pro",
+        billingCycle: "yearly",
+        amount: 490,
+        currency: "EUR",
+        provider: "paddle",
+        countryCode: "FR"
+      });
+      env.getCalls.length = 0;
+      env.setCalls.length = 0;
+      const acquireLockSpy = vi.spyOn(env.idempotency, "markInProgress");
+
+      const { res } = await env.sendSignedPaddleWebhook({
+        event_id: "evt_b2_15_type_only",
+        type: "transaction.completed",
+        data: {
+          id: "txn_b2_15",
+          custom_data: { orderId: order.orderId }
+        }
+      });
+
+      expect(res.statusCode).toBe(400);
+      expect(res.jsonBody?.code).toBe("MISSING_EVENT_TYPE");
+      expect(env.getCalls).toHaveLength(0);
+      expect(env.setCalls).toHaveLength(0);
+      expect(acquireLockSpy).not.toHaveBeenCalled();
+      expect(env.idempotency.isInProgress("paddle_evt_evt_b2_15_type_only")).toBe(false);
+      expect(env.idempotency.isProcessed("paddle_evt_evt_b2_15_type_only")).toBe(false);
+    });
+
+    it("B2.16 (R2 B2.3 #7 IMPÉRATIF) event_type non autorisé avec alert_name: 'transaction.completed' -> rejeté (422 UNSUPPORTED_OR_EARLY_EVENT_TYPE), sans écriture ni verrou", async () => {
+      const env = createSimulatedBackendEnv();
+      env.registerAuthenticatedUser({
+        token: "token_b2_16",
+        uid: "uid_b2_16",
+        email: "b2_16@orthogonal.fr"
+      });
+      const order = await env.repository.createPendingOrder({
+        verifiedUserUid: "uid_b2_16",
+        verifiedUserEmail: "b2_16@orthogonal.fr",
+        plan: "pro",
+        billingCycle: "yearly",
+        amount: 490,
+        currency: "EUR",
+        provider: "paddle",
+        countryCode: "FR"
+      });
+      env.getCalls.length = 0;
+      env.setCalls.length = 0;
+      const acquireLockSpy = vi.spyOn(env.idempotency, "markInProgress");
+
+      const { res } = await env.sendSignedPaddleWebhook({
+        event_id: "evt_b2_16_unauth_with_alert_name",
+        event_type: "transaction.created",
+        alert_name: "transaction.completed",
+        data: {
+          id: "txn_b2_16",
+          custom_data: { orderId: order.orderId }
+        }
+      });
+
+      expect(res.statusCode).toBe(422);
+      expect(res.jsonBody?.code).toBe("UNSUPPORTED_OR_EARLY_EVENT_TYPE");
+      expect(env.getCalls).toHaveLength(0);
+      expect(env.setCalls).toHaveLength(0);
+      expect(acquireLockSpy).not.toHaveBeenCalled();
+      expect(env.idempotency.isInProgress("paddle_evt_evt_b2_16_unauth_with_alert_name")).toBe(false);
+      expect(env.idempotency.isProcessed("paddle_evt_evt_b2_16_unauth_with_alert_name")).toBe(false);
+    });
+
+    it("B2.17 (R2 B2.3 #8 IMPÉRATIF) event_type non autorisé avec type: 'transaction.completed' -> rejeté (422 UNSUPPORTED_OR_EARLY_EVENT_TYPE), sans écriture ni verrou", async () => {
+      const env = createSimulatedBackendEnv();
+      env.registerAuthenticatedUser({
+        token: "token_b2_17",
+        uid: "uid_b2_17",
+        email: "b2_17@orthogonal.fr"
+      });
+      const order = await env.repository.createPendingOrder({
+        verifiedUserUid: "uid_b2_17",
+        verifiedUserEmail: "b2_17@orthogonal.fr",
+        plan: "pro",
+        billingCycle: "yearly",
+        amount: 490,
+        currency: "EUR",
+        provider: "paddle",
+        countryCode: "FR"
+      });
+      env.getCalls.length = 0;
+      env.setCalls.length = 0;
+      const acquireLockSpy = vi.spyOn(env.idempotency, "markInProgress");
+
+      const { res } = await env.sendSignedPaddleWebhook({
+        event_id: "evt_b2_17_unauth_with_type",
+        event_type: "transaction.updated",
+        type: "transaction.completed",
+        data: {
+          id: "txn_b2_17",
+          custom_data: { orderId: order.orderId }
+        }
+      });
+
+      expect(res.statusCode).toBe(422);
+      expect(res.jsonBody?.code).toBe("UNSUPPORTED_OR_EARLY_EVENT_TYPE");
+      expect(env.getCalls).toHaveLength(0);
+      expect(env.setCalls).toHaveLength(0);
+      expect(acquireLockSpy).not.toHaveBeenCalled();
+      expect(env.idempotency.isInProgress("paddle_evt_evt_b2_17_unauth_with_type")).toBe(false);
+      expect(env.idempotency.isProcessed("paddle_evt_evt_b2_17_unauth_with_type")).toBe(false);
     });
   });
 
