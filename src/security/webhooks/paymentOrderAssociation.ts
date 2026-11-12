@@ -273,7 +273,26 @@ export async function validateAndAssociatePaddleOrder(
     };
   }
 
-  if (order.status !== "pending" || order.associationStatus === "associated") {
+  if (order.status !== "pending") {
+    return {
+      ok: false,
+      statusCode: 409,
+      code: "ORDER_INVALID_STATUS",
+      error: `Order state (status='${String(order.status)}', associationStatus='${String(order.associationStatus || "unassociated")}') does not allow new payment association`
+    };
+  }
+
+  // SEC-01-FIX-06-R1 (Section 5): Recovery after interruption between order association write
+  // and webhook event completion. Recognize the existing association ONLY if orderId,
+  // providerTransactionId, recorded lastEventId, provider === "paddle", and authoritative UID
+  // all match the incoming event.
+  const isAlreadyAssociatedForExactSameEvent =
+    order.associationStatus === "associated" &&
+    expectedOrExistingTxId === extracted.providerTransactionId &&
+    extractNonEmptyString(order.lastEventId) === extracted.eventId &&
+    order.provider === "paddle";
+
+  if (order.associationStatus === "associated" && !isAlreadyAssociatedForExactSameEvent) {
     return {
       ok: false,
       statusCode: 409,
@@ -323,6 +342,22 @@ export async function validateAndAssociatePaddleOrder(
     };
   }
 
+  if (isAlreadyAssociatedForExactSameEvent) {
+    return {
+      ok: true,
+      statusCode: 200,
+      alreadyAssociatedForSameEvent: true,
+      order,
+      identifiers: {
+        orderId: extracted.orderId,
+        providerTransactionId: extracted.providerTransactionId,
+        eventId: extracted.eventId,
+        eventType: eventPolicyResult.eventType,
+        userUid: authoritativeUserUid
+      }
+    };
+  }
+
   // STEP 7: Persist the validated association in the authoritative repository
   const updatedOrder = await deps.repository.recordOrderTransactionAssociation({
     orderId: extracted.orderId,
@@ -338,6 +373,7 @@ export async function validateAndAssociatePaddleOrder(
   return {
     ok: true,
     statusCode: 200,
+    alreadyAssociatedForSameEvent: false,
     order: updatedOrder,
     identifiers: {
       orderId: extracted.orderId,

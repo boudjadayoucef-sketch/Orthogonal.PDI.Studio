@@ -85,14 +85,19 @@ function createSimulatedOrderAssociationEnv(options?: {
     options?: { merge?: boolean };
   }> = [];
 
+  let txQueue = Promise.resolve();
   const adminDb = {
     collection: vi.fn((colName: string) => ({
       doc: vi.fn((docId: string) => ({
+        id: docId,
+        path: `${colName}/${docId}`,
         get: vi.fn(async () => {
-          operationLog.push(`db.get:${colName}/${docId}`);
-          getCalls.push({ collection: colName, docId });
-          if (options?.failDbGet) {
-            throw new Error("Simulated Firestore read failure");
+          if (colName !== "payment_webhook_events") {
+            operationLog.push(`db.get:${colName}/${docId}`);
+            getCalls.push({ collection: colName, docId });
+            if (options?.failDbGet) {
+              throw new Error("Simulated Firestore read failure");
+            }
           }
           const existing = orderStore.get(`${colName}:${docId}`);
           return {
@@ -102,16 +107,18 @@ function createSimulatedOrderAssociationEnv(options?: {
           };
         }),
         set: vi.fn(async (data: Record<string, unknown>, setOpts?: { merge?: boolean }) => {
-          operationLog.push(`db.set:${colName}/${docId}`);
-          if (options?.failDbSet) {
-            throw new Error("Simulated Firestore write failure");
+          if (colName !== "payment_webhook_events") {
+            operationLog.push(`db.set:${colName}/${docId}`);
+            if (options?.failDbSet) {
+              throw new Error("Simulated Firestore write failure");
+            }
+            setCalls.push({ collection: colName, docId, data, options: setOpts });
           }
           const current = orderStore.get(`${colName}:${docId}`) || {};
           orderStore.set(
             `${colName}:${docId}`,
             setOpts?.merge ? { ...current, ...data } : { ...data }
           );
-          setCalls.push({ collection: colName, docId, data, options: setOpts });
         })
       })),
       where: vi.fn((field: string, _op: "==", value: unknown) => ({
@@ -130,7 +137,22 @@ function createSimulatedOrderAssociationEnv(options?: {
           };
         })
       }))
-    }))
+    })),
+    runTransaction: async <T>(updateFn: (tx: any) => Promise<T>): Promise<T> => {
+      const run = txQueue.then(async () => {
+        const tx = {
+          get: async (docRef: any) => docRef.get(),
+          set: (docRef: any, data: Record<string, unknown>, opts?: { merge?: boolean }) =>
+            docRef.set(data, opts)
+        };
+        return updateFn(tx);
+      });
+      txQueue = run.then(
+        () => undefined,
+        () => undefined
+      );
+      return run;
+    }
   };
 
   const adminAuth = {

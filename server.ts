@@ -15,11 +15,11 @@ import { requireAuth, requireSuperAdmin, requireEmailVerified, AuthRequest } fro
 import { adminAuth, adminDb } from "./src/lib/firebase-admin.ts";
 import { 
   createBoundedRateLimiter,
-  globalWebhookIdempotency,
   verifyProductionConfig,
   isSuspiciousRequestPath
 } from "./src/security/sec01SecurityService.ts";
 import { createPendingOrderRepository } from "./src/security/webhooks/pendingOrderRepository.ts";
+import { createWebhookIdempotencyRepository } from "./src/security/webhooks/webhookIdempotencyRepository.ts";
 import { createPaymentWebhookProcessor } from "./src/security/webhooks/paymentWebhookProcessor.ts";
 import { createPaddleWebhookHandler } from "./src/security/webhooks/paddleWebhookHandler.ts";
 import { createSlickPayWebhookHandler } from "./src/security/webhooks/slickPayWebhookHandler.ts";
@@ -209,10 +209,14 @@ const pendingOrderRepository = createPendingOrderRepository({
   adminDb
 });
 
+const webhookIdempotencyRepository = createWebhookIdempotencyRepository({
+  adminDb
+});
+
 const paymentWebhookProcessor = createPaymentWebhookProcessor({
   adminDb,
   adminAuth,
-  idempotency: globalWebhookIdempotency,
+  idempotencyRepository: webhookIdempotencyRepository,
   pendingOrderRepository
 });
 

@@ -97,9 +97,12 @@ function createSimulatedWebhookStack(options?: {
   }> = [];
   const docSetMock = vi.fn();
 
+  let txQueue = Promise.resolve();
   const adminDb = {
     collection: vi.fn((colName: string) => ({
       doc: vi.fn((docId: string) => ({
+        id: docId,
+        path: `${colName}/${docId}`,
         get: vi.fn(async () => {
           const existing = store.get(`${colName}:${docId}`);
           return {
@@ -114,11 +117,28 @@ function createSimulatedWebhookStack(options?: {
             `${colName}:${docId}`,
             setOpts?.merge ? { ...current, ...data } : { ...data }
           );
-          setCalls.push({ collection: colName, docId, data, options: setOpts });
-          docSetMock(colName, docId, data, setOpts);
+          if (colName !== "payment_webhook_events") {
+            setCalls.push({ collection: colName, docId, data, options: setOpts });
+            docSetMock(colName, docId, data, setOpts);
+          }
         })
       }))
-    }))
+    })),
+    runTransaction: async <T>(updateFn: (tx: any) => Promise<T>): Promise<T> => {
+      const run = txQueue.then(async () => {
+        const tx = {
+          get: async (docRef: any) => docRef.get(),
+          set: (docRef: any, data: Record<string, unknown>, opts?: { merge?: boolean }) =>
+            docRef.set(data, opts)
+        };
+        return updateFn(tx);
+      });
+      txQueue = run.then(
+        () => undefined,
+        () => undefined
+      );
+      return run;
+    }
   };
 
   const adminAuth = {

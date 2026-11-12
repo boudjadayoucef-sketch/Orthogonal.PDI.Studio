@@ -1,20 +1,20 @@
 /**
  * ORTHOGONAL - ENG · PIPING DESIGN & ISOMETRICS (PD&I)
- * SEC-01-FIX-05-B-R1 — PAYMENT WEBHOOK BUSINESS PROCESSOR
+ * SEC-01-FIX-06-R1 — PAYMENT WEBHOOK BUSINESS PROCESSOR (DURABLE IDEMPOTENCY)
  *
  * Responsibility:
- * - Orchestrates post-authentication Paddle webhook processing by delegating order lookup
- *   to `PendingOrderRepository`, event policy evaluation to `evaluatePaddleEventPolicy`,
- *   and association validation to `validateAndAssociatePaddleOrder`.
- * - Enforces event-level idempotency via `WebhookIdempotencyRegistry` for valid association events.
+ * - Orchestrates post-authentication Paddle webhook processing by delegating:
+ *   1. Identifier extraction to `extractPaddleWebhookIdentifiers`
+ *   2. Event policy validation to `evaluatePaddleEventPolicy` (before any idempotency read/write)
+ *   3. Durable atomic lease management to `WebhookIdempotencyRepository` (`payment_webhook_events`)
+ *   4. Order lookup and association validation to `validateAndAssociatePaddleOrder` (`PendingOrderRepository`)
+ * - Never relies on in-memory `globalWebhookIdempotency` as authority.
+ * - Fails closed on any Firestore transaction or persistence error (never returns a false 200).
  * - Never creates arbitrary orders from webhook data, never resolves users by webhook email,
- *   and never activates subscriptions or Custom Claims in SEC-01-FIX-05-B-R1.
+ *   and never activates subscriptions or Custom Claims.
  */
 
-import {
-  WebhookIdempotencyRegistry,
-  globalWebhookIdempotency
-} from "../sec01SecurityService.ts";
+import type { WebhookIdempotencyRegistry } from "../sec01SecurityService.ts";
 import { evaluatePaddleEventPolicy } from "./paddleEventPolicy.ts";
 import {
   createPendingOrderRepository,
@@ -25,6 +25,10 @@ import {
   extractPaddleWebhookIdentifiers,
   validateAndAssociatePaddleOrder
 } from "./paymentOrderAssociation.ts";
+import {
+  createWebhookIdempotencyRepository,
+  type WebhookIdempotencyRepository
+} from "./webhookIdempotencyRepository.ts";
 import type {
   OrderAssociationErrorCode,
   WebhookAdminAuth,
@@ -43,6 +47,9 @@ export type {
 export interface PaymentWebhookProcessorDeps {
   adminDb: WebhookFirestoreDb;
   adminAuth: WebhookAdminAuth;
+  /** Durable Firestore-backed idempotency repository (authority for SEC-01-FIX-06-R1) */
+  idempotencyRepository?: WebhookIdempotencyRepository;
+  /** Deprecated legacy prop kept only for backwards type compatibility in callers; ignored as authority */
   idempotency?: WebhookIdempotencyRegistry;
   pendingOrderRepository?: PendingOrderRepository;
 }
@@ -65,7 +72,11 @@ export type PaddleWebhookProcessResult =
       statusCode: 400 | 403 | 404 | 409 | 422 | 500;
       body: {
         error: string;
-        code?: OrderAssociationErrorCode | "WEBHOOK_IN_PROGRESS" | "INTERNAL_PERSISTENCE_ERROR";
+        code?:
+          | OrderAssociationErrorCode
+          | "WEBHOOK_IN_PROGRESS"
+          | "LEASE_CONFLICT"
+          | "INTERNAL_PERSISTENCE_ERROR";
       };
     };
 
@@ -76,7 +87,8 @@ export interface PaymentWebhookProcessor {
 export function createPaymentWebhookProcessor(
   deps: PaymentWebhookProcessorDeps
 ): PaymentWebhookProcessor {
-  const idempotency = deps.idempotency ?? globalWebhookIdempotency;
+  const idempotencyRepository =
+    deps.idempotencyRepository ?? createWebhookIdempotencyRepository({ adminDb: deps.adminDb });
   const repository =
     deps.pendingOrderRepository ?? createPendingOrderRepository({ adminDb: deps.adminDb });
 
@@ -84,53 +96,161 @@ export function createPaymentWebhookProcessor(
     async processVerifiedPaddleEvent(
       payload: Record<string, any>
     ): Promise<PaddleWebhookProcessResult> {
+      // STEP 1 & 2: Receive authenticated event and extract identifiers
       const extracted = extractPaddleWebhookIdentifiers(payload);
-      const policyCheck = evaluatePaddleEventPolicy(extracted.eventType);
 
-      const eventKey =
-        policyCheck.allowed &&
-        extracted.eventId &&
-        extracted.orderId &&
-        isValidInternalOrderIdFormat(extracted.orderId) &&
-        extracted.providerTransactionId &&
-        extracted.eventId !== extracted.providerTransactionId &&
-        extracted.providerTransactionId !== extracted.orderId &&
-        extracted.eventId !== extracted.orderId
-          ? `paddle_evt_${extracted.eventId}`
-          : null;
-
-      if (eventKey) {
-        if (idempotency.isProcessed(eventKey)) {
-          return {
-            statusCode: 200,
-            body: { received: true, status: "already_processed" }
-          };
-        }
-        if (!idempotency.markInProgress(eventKey)) {
-          return {
-            statusCode: 409,
-            body: {
-              error: "Webhook event currently in progress",
-              code: "WEBHOOK_IN_PROGRESS"
-            }
-          };
-        }
+      // STEP 3 & 4: Validate presence and distinctness of required identifiers
+      // (before any idempotency or order Firestore read/write)
+      if (!extracted.orderId) {
+        return {
+          statusCode: 400,
+          body: {
+            error: "Missing internal orderId in Paddle webhook custom_data",
+            code: "MISSING_INTERNAL_ORDER_ID"
+          }
+        };
       }
 
+      if (!isValidInternalOrderIdFormat(extracted.orderId)) {
+        return {
+          statusCode: 422,
+          body: {
+            error: `Invalid internal orderId format: '${extracted.orderId}'`,
+            code: "INVALID_INTERNAL_ORDER_ID"
+          }
+        };
+      }
+
+      if (!extracted.providerTransactionId) {
+        return {
+          statusCode: 400,
+          body: {
+            error: "Missing external providerTransactionId in Paddle webhook payload",
+            code: "MISSING_PROVIDER_TRANSACTION_ID"
+          }
+        };
+      }
+
+      if (!extracted.eventId) {
+        return {
+          statusCode: 400,
+          body: {
+            error: "Missing Paddle event_id in webhook payload",
+            code: "MISSING_EVENT_ID"
+          }
+        };
+      }
+
+      if (
+        extracted.eventId === extracted.providerTransactionId ||
+        extracted.providerTransactionId === extracted.orderId ||
+        extracted.eventId === extracted.orderId
+      ) {
+        return {
+          statusCode: 422,
+          body: {
+            error:
+              "Ambiguous identifiers: internal orderId, providerTransactionId, and eventId must be strictly distinct",
+            code: "EVENT_ID_EQUALS_TRANSACTION_ID"
+          }
+        };
+      }
+
+      // STEP 5 & 6: Validate event type policy and refuse unauthorized events
+      // BEFORE any Firestore idempotency read or write
+      const policyCheck = evaluatePaddleEventPolicy(extracted.eventType);
+      if (!policyCheck.allowed) {
+        const deniedPolicy = policyCheck as Extract<typeof policyCheck, { allowed: false }>;
+        return {
+          statusCode: deniedPolicy.statusCode,
+          body: {
+            error: deniedPolicy.error,
+            code: deniedPolicy.code
+          }
+        };
+      }
+
+      // STEP 7: Atomically acquire durable lease in Firestore (`payment_webhook_events`)
+      let leaseAcquisition;
+      try {
+        leaseAcquisition = await idempotencyRepository.acquireEventLease({
+          provider: "paddle",
+          eventId: extracted.eventId,
+          eventType: policyCheck.eventType
+        });
+      } catch (idempErr: any) {
+        console.error(
+          "[Webhook Paddle Durable Idempotency Error]:",
+          idempErr?.message || idempErr
+        );
+        return {
+          statusCode: 500,
+          body: {
+            error: "Failed to acquire durable webhook idempotency lease",
+            code: "INTERNAL_PERSISTENCE_ERROR"
+          }
+        };
+      }
+
+      // STEP 8: If already_processed, return idempotent result without re-running business logic
+      if (leaseAcquisition.outcome === "already_processed") {
+        return {
+          statusCode: 200,
+          body: {
+            received: true,
+            status: "already_processed"
+          }
+        };
+      }
+
+      // STEP 9: If in_progress, return 409 conflict without executing business logic
+      if (leaseAcquisition.outcome === "in_progress") {
+        return {
+          statusCode: 409,
+          body: {
+            error: "Webhook event currently in progress",
+            code: "WEBHOOK_IN_PROGRESS"
+          }
+        };
+      }
+
+      const activeLeaseToken = leaseAcquisition.leaseToken;
+
+      // STEP 10: If acquired, execute order validation and association
       try {
         const associationResult = await validateAndAssociatePaddleOrder(payload, {
           repository,
           adminAuth: deps.adminAuth
         });
 
+        // STEP 12: If association fails, record controlled failure in durable idempotency store
         if (!associationResult.ok) {
           const failedResult = associationResult as Extract<
             typeof associationResult,
             { ok: false }
           >;
-          if (eventKey) {
-            idempotency.releaseInProgress(eventKey);
+
+          try {
+            await idempotencyRepository.failEventLease({
+              provider: "paddle",
+              eventId: extracted.eventId,
+              leaseToken: activeLeaseToken,
+              errorCode: failedResult.code
+            });
+          } catch (failLeaseErr: any) {
+            console.error(
+              "[Webhook Paddle Idempotency Fail-Lease Error]:",
+              failLeaseErr?.message || failLeaseErr
+            );
+            return {
+              statusCode: 500,
+              body: {
+                error: "Failed to persist webhook failure state",
+                code: "INTERNAL_PERSISTENCE_ERROR"
+              }
+            };
           }
+
           return {
             statusCode: failedResult.statusCode,
             body: {
@@ -145,10 +265,28 @@ export function createPaymentWebhookProcessor(
           { ok: true }
         >;
 
-        if (eventKey) {
-          idempotency.markCompleted(eventKey);
+        // STEP 11: Finalize durable lease to "completed" while verifying leaseToken ownership
+        const completionResult = await idempotencyRepository.completeEventLease({
+          provider: "paddle",
+          eventId: extracted.eventId,
+          leaseToken: activeLeaseToken
+        });
+
+        if (!completionResult.ok) {
+          const conflictResult = completionResult as Extract<
+            typeof completionResult,
+            { ok: false }
+          >;
+          return {
+            statusCode: 409,
+            body: {
+              error: conflictResult.error,
+              code: "LEASE_CONFLICT"
+            }
+          };
         }
 
+        // STEP 13: Return HTTP 200 result
         return {
           statusCode: 200,
           body: {
@@ -163,8 +301,15 @@ export function createPaymentWebhookProcessor(
           }
         };
       } catch (innerErr: any) {
-        if (eventKey) {
-          idempotency.releaseInProgress(eventKey);
+        try {
+          await idempotencyRepository.failEventLease({
+            provider: "paddle",
+            eventId: extracted.eventId,
+            leaseToken: activeLeaseToken,
+            errorCode: "INTERNAL_PERSISTENCE_ERROR"
+          });
+        } catch {
+          // If Firestore itself is unavailable, the lease will expire automatically
         }
         console.error(
           "[Webhook Paddle Association Error]:",

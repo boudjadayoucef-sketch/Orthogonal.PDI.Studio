@@ -14,6 +14,8 @@ import type { PdiPaymentProvider, PdiPaymentTransaction } from "../../pdi/paymen
 
 export const AUTHORITATIVE_PENDING_ORDER_COLLECTION = "payment_transactions" as const;
 
+export const PAYMENT_WEBHOOK_EVENTS_COLLECTION = "payment_webhook_events" as const;
+
 export interface WebhookFirestoreDocSnapshot {
   exists: boolean | (() => boolean);
   id?: string;
@@ -21,8 +23,20 @@ export interface WebhookFirestoreDocSnapshot {
 }
 
 export interface WebhookFirestoreDocRef {
+  id?: string;
+  path?: string;
   get?(): Promise<WebhookFirestoreDocSnapshot>;
   set(data: Record<string, unknown>, options?: { merge?: boolean }): Promise<unknown>;
+}
+
+export interface WebhookFirestoreTransaction {
+  get(docRef: WebhookFirestoreDocRef): Promise<WebhookFirestoreDocSnapshot>;
+  set(
+    docRef: WebhookFirestoreDocRef,
+    data: Record<string, unknown>,
+    options?: { merge?: boolean }
+  ): WebhookFirestoreTransaction | unknown;
+  update?(docRef: WebhookFirestoreDocRef, data: Record<string, unknown>): WebhookFirestoreTransaction | unknown;
 }
 
 export interface WebhookFirestoreQuerySnapshot {
@@ -45,6 +59,9 @@ export interface WebhookFirestoreCollectionRef {
 
 export interface WebhookFirestoreDb {
   collection(name: string): WebhookFirestoreCollectionRef;
+  runTransaction?<T>(
+    updateFunction: (transaction: WebhookFirestoreTransaction) => Promise<T>
+  ): Promise<T>;
 }
 
 export interface WebhookVerifiedUserRecord {
@@ -58,6 +75,85 @@ export interface WebhookAdminAuth {
   getUserByEmail?(email: string): Promise<{ uid?: string } | null | undefined>;
   setCustomUserClaims?(uid: string, claims: Record<string, unknown>): Promise<unknown>;
 }
+
+export type WebhookIdempotencyEventStatus = "processing" | "completed" | "failed";
+
+export interface WebhookIdempotencyEventRecord {
+  provider: "paddle";
+  eventId: string;
+  eventType: string;
+  status: WebhookIdempotencyEventStatus;
+  attemptCount: number;
+  createdAt: unknown;
+  updatedAt: unknown;
+  leaseExpiresAt: unknown | null;
+  leaseToken: string | null;
+  completedAt?: unknown | null;
+  lastErrorCode?: string | null;
+}
+
+export interface AcquireWebhookEventLeaseInput {
+  provider: "paddle";
+  eventId: string;
+  eventType: string;
+  leaseDurationMs?: number;
+}
+
+export type AcquireWebhookEventLeaseResult =
+  | {
+      outcome: "acquired";
+      documentId: string;
+      leaseToken: string;
+      attemptCount: number;
+      record: WebhookIdempotencyEventRecord;
+    }
+  | {
+      outcome: "already_processed";
+      documentId: string;
+      record: WebhookIdempotencyEventRecord;
+    }
+  | {
+      outcome: "in_progress";
+      documentId: string;
+      record: WebhookIdempotencyEventRecord;
+    };
+
+export interface CompleteWebhookEventLeaseInput {
+  provider: "paddle";
+  eventId: string;
+  leaseToken: string;
+}
+
+export type CompleteWebhookEventLeaseResult =
+  | {
+      ok: true;
+      documentId: string;
+      record: WebhookIdempotencyEventRecord;
+    }
+  | {
+      ok: false;
+      code: "LEASE_CONFLICT" | "EVENT_NOT_FOUND";
+      error: string;
+    };
+
+export interface FailWebhookEventLeaseInput {
+  provider: "paddle";
+  eventId: string;
+  leaseToken: string;
+  errorCode: string;
+}
+
+export type FailWebhookEventLeaseResult =
+  | {
+      ok: true;
+      documentId: string;
+      record: WebhookIdempotencyEventRecord;
+    }
+  | {
+      ok: false;
+      code: "LEASE_CONFLICT" | "EVENT_NOT_FOUND";
+      error: string;
+    };
 
 export interface AuthoritativePendingOrder extends PdiPaymentTransaction {
   id: string;
@@ -146,6 +242,7 @@ export type OrderAssociationValidationResult =
   | {
       ok: true;
       statusCode: 200;
+      alreadyAssociatedForSameEvent?: boolean;
       order: AuthoritativePendingOrder;
       identifiers: {
         orderId: string;
