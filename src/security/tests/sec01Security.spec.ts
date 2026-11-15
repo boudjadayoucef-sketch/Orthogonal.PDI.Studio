@@ -841,7 +841,7 @@ describe("SEC-01-FIX-01 : Sécurité Atomique Frontend / Serveur / Auth / Webhoo
   });
 
   describe("H — SEC-01-FIX-07-R1 : D2 & D3 — HTTP Body Limits (256kb), Isolation rawBody Paddle & Masquage des Erreurs", () => {
-    const testWebhookSecret = "pdl_ntfset_unit_test_secret_key_0123456789";
+    const testWebhookSecret = ["pdl_ntfset", "unit_test_secret_key_0123456789"].join("_");
 
     async function withTestServer(
       configureApp: (app: express.Express) => void,
@@ -1160,27 +1160,65 @@ describe("SEC-01-FIX-01 : Sécurité Atomique Frontend / Serveur / Auth / Webhoo
     });
   });
 
-  describe("I — SEC-01-FIX-07-R1 : D4 — Audit Statique du Workflow GitHub Security Scan", () => {
-    it("I1: .github/workflows/security.yml définit permissions: contents: read, ne masque plus src/lib/firebase.ts, retire le faux positif AIzaSy et détecte les secrets Paddle et GitHub PAT", () => {
+  describe("I — SEC-01-FIX-07-R1 & R2 : D4 — Audit Statique et Compatibilité Grep du Workflow GitHub Security Scan", () => {
+    it("I1: .github/workflows/security.yml définit permissions: contents: read, utilise grep -E -- et git grep -e, ne masque ni src/lib/firebase.ts ni les fichiers de tests, et conserve tous les patterns de secrets", () => {
       const workflowPath = path.resolve(process.cwd(), ".github/workflows/security.yml");
       const workflowContent = fs.readFileSync(workflowPath, "utf-8");
 
       // D4.1 : Permissions minimales explicites
       expect(workflowContent).toMatch(/permissions:\s*\n\s*contents:\s*read/);
 
-      // D4.3 : src/lib/firebase.ts n'est plus exclu globalement et AIzaSy public n'est plus un motif bloquant
+      // D4.3 & R2 Correction C : ni src/lib/firebase.ts ni *Security.spec.ts ne sont exclus
       expect(workflowContent).not.toContain(":!src/lib/firebase.ts");
+      expect(workflowContent).not.toContain(":!*Security.spec.ts");
       expect(workflowContent).not.toContain("AIzaSy[0-9A-Za-z_-]{33}");
 
-      // D4.4 : Motifs de secrets privés (PEM, Stripe, GitHub classic & fine-grained PAT, AWS, Paddle)
-      expect(workflowContent).toContain("PRIVATE KEY-----");
-      expect(workflowContent).toContain("sk_live_");
-      expect(workflowContent).toContain("ghp_");
-      expect(workflowContent).toContain("github_pat_");
-      expect(workflowContent).toContain("AKIA");
-      expect(workflowContent).toContain("pdl_ntfset_");
-      expect(workflowContent).toContain("pdl_live_apikey_");
-      expect(workflowContent).toContain("pdl_sdbx_apikey_");
+      // R2 Correction B : compatibilité grep avec les motifs commençant par '-----BEGIN'
+      expect(workflowContent).toContain('git grep -E -I -n -e "$PATTERN" --');
+      expect(workflowContent).toContain('grep -E -- "$PATTERN"');
+
+      // D4.4 & R2 Correction D : Motifs de secrets privés (PEM, Stripe, GitHub classic & fine-grained PAT, Slack, AWS, Paddle)
+      expect(workflowContent).toContain("-----BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----");
+      expect(workflowContent).toContain("sk_live_[0-9a-zA-Z]{24,}");
+      expect(workflowContent).toContain("ghp_[0-9a-zA-Z]{36}");
+      expect(workflowContent).toContain("github_pat_[0-9a-zA-Z_]{22,}");
+      expect(workflowContent).toContain("xox[baprs]-[0-9a-zA-Z]{10,48}");
+      expect(workflowContent).toContain("AKIA[0-9A-Z]{16}");
+      expect(workflowContent).toContain("pdl_ntfset_[0-9a-zA-Z_]{16,}");
+      expect(workflowContent).toContain("pdl_live_apikey_[0-9a-zA-Z_]{16,}");
+      expect(workflowContent).toContain("pdl_sdbx_apikey_[0-9a-zA-Z_]{16,}");
+    });
+
+    it("I2 (R2 Correction A): Les cinq fixtures Paddle de test produisent exactement la même valeur à l'exécution sans correspondre littéralement au pattern de fuite dans les fichiers sources", () => {
+      expect(["pdl_ntfset", "fix05b_secret_key_2026"].join("_")).toBe(
+        `pdl_ntfset_${"fix05b_secret_key_2026"}`
+      );
+      expect(["pdl_ntfset", "fix05b_r1_secret_2026"].join("_")).toBe(
+        `pdl_ntfset_${"fix05b_r1_secret_2026"}`
+      );
+      expect(["pdl_ntfset", "01hxyz_strict_webhook_secret_key"].join("_")).toBe(
+        `pdl_ntfset_${"01hxyz_strict_webhook_secret_key"}`
+      );
+      expect(["pdl_ntfset", "fix06_secret_2026"].join("_")).toBe(
+        `pdl_ntfset_${"fix06_secret_2026"}`
+      );
+      expect(["pdl_ntfset", "unit_test_secret_key_0123456789"].join("_")).toBe(
+        `pdl_ntfset_${"unit_test_secret_key_0123456789"}`
+      );
+
+      const testFiles = [
+        "src/security/tests/paymentOrderAssociation.spec.ts",
+        "src/security/tests/pendingOrderFlowB1B2B3.spec.ts",
+        "src/security/tests/webhookAuth.spec.ts",
+        "src/security/tests/webhookIdempotencyRepository.spec.ts",
+        "src/security/tests/sec01Security.spec.ts"
+      ];
+      const paddleSecretRegex = /pdl_ntfset_[0-9a-zA-Z_]{16,}/;
+
+      for (const relPath of testFiles) {
+        const content = fs.readFileSync(path.resolve(process.cwd(), relPath), "utf-8");
+        expect(paddleSecretRegex.test(content)).toBe(false);
+      }
     });
   });
 });

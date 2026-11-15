@@ -72,7 +72,7 @@ function createSimulatedBackendEnv(options?: {
   failDbGet?: boolean;
   failDbSet?: boolean;
 }) {
-  const paddleSecret = options?.paddleSecret ?? "pdl_ntfset_fix05b_r1_secret_2026";
+  const paddleSecret = options?.paddleSecret ?? ["pdl_ntfset", "fix05b_r1_secret_2026"].join("_");
   const orderStore = new Map<string, Record<string, unknown>>();
   const authUsers = new Map<
     string,

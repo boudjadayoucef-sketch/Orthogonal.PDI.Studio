@@ -43,9 +43,9 @@ jobs:
             "pdl_sdbx_apikey_[0-9a-zA-Z_]{16,}"
           )
           
-          # 1. Deterministic scan of current working tree (HEAD)
+          # 1. Deterministic scan of current working tree (HEAD), including all test files
           for PATTERN in "${PATTERNS[@]}"; do
-            MATCHES=$(git grep -E -I -n "$PATTERN" -- ':!*.example' ':!*Security.spec.ts' ':!dist/**' || true)
+            MATCHES=$(git grep -E -I -n -e "$PATTERN" -- ':!*.example' ':!dist/**' || true)
             if [ -n "$MATCHES" ]; then
               echo "::error::Potential secret leak detected in working tree matching pattern: $PATTERN"
               echo "$MATCHES"
@@ -65,10 +65,10 @@ jobs:
           
           if [ -n "$DIFF_RANGE" ]; then
             echo "Scanning commit diff range: $DIFF_RANGE"
-            ADDED_LINES=$(git diff "$DIFF_RANGE" -- ':!*.example' ':!*Security.spec.ts' ':!dist/**' | grep -E '^\+[^+]' || true)
+            ADDED_LINES=$(git diff "$DIFF_RANGE" -- ':!*.example' ':!dist/**' | grep -E -- '^\+[^+]' || true)
             if [ -n "$ADDED_LINES" ]; then
               for PATTERN in "${PATTERNS[@]}"; do
-                DIFF_MATCHES=$(printf "%s\n" "$ADDED_LINES" | grep -E "$PATTERN" || true)
+                DIFF_MATCHES=$(printf "%s\n" "$ADDED_LINES" | grep -E -- "$PATTERN" || true)
                 if [ -n "$DIFF_MATCHES" ]; then
                   echo "::error::Potential secret leak detected in commit diff ($DIFF_RANGE) matching pattern: $PATTERN"
                   LEAKS_FOUND=1

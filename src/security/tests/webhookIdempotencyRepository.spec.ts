@@ -287,7 +287,7 @@ function createTransactionalFirestoreBackingStore() {
     };
   }
 
-  function createServerInstance(paddleSecret = "pdl_ntfset_fix06_secret_2026") {
+  function createServerInstance(paddleSecret = ["pdl_ntfset", "fix06_secret_2026"].join("_")) {
     const adminDb = createAdminDbClient();
     const authUsers = new Map<string, { uid: string; email: string; disabled?: boolean }>();
 

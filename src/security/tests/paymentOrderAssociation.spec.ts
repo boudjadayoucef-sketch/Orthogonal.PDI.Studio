@@ -70,7 +70,7 @@ function createSimulatedOrderAssociationEnv(options?: {
   failDbGet?: boolean;
   failDbSet?: boolean;
 }) {
-  const paddleSecret = options?.paddleSecret ?? "pdl_ntfset_fix05b_secret_key_2026";
+  const paddleSecret = options?.paddleSecret ?? ["pdl_ntfset", "fix05b_secret_key_2026"].join("_");
   const slickPaySecret = options?.slickPaySecret ?? "slickpay_secret_fix05b_2026";
 
   const orderStore = new Map<string, Record<string, unknown>>();

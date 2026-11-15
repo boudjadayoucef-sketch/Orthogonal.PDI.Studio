@@ -186,7 +186,7 @@ function createSimulatedWebhookStack(options?: {
 }
 
 describe("SEC-01-FIX-05-A-R1 : Webhook Authentication Hardening & Modular Separation", () => {
-  const paddleSecret = "pdl_ntfset_01hxyz_strict_webhook_secret_key";
+  const paddleSecret = ["pdl_ntfset", "01hxyz_strict_webhook_secret_key"].join("_");
   const slickPaySecret = "slickpay_shared_secret_2026_dz";
 
   beforeEach(() => {
