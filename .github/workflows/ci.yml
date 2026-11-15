@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   validate:
     name: Validate Build, Lint & Tests
@@ -30,3 +33,29 @@ jobs:
 
       - name: Build production bundle
         run: npm run build
+
+  firestore-rules-emulator:
+    name: Firestore Security Rules Emulator
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js LTS
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Set up Java 21 for Firestore Emulator
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Install dependencies (npm ci)
+        run: npm ci
+
+      - name: Run Firestore Security Rules Emulator tests
+        run: npm run test:rules
