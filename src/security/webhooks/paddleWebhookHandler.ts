@@ -55,9 +55,10 @@ export function createPaddleWebhookHandler(deps: PaddleWebhookHandlerDeps) {
       return res.status(result.statusCode).json(result.body);
     } catch (err: any) {
       console.error("[Webhook Paddle Error]:", err?.message || err);
-      return res
-        .status(500)
-        .json({ error: err?.message || "Paddle webhook processing failed" });
+      return res.status(500).json({
+        error: "Internal webhook processing error",
+        code: "WEBHOOK_INTERNAL_ERROR"
+      });
     }
   };
 }

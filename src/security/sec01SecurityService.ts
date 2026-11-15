@@ -14,7 +14,8 @@
  */
 
 import crypto from "node:crypto";
-import type { Request, Response, NextFunction } from "express";
+import express from "express";
+import type { Request, Response, NextFunction, ErrorRequestHandler } from "express";
 
 // =========================================================================
 // 1. BOUNDED IN-MEMORY RATE LIMITER
@@ -491,6 +492,338 @@ export function isSuspiciousRequestPath(rawUrl: string | undefined | null): bool
 }
 
 // =========================================================================
+// 5.C CSP FRAME-ANCESTORS & STRICT ORIGIN VALIDATION (SEC-01-FIX-07-R1 D1)
+// =========================================================================
+
+/** Verified exact Google AI Studio parent frame origin (no wildcard *.google.com / *.run.app) */
+export const VERIFIED_AISTUDIO_FRAME_ANCESTOR = "https://aistudio.google.com" as const;
+
+export interface OriginValidationOptions {
+  /** Allow http://localhost and http://127.0.0.1 in non-production environments only */
+  allowLocalhostHttp?: boolean;
+}
+
+export interface OriginValidationResult {
+  isValid: boolean;
+  normalizedOrigin?: string;
+  error?: string;
+}
+
+/**
+ * Validates and normalizes a single origin entry (SEC-01-FIX-07-R1 D1.1 & D1.2).
+ * Rejects:
+ * - Wildcards (`*`, `https://*.google.com`, `https://*.run.app`, `https://*.googleusercontent.com`)
+ * - Control characters, semicolons (`;`), quotes, whitespace, or backslashes
+ * - Non-HTTPS origins (except `http://localhost` / `http://127.0.0.1` when `allowLocalhostHttp: true`)
+ * - Origins containing paths (including trailing `/`), query parameters (`?`), fragments (`#`), or credentials
+ */
+export function validateOriginEntry(
+  rawOrigin: unknown,
+  options: OriginValidationOptions = {}
+): OriginValidationResult {
+  if (typeof rawOrigin !== "string") {
+    return { isValid: false, error: "Origin must be a string" };
+  }
+
+  const trimmed = rawOrigin.trim();
+  if (trimmed.length === 0) {
+    return { isValid: false, error: "Origin cannot be empty" };
+  }
+
+  // Reject control characters, semicolons (CSP injection), spaces, quotes, backslashes
+  if (/[\x00-\x1f\x7f;'"\\\s]/.test(trimmed)) {
+    return {
+      isValid: false,
+      error: "Origin contains forbidden characters (control chars, semicolon, quotes, or whitespace)"
+    };
+  }
+
+  // Reject any wildcard '*' (global '*' or subdomain wildcard '*.domain')
+  if (trimmed.includes("*")) {
+    return {
+      isValid: false,
+      error: "Wildcard '*' is forbidden in validated origins"
+    };
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return { isValid: false, error: `Malformed origin URL: ${trimmed}` };
+  }
+
+  if (parsed.username || parsed.password) {
+    return { isValid: false, error: "Origin must not contain credentials" };
+  }
+
+  if (parsed.search !== "" || parsed.hash !== "" || trimmed.includes("?") || trimmed.includes("#")) {
+    return {
+      isValid: false,
+      error: "Origin must not contain query parameters or fragments"
+    };
+  }
+
+  if (parsed.pathname !== "/" || trimmed.endsWith("/")) {
+    return {
+      isValid: false,
+      error: "Origin must not contain a path or trailing slash"
+    };
+  }
+
+  const hostname = parsed.hostname.toLowerCase();
+  const isLocalhost = hostname === "localhost" || hostname === "127.0.0.1";
+
+  if (parsed.protocol === "https:") {
+    if (!isLocalhost && !/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(hostname)) {
+      return { isValid: false, error: `Invalid HTTPS hostname: ${hostname}` };
+    }
+  } else if (parsed.protocol === "http:") {
+    if (!options.allowLocalhostHttp || !isLocalhost) {
+      return {
+        isValid: false,
+        error: "Non-HTTPS origin is forbidden in production or for non-localhost hosts"
+      };
+    }
+  } else {
+    return {
+      isValid: false,
+      error: `Unsupported origin protocol: ${parsed.protocol}`
+    };
+  }
+
+  return {
+    isValid: true,
+    normalizedOrigin: parsed.origin.toLowerCase()
+  };
+}
+
+/**
+ * Validates `APP_URL` strictly as an HTTPS origin (SEC-01-FIX-07-R1 D1.1).
+ */
+export function validateAppUrl(rawAppUrl: string | undefined): OriginValidationResult {
+  if (rawAppUrl === undefined || rawAppUrl.trim() === "") {
+    return { isValid: true };
+  }
+  return validateOriginEntry(rawAppUrl, { allowLocalhostHttp: false });
+}
+
+export interface AllowedOriginsValidationResult {
+  isValid: boolean;
+  origins: string[];
+  invalidEntries: string[];
+  error?: string;
+}
+
+/**
+ * Validates and normalizes `ALLOWED_ORIGINS` while preserving legitimate base origins (SEC-01-FIX-07-R1 D1.2).
+ */
+export function validateAllowedOrigins(
+  rawAllowedOrigins: string | undefined,
+  options: { isProduction?: boolean; baseOrigins?: string[]; appUrl?: string } = {}
+): AllowedOriginsValidationResult {
+  const isProduction = options.isProduction === true;
+  const allowLocalhostHttp = !isProduction;
+  const invalidEntries: string[] = [];
+  const normalizedSet = new Set<string>();
+
+  const defaultBaseOrigins = options.baseOrigins ?? [
+    VERIFIED_AISTUDIO_FRAME_ANCESTOR,
+    "https://ais-dev-6etwlfzn4irzgw5ljyhzsh-76486687314.europe-west2.run.app",
+    "https://ais-pre-6etwlfzn4irzgw5ljyhzsh-76486687314.europe-west2.run.app",
+    ...(!isProduction ? ["http://localhost:3000", "http://127.0.0.1:3000"] : [])
+  ];
+
+  for (const base of defaultBaseOrigins) {
+    const res = validateOriginEntry(base, { allowLocalhostHttp });
+    if (res.isValid && res.normalizedOrigin) {
+      normalizedSet.add(res.normalizedOrigin);
+    }
+  }
+
+  if (options.appUrl !== undefined && options.appUrl.trim() !== "") {
+    const appUrlRes = validateAppUrl(options.appUrl);
+    if (appUrlRes.isValid && appUrlRes.normalizedOrigin) {
+      normalizedSet.add(appUrlRes.normalizedOrigin);
+    }
+  }
+
+  if (rawAllowedOrigins !== undefined && rawAllowedOrigins.trim() !== "") {
+    const entries = rawAllowedOrigins.split(",").map((s) => s.trim());
+    for (const entry of entries) {
+      if (!entry) {
+        invalidEntries.push(entry);
+        continue;
+      }
+      const check = validateOriginEntry(entry, { allowLocalhostHttp });
+      if (!check.isValid || !check.normalizedOrigin) {
+        invalidEntries.push(entry);
+      } else {
+        normalizedSet.add(check.normalizedOrigin);
+      }
+    }
+  }
+
+  if (invalidEntries.length > 0) {
+    return {
+      isValid: false,
+      origins: Array.from(normalizedSet),
+      invalidEntries,
+      error: `Invalid ALLOWED_ORIGINS entries rejected: ${invalidEntries.join(", ")}`
+    };
+  }
+
+  return {
+    isValid: true,
+    origins: Array.from(normalizedSet),
+    invalidEntries: []
+  };
+}
+
+export interface CspFrameAncestorsResolution {
+  isValid: boolean;
+  /** Space-separated list of validated frame-ancestors sources (e.g. `'self' https://aistudio.google.com`) */
+  value: string;
+  /** Full directive `frame-ancestors <value>` */
+  directive: string;
+  ancestors: string[];
+  error?: string;
+}
+
+/**
+ * Pure, modular, testable resolver for the CSP `frame-ancestors` policy (SEC-01-FIX-07-R1 D1.1).
+ *
+ * Guarantees:
+ * - `'self'` and the verified Google AI Studio origin (`https://aistudio.google.com`) are included.
+ * - `APP_URL`, when provided, is validated strictly as an HTTPS origin before inclusion.
+ * - `CSP_FRAME_ANCESTORS` is strictly validated token-by-token before any header construction.
+ * - Rejects `;` (CSP directive injection), control characters, malformed origins, and general wildcards (`*.google.com`, `*.run.app`, etc.).
+ * - Forbids `*` in production (`NODE_ENV === "production"`).
+ * - Never concatenates unvalidated environment strings into the CSP header; falls closed to `'self' https://aistudio.google.com` on error.
+ */
+export function resolveCspFrameAncestors(
+  env: Record<string, string | undefined> = process.env
+): CspFrameAncestorsResolution {
+  const isProd = env.NODE_ENV === "production";
+  const failClosedAncestors = ["'self'", VERIFIED_AISTUDIO_FRAME_ANCESTOR];
+  const failClosedValue = failClosedAncestors.join(" ");
+
+  const ancestorsSet = new Set<string>(failClosedAncestors);
+
+  // 1. Validate APP_URL if provided
+  if (env.APP_URL !== undefined && env.APP_URL.trim() !== "") {
+    const appUrlCheck = validateAppUrl(env.APP_URL);
+    if (!appUrlCheck.isValid || !appUrlCheck.normalizedOrigin) {
+      return {
+        isValid: false,
+        value: failClosedValue,
+        directive: `frame-ancestors ${failClosedValue}`,
+        ancestors: failClosedAncestors,
+        error: `Invalid APP_URL for CSP frame-ancestors: ${appUrlCheck.error}`
+      };
+    }
+    ancestorsSet.add(appUrlCheck.normalizedOrigin);
+  }
+
+  const rawCspAncestors = env.CSP_FRAME_ANCESTORS;
+
+  // 2. If CSP_FRAME_ANCESTORS is not configured, use safe environment defaults
+  if (rawCspAncestors === undefined || rawCspAncestors.trim() === "") {
+    if (!isProd) {
+      ancestorsSet.add("http://localhost:3000");
+      ancestorsSet.add("http://127.0.0.1:3000");
+    }
+    const ancestors = Array.from(ancestorsSet);
+    const value = ancestors.join(" ");
+    return {
+      isValid: true,
+      value,
+      directive: `frame-ancestors ${value}`,
+      ancestors
+    };
+  }
+
+  // 3. Reject control characters and semicolon directive injection immediately
+  if (/[\x00-\x1f\x7f;]/.test(rawCspAncestors)) {
+    return {
+      isValid: false,
+      value: failClosedValue,
+      directive: `frame-ancestors ${failClosedValue}`,
+      ancestors: failClosedAncestors,
+      error: "CSP_FRAME_ANCESTORS contains forbidden control characters or directive separator ';'"
+    };
+  }
+
+  const tokens = rawCspAncestors
+    .split(/[\s,]+/)
+    .map((t) => t.trim())
+    .filter(Boolean);
+
+  if (tokens.length === 0) {
+    return {
+      isValid: false,
+      value: failClosedValue,
+      directive: `frame-ancestors ${failClosedValue}`,
+      ancestors: failClosedAncestors,
+      error: "CSP_FRAME_ANCESTORS cannot be whitespace-only"
+    };
+  }
+
+  for (const token of tokens) {
+    if (token === "'self'" || token === "self") {
+      ancestorsSet.add("'self'");
+      continue;
+    }
+
+    if (token === "*") {
+      if (isProd) {
+        return {
+          isValid: false,
+          value: failClosedValue,
+          directive: `frame-ancestors ${failClosedValue}`,
+          ancestors: failClosedAncestors,
+          error: "Wildcard '*' is strictly forbidden in CSP_FRAME_ANCESTORS in production"
+        };
+      }
+      ancestorsSet.add("*");
+      continue;
+    }
+
+    if (token.includes("*")) {
+      return {
+        isValid: false,
+        value: failClosedValue,
+        directive: `frame-ancestors ${failClosedValue}`,
+        ancestors: failClosedAncestors,
+        error: `Wildcard origin '${token}' is forbidden in CSP_FRAME_ANCESTORS`
+      };
+    }
+
+    const originCheck = validateOriginEntry(token, { allowLocalhostHttp: !isProd });
+    if (!originCheck.isValid || !originCheck.normalizedOrigin) {
+      return {
+        isValid: false,
+        value: failClosedValue,
+        directive: `frame-ancestors ${failClosedValue}`,
+        ancestors: failClosedAncestors,
+        error: `Invalid origin '${token}' in CSP_FRAME_ANCESTORS: ${originCheck.error}`
+      };
+    }
+
+    ancestorsSet.add(originCheck.normalizedOrigin);
+  }
+
+  const ancestors = Array.from(ancestorsSet);
+  const value = ancestors.join(" ");
+  return {
+    isValid: true,
+    value,
+    directive: `frame-ancestors ${value}`,
+    ancestors
+  };
+}
+
+// =========================================================================
 // 6. SAFE PRODUCTION CONFIGURATION VALIDATION
 // =========================================================================
 
@@ -498,6 +831,7 @@ export interface ConfigValidationResult {
   isSafe: boolean;
   missingCriticalKeys: string[];
   forbiddenViteSecretKeys: string[];
+  invalidConfigKeys?: string[];
   errorMessage?: string;
 }
 
@@ -506,6 +840,7 @@ export interface ConfigValidationResult {
  * Enforces:
  * - No server secrets prefixed with VITE_ (must be server-only)
  * - Required production environment variables present
+ * - Strict validation of APP_URL, ALLOWED_ORIGINS, and CSP_FRAME_ANCESTORS (SEC-01-FIX-07-R1 D1)
  * - Safe errors that never print secret values
  */
 export function verifyProductionConfig(
@@ -514,6 +849,7 @@ export function verifyProductionConfig(
   const isProduction = env.NODE_ENV === "production";
   const missingCriticalKeys: string[] = [];
   const forbiddenViteSecretKeys: string[] = [];
+  const invalidConfigKeys: string[] = [];
 
   // Check for accidentally leaked server secrets using VITE_ prefix
   const sensitiveSecretNames = [
@@ -548,7 +884,33 @@ export function verifyProductionConfig(
     }
   }
 
-  const isSafe = missingCriticalKeys.length === 0 && forbiddenViteSecretKeys.length === 0;
+  // SEC-01-FIX-07-R1 (D1.1 & D1.2): Validate APP_URL, ALLOWED_ORIGINS, and CSP_FRAME_ANCESTORS
+  if (env.APP_URL !== undefined && env.APP_URL.trim() !== "") {
+    const appUrlCheck = validateAppUrl(env.APP_URL);
+    if (!appUrlCheck.isValid) {
+      invalidConfigKeys.push(`APP_URL (${appUrlCheck.error})`);
+    }
+  }
+
+  if (env.ALLOWED_ORIGINS !== undefined && env.ALLOWED_ORIGINS.trim() !== "") {
+    const originsCheck = validateAllowedOrigins(env.ALLOWED_ORIGINS, {
+      isProduction,
+      appUrl: env.APP_URL
+    });
+    if (!originsCheck.isValid) {
+      invalidConfigKeys.push(`ALLOWED_ORIGINS (${originsCheck.error})`);
+    }
+  }
+
+  const cspCheck = resolveCspFrameAncestors(env);
+  if (!cspCheck.isValid) {
+    invalidConfigKeys.push(`CSP_FRAME_ANCESTORS (${cspCheck.error})`);
+  }
+
+  const isSafe =
+    missingCriticalKeys.length === 0 &&
+    forbiddenViteSecretKeys.length === 0 &&
+    invalidConfigKeys.length === 0;
   let errorMessage: string | undefined;
 
   if (!isSafe) {
@@ -561,6 +923,9 @@ export function verifyProductionConfig(
         `Server secrets MUST NOT use VITE_ prefix (exposed to client bundle): ${forbiddenViteSecretKeys.join(", ")}`
       );
     }
+    if (invalidConfigKeys.length > 0) {
+      issues.push(`Invalid security configuration: ${invalidConfigKeys.join("; ")}`);
+    }
     errorMessage = `[FATAL] Server startup configuration failure: ${issues.join("; ")}`;
   }
 
@@ -568,7 +933,107 @@ export function verifyProductionConfig(
     isSafe,
     missingCriticalKeys,
     forbiddenViteSecretKeys,
+    invalidConfigKeys,
     errorMessage
+  };
+}
+
+// =========================================================================
+// 6.B HTTP BODY LIMITS, SELECTIVE RAWBODY & GLOBAL ERROR MASKING (SEC-01-FIX-07-R1 D2 & D3)
+// =========================================================================
+
+export const HTTP_BODY_LIMIT = "256kb" as const;
+export const URLENCODED_PARAMETER_LIMIT = 100 as const;
+
+/**
+ * Isolated JSON parser for `POST /api/webhooks/paddle` ONLY (SEC-01-FIX-07-R1 D2.2).
+ * Captures the exact raw UTF-8 request body into `req.rawBody` for HMAC-SHA256 verification
+ * while enforcing the strict 256kb payload ceiling.
+ */
+export function createPaddleWebhookBodyParser() {
+  return express.json({
+    limit: HTTP_BODY_LIMIT,
+    verify: (req: any, _res, buf) => {
+      req.rawBody = buf.toString("utf8");
+    }
+  });
+}
+
+/**
+ * Standard JSON body parser with strict 256kb limit and NO `rawBody` allocation (SEC-01-FIX-07-R1 D2.1).
+ * Skips `/api/webhooks/paddle` so that only `createPaddleWebhookBodyParser` parses and captures `rawBody` there.
+ */
+export function createStandardJsonParser() {
+  const jsonParser = express.json({
+    limit: HTTP_BODY_LIMIT
+  });
+
+  return (req: Request, res: Response, next: NextFunction) => {
+    const cleanPath = (req.originalUrl || req.url || req.path || "").split("?")[0];
+    if (cleanPath === "/api/webhooks/paddle") {
+      return next();
+    }
+    return jsonParser(req, res, next);
+  };
+}
+
+/**
+ * Standard URL-encoded body parser with strict 256kb limit, `extended: false`, and `parameterLimit: 100` (SEC-01-FIX-07-R1 D2.1).
+ */
+export function createStandardUrlencodedParser() {
+  return express.urlencoded({
+    limit: HTTP_BODY_LIMIT,
+    extended: false,
+    parameterLimit: URLENCODED_PARAMETER_LIMIT
+  });
+}
+
+/**
+ * Global Express error-handling middleware (SEC-01-FIX-07-R1 D2.4 & D3).
+ *
+ * Enforces:
+ * - `entity.too.large` / HTTP 413 -> HTTP 413 generic JSON (`PAYLOAD_TOO_LARGE`)
+ * - Malformed JSON / `entity.parse.failed` / `parameters.too.many` / HTTP 400 -> HTTP 400 generic JSON (`MALFORMED_PAYLOAD`)
+ * - Any other unhandled error -> HTTP 500 generic JSON (`INTERNAL_SERVER_ERROR`)
+ * - Never leaks `err.message`, `err.stack`, filesystem paths, or internal parser details to the client.
+ */
+export function createGlobalExpressErrorHandler(): ErrorRequestHandler {
+  return (err: any, _req: Request, res: Response, next: NextFunction) => {
+    if (res.headersSent) {
+      return next(err);
+    }
+
+    const status = Number(err?.status || err?.statusCode || 500);
+    const errorType = typeof err?.type === "string" ? err.type : "";
+
+    if (errorType === "entity.too.large" || status === 413) {
+      console.warn("[HTTP 413] Request payload exceeded maximum allowed size (256kb).");
+      return res.status(413).json({
+        error: "Payload too large",
+        code: "PAYLOAD_TOO_LARGE"
+      });
+    }
+
+    if (
+      errorType === "entity.parse.failed" ||
+      errorType === "parameters.too.many" ||
+      errorType === "charset.unsupported" ||
+      errorType === "encoding.unsupported" ||
+      (err instanceof SyntaxError && status === 400) ||
+      status === 400
+    ) {
+      console.warn("[HTTP 400] Malformed request body rejected.");
+      return res.status(400).json({
+        error: "Malformed request payload",
+        code: "MALFORMED_PAYLOAD"
+      });
+    }
+
+    console.error("[HTTP 500] Unhandled internal server error:", err?.code || errorType || "InternalError");
+    return res.status(500).json({
+      error: "Internal server error",
+      code: "INTERNAL_SERVER_ERROR"
+    });
   };
 }
 

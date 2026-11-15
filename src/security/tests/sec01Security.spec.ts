@@ -16,6 +16,8 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import express from "express";
+import type { Server } from "node:http";
 import {
   requireRole,
   requireSuperAdmin,
@@ -33,8 +35,19 @@ import {
   validateRedirectUrl,
   verifyProductionConfig,
   SafeUnconfiguredEmailProvider,
-  isSuspiciousRequestPath
+  isSuspiciousRequestPath,
+  validateOriginEntry,
+  validateAppUrl,
+  validateAllowedOrigins,
+  resolveCspFrameAncestors,
+  VERIFIED_AISTUDIO_FRAME_ANCESTOR,
+  createPaddleWebhookBodyParser,
+  createStandardJsonParser,
+  createStandardUrlencodedParser,
+  createGlobalExpressErrorHandler
 } from "../sec01SecurityService.ts";
+import { createPaddleWebhookHandler } from "../webhooks/paddleWebhookHandler.ts";
+import { createSlickPayWebhookHandler } from "../webhooks/slickPayWebhookHandler.ts";
 
 describe("SEC-01-FIX-01 : Sécurité Atomique Frontend / Serveur / Auth / Webhook", () => {
   // =========================================================================
@@ -665,6 +678,509 @@ describe("SEC-01-FIX-01 : Sécurité Atomique Frontend / Serveur / Auth / Webhoo
 
     it("E6: Décodage malformé rejeté en toute sécurité", () => {
       expect(isSuspiciousRequestPath("/%E0%A4%A")).toBe(true);
+    });
+  });
+
+  // =========================================================================
+  // 8. SEC-01-FIX-07-R1 — SERVER HARDENING (D1: CSP & ORIGINES, D2: BODY LIMITS & RAWBODY, D3: ERROR MASKING, D4: SECURITY SCAN)
+  // =========================================================================
+  describe("G — SEC-01-FIX-07-R1 : D1 — CSP frame-ancestors & Validation Stricte des Origines", () => {
+    it("G1 (CSP Prod): Production refuse '*' dans CSP_FRAME_ANCESTORS et échoue explicitement dans verifyProductionConfig", () => {
+      const env = {
+        NODE_ENV: "production",
+        FIREBASE_PROJECT_ID: "orthogonal-pdi-prod-01",
+        CSP_FRAME_ANCESTORS: "*"
+      };
+
+      const cspRes = resolveCspFrameAncestors(env);
+      expect(cspRes.isValid).toBe(false);
+      expect(cspRes.error).toContain("Wildcard '*' is strictly forbidden");
+      // Fail-closed: ne contient jamais '*' dans la directive émise
+      expect(cspRes.value).not.toContain("*");
+      expect(cspRes.ancestors).toEqual(["'self'", VERIFIED_AISTUDIO_FRAME_ANCESTOR]);
+
+      const configRes = verifyProductionConfig(env);
+      expect(configRes.isSafe).toBe(false);
+      expect(configRes.errorMessage).toContain("CSP_FRAME_ANCESTORS");
+    });
+
+    it("G2 (CSP Prod): Production refuse toute injection de directive contenant ';'", () => {
+      const env = {
+        NODE_ENV: "production",
+        FIREBASE_PROJECT_ID: "orthogonal-pdi-prod-01",
+        CSP_FRAME_ANCESTORS: "'self'; script-src 'unsafe-inline' https://evil.example.com"
+      };
+
+      const cspRes = resolveCspFrameAncestors(env);
+      expect(cspRes.isValid).toBe(false);
+      expect(cspRes.error).toContain("';'");
+      expect(cspRes.directive).toBe(`frame-ancestors 'self' ${VERIFIED_AISTUDIO_FRAME_ANCESTOR}`);
+      expect(cspRes.directive).not.toContain("evil.example.com");
+
+      const configRes = verifyProductionConfig(env);
+      expect(configRes.isSafe).toBe(false);
+    });
+
+    it("G3 (CSP Prod): Production refuse les origines malformées, non-HTTPS, avec chemins ou wildcards partiels (*.google.com, *.run.app)", () => {
+      const invalidCases = [
+        "http://insecure-origin.example.com",
+        "https://*.google.com",
+        "https://*.googleusercontent.com",
+        "https://*.run.app",
+        "https://valid.example.com/with/path",
+        "https://valid.example.com?query=1",
+        "https://valid.example.com#hash",
+        "not-a-valid-url",
+        "javascript:alert(1)"
+      ];
+
+      for (const badAncestor of invalidCases) {
+        const res = resolveCspFrameAncestors({
+          NODE_ENV: "production",
+          CSP_FRAME_ANCESTORS: badAncestor
+        });
+        expect(res.isValid).toBe(false);
+        expect(res.value).toBe(`'self' ${VERIFIED_AISTUDIO_FRAME_ANCESTOR}`);
+      }
+    });
+
+    it("G4 (CSP Prod): Production accepte les origines HTTPS explicitement autorisées et APP_URL valide", () => {
+      const env = {
+        NODE_ENV: "production",
+        FIREBASE_PROJECT_ID: "orthogonal-pdi-prod-01",
+        APP_URL: "https://studio.orthogonal-pdi.dz",
+        CSP_FRAME_ANCESTORS: "'self' https://portal.orthogonal-pdi.dz https://aistudio.google.com"
+      };
+
+      const cspRes = resolveCspFrameAncestors(env);
+      expect(cspRes.isValid).toBe(true);
+      expect(cspRes.ancestors).toContain("'self'");
+      expect(cspRes.ancestors).toContain("https://aistudio.google.com");
+      expect(cspRes.ancestors).toContain("https://studio.orthogonal-pdi.dz");
+      expect(cspRes.ancestors).toContain("https://portal.orthogonal-pdi.dz");
+      expect(cspRes.value).not.toContain("*");
+
+      const configRes = verifyProductionConfig(env);
+      expect(configRes.isSafe).toBe(true);
+    });
+
+    it("G5 (CSP Dev): Développement conserve le comportement prévu (localhost autorisé, tout en bloquant les injections ';')", () => {
+      const defaultDev = resolveCspFrameAncestors({ NODE_ENV: "development" });
+      expect(defaultDev.isValid).toBe(true);
+      expect(defaultDev.ancestors).toContain("'self'");
+      expect(defaultDev.ancestors).toContain("https://aistudio.google.com");
+      expect(defaultDev.ancestors).toContain("http://localhost:3000");
+      expect(defaultDev.ancestors).toContain("http://127.0.0.1:3000");
+
+      const wildcardDev = resolveCspFrameAncestors({
+        NODE_ENV: "development",
+        CSP_FRAME_ANCESTORS: "*"
+      });
+      expect(wildcardDev.isValid).toBe(true);
+      expect(wildcardDev.ancestors).toContain("*");
+
+      const injectedDev = resolveCspFrameAncestors({
+        NODE_ENV: "development",
+        CSP_FRAME_ANCESTORS: "*; object-src *"
+      });
+      expect(injectedDev.isValid).toBe(false);
+    });
+
+    it("G6 (APP_URL): APP_URL invalide (HTTP, chemin, wildcard, malformée) est rejeté", () => {
+      expect(validateAppUrl("https://app.orthogonal-pdi.dz").isValid).toBe(true);
+      expect(validateAppUrl("http://app.orthogonal-pdi.dz").isValid).toBe(false);
+      expect(validateAppUrl("https://app.orthogonal-pdi.dz/subpath").isValid).toBe(false);
+      expect(validateAppUrl("https://app.orthogonal-pdi.dz/").isValid).toBe(false);
+      expect(validateAppUrl("https://*.run.app").isValid).toBe(false);
+      expect(validateAppUrl("malformed_url").isValid).toBe(false);
+
+      const badProdAppUrl = verifyProductionConfig({
+        NODE_ENV: "production",
+        FIREBASE_PROJECT_ID: "orthogonal-pdi-prod-01",
+        APP_URL: "http://insecure.orthogonal-pdi.dz"
+      });
+      expect(badProdAppUrl.isSafe).toBe(false);
+      expect(badProdAppUrl.errorMessage).toContain("APP_URL");
+    });
+
+    it("G7 (ALLOWED_ORIGINS): ALLOWED_ORIGINS invalide ('*', HTTP en prod, chemins, fragments, malformé) est rejeté et les origines valides sont normalisées", () => {
+      const badWildcard = validateAllowedOrigins("*", { isProduction: true });
+      expect(badWildcard.isValid).toBe(false);
+      expect(badWildcard.invalidEntries).toContain("*");
+
+      const badHttpInProd = validateAllowedOrigins("http://localhost:3000", { isProduction: true });
+      expect(badHttpInProd.isValid).toBe(false);
+
+      const badPathOrigin = validateAllowedOrigins("https://orthogonal-pdi.dz/login", { isProduction: true });
+      expect(badPathOrigin.isValid).toBe(false);
+
+      const badQueryOrigin = validateAllowedOrigins("https://orthogonal-pdi.dz?redirect=1", { isProduction: true });
+      expect(badQueryOrigin.isValid).toBe(false);
+
+      const badFragmentOrigin = validateAllowedOrigins("https://orthogonal-pdi.dz#top", { isProduction: true });
+      expect(badFragmentOrigin.isValid).toBe(false);
+
+      const validProdOrigins = validateAllowedOrigins(
+        "HTTPS://ORTHOGONAL-PDI.DZ, https://console.orthogonal-pdi.dz",
+        { isProduction: true, appUrl: "https://app.orthogonal-pdi.dz" }
+      );
+      expect(validProdOrigins.isValid).toBe(true);
+      expect(validProdOrigins.origins).toContain("https://orthogonal-pdi.dz");
+      expect(validProdOrigins.origins).toContain("https://console.orthogonal-pdi.dz");
+      expect(validProdOrigins.origins).toContain("https://app.orthogonal-pdi.dz");
+      expect(validProdOrigins.origins).toContain("https://aistudio.google.com");
+
+      const prodConfigWithInvalidOrigins = verifyProductionConfig({
+        NODE_ENV: "production",
+        FIREBASE_PROJECT_ID: "orthogonal-pdi-prod-01",
+        ALLOWED_ORIGINS: "https://orthogonal-pdi.dz, *"
+      });
+      expect(prodConfigWithInvalidOrigins.isSafe).toBe(false);
+      expect(prodConfigWithInvalidOrigins.errorMessage).toContain("ALLOWED_ORIGINS");
+    });
+  });
+
+  describe("H — SEC-01-FIX-07-R1 : D2 & D3 — HTTP Body Limits (256kb), Isolation rawBody Paddle & Masquage des Erreurs", () => {
+    const testWebhookSecret = "pdl_ntfset_unit_test_secret_key_0123456789";
+
+    async function withTestServer(
+      configureApp: (app: express.Express) => void,
+      runTest: (baseUrl: string) => Promise<void>
+    ) {
+      const app = express();
+      app.use(createStandardJsonParser());
+      app.use(createStandardUrlencodedParser());
+      configureApp(app);
+      app.use(createGlobalExpressErrorHandler());
+
+      const server: Server = await new Promise((resolve) => {
+        const s = app.listen(0, "127.0.0.1", () => resolve(s));
+      });
+      const address = server.address() as { port: number };
+      const baseUrl = `http://127.0.0.1:${address.port}`;
+
+      try {
+        await runTest(baseUrl);
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    }
+
+    it("H1 (HTTP Body Limits): JSON supérieur à 256kb -> HTTP 413 générique sans détail interne", async () => {
+      await withTestServer(
+        (app) => {
+          app.post("/api/test-json", (req, res) => {
+            res.status(200).json({ ok: true, size: JSON.stringify(req.body).length });
+          });
+        },
+        async (baseUrl) => {
+          const oversizedPayload = JSON.stringify({ data: "A".repeat(300 * 1024) });
+          const res = await fetch(`${baseUrl}/api/test-json`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: oversizedPayload
+          });
+          expect(res.status).toBe(413);
+          const body = await res.json();
+          expect(body).toEqual({
+            error: "Payload too large",
+            code: "PAYLOAD_TOO_LARGE"
+          });
+        }
+      );
+    });
+
+    it("H2 (HTTP Body Limits): URL-encoded supérieur à 256kb -> HTTP 413 générique", async () => {
+      await withTestServer(
+        (app) => {
+          app.post("/api/test-form", (_req, res) => {
+            res.status(200).json({ ok: true });
+          });
+        },
+        async (baseUrl) => {
+          const oversizedForm = `field=${"B".repeat(300 * 1024)}`;
+          const res = await fetch(`${baseUrl}/api/test-form`, {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: oversizedForm
+          });
+          expect(res.status).toBe(413);
+          const body = await res.json();
+          expect(body).toEqual({
+            error: "Payload too large",
+            code: "PAYLOAD_TOO_LARGE"
+          });
+        }
+      );
+    });
+
+    it("H3 (HTTP Body Limits & Parsing): JSON malformé -> HTTP 400 générique sans stack ni détail du parser", async () => {
+      await withTestServer(
+        (app) => {
+          app.post("/api/test-json", (_req, res) => {
+            res.status(200).json({ ok: true });
+          });
+        },
+        async (baseUrl) => {
+          const res = await fetch(`${baseUrl}/api/test-json`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: '{"unterminated_json": "SECRET_PARSER_DETAIL'
+          });
+          expect(res.status).toBe(400);
+          const text = await res.text();
+          expect(text).not.toContain("SyntaxError");
+          expect(text).not.toContain("SECRET_PARSER_DETAIL");
+          expect(JSON.parse(text)).toEqual({
+            error: "Malformed request payload",
+            code: "MALFORMED_PAYLOAD"
+          });
+        }
+      );
+    });
+
+    it("H4 (Global Error Handler): Erreur interne synchrone contenant SECRET_DB_URI_LEAK -> HTTP 500 générique masqué", async () => {
+      await withTestServer(
+        (app) => {
+          app.get("/api/test-crash", () => {
+            throw new Error("Database connection failed: postgres://admin:SECRET_DB_URI_LEAK@10.0.0.5:5432/pdi");
+          });
+        },
+        async (baseUrl) => {
+          const res = await fetch(`${baseUrl}/api/test-crash`);
+          expect(res.status).toBe(500);
+          const text = await res.text();
+          expect(text).not.toContain("SECRET_DB_URI_LEAK");
+          expect(text).not.toContain("postgres://");
+          expect(JSON.parse(text)).toEqual({
+            error: "Internal server error",
+            code: "INTERNAL_SERVER_ERROR"
+          });
+        }
+      );
+    });
+
+    it("H5 (Paddle rawBody & Limits): Corps brut conservé exactement sur /api/webhooks/paddle, absent sur les autres routes, HMAC valide accepté, HMAC invalide rejeté, payload > 256kb rejeté avant traitement", async () => {
+      let standardRouteRawBody: unknown = "NOT_CHECKED";
+      const processedEvents: unknown[] = [];
+
+      const mockProcessor = {
+        processVerifiedPaddleEvent: vi.fn(async (payload: unknown) => {
+          processedEvents.push(payload);
+          return {
+            statusCode: 200,
+            body: {
+              received: true,
+              status: "associated",
+              code: "ORDER_ASSOCIATED"
+            }
+          };
+        })
+      };
+
+      await withTestServer(
+        (app) => {
+          app.post("/api/standard-route", (req: any, res) => {
+            standardRouteRawBody = req.rawBody;
+            res.status(200).json({ ok: true, hasRawBody: Boolean(req.rawBody) });
+          });
+
+          app.post(
+            "/api/webhooks/paddle",
+            createPaddleWebhookBodyParser(),
+            createPaddleWebhookHandler({
+              processor: mockProcessor as any,
+              getPaddleSecret: () => testWebhookSecret
+            })
+          );
+        },
+        async (baseUrl) => {
+          // 1. Route standard : req.rawBody NE DOIT PAS être capturé
+          const stdRes = await fetch(`${baseUrl}/api/standard-route`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ hello: "world" })
+          });
+          expect(stdRes.status).toBe(200);
+          expect(standardRouteRawBody).toBeUndefined();
+
+          // 2. Webhook Paddle avec formatage JSON spécifique (espaces et retours ligne) :
+          //    prouve que les octets bruts exacts sont préservés pour la vérification HMAC
+          const rawBodyWithWhitespace =
+            '{\n  "event_id":  "evt_raw_001" ,\n  "event_type": "transaction.completed",\n  "data": { "id": "txn_01" }\n}';
+          const ts = Math.floor(Date.now() / 1000).toString();
+          const validH1 = crypto
+            .createHmac("sha256", testWebhookSecret)
+            .update(`${ts}:${rawBodyWithWhitespace}`, "utf8")
+            .digest("hex");
+
+          const validRes = await fetch(`${baseUrl}/api/webhooks/paddle`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Paddle-Signature": `ts=${ts};h1=${validH1}`
+            },
+            body: rawBodyWithWhitespace
+          });
+          expect(validRes.status).toBe(200);
+          expect(mockProcessor.processVerifiedPaddleEvent).toHaveBeenCalledTimes(1);
+
+          // 3. Webhook Paddle avec HMAC invalide -> rejeté 401 sans appeler le processeur
+          const invalidH1 = validH1.startsWith("a") ? `b${validH1.slice(1)}` : `a${validH1.slice(1)}`;
+          const invalidRes = await fetch(`${baseUrl}/api/webhooks/paddle`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Paddle-Signature": `ts=${ts};h1=${invalidH1}`
+            },
+            body: rawBodyWithWhitespace
+          });
+          expect(invalidRes.status).toBe(401);
+          expect(mockProcessor.processVerifiedPaddleEvent).toHaveBeenCalledTimes(1);
+
+          // 4. Webhook Paddle surdimensionné (> 256kb) -> rejeté HTTP 413 avant le handler Paddle
+          const hugeBody = JSON.stringify({
+            event_id: "evt_huge_001",
+            padding: "X".repeat(280 * 1024)
+          });
+          const hugeH1 = crypto
+            .createHmac("sha256", testWebhookSecret)
+            .update(`${ts}:${hugeBody}`, "utf8")
+            .digest("hex");
+
+          const hugeRes = await fetch(`${baseUrl}/api/webhooks/paddle`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Paddle-Signature": `ts=${ts};h1=${hugeH1}`
+            },
+            body: hugeBody
+          });
+          expect(hugeRes.status).toBe(413);
+          expect(mockProcessor.processVerifiedPaddleEvent).toHaveBeenCalledTimes(1);
+        }
+      );
+    });
+
+    it("H6 (Error Masking Webhooks): Simulation d'une exception contenant SECRET_DB_URI_LEAK dans Paddle et Slick-Pay -> HTTP 500 générique sans fuite de SECRET_DB_URI_LEAK", async () => {
+      const rawBody = JSON.stringify({
+        event_id: "evt_crash_500",
+        event_type: "transaction.completed"
+      });
+      const ts = Math.floor(Date.now() / 1000).toString();
+      const validH1 = crypto
+        .createHmac("sha256", testWebhookSecret)
+        .update(`${ts}:${rawBody}`, "utf8")
+        .digest("hex");
+
+      const crashingPaddleProcessor = {
+        processVerifiedPaddleEvent: vi.fn(async () => {
+          throw new Error("Firestore fatal failure: SECRET_DB_URI_LEAK at /app/applet/server.ts");
+        })
+      };
+
+      const paddleHandler = createPaddleWebhookHandler({
+        processor: crashingPaddleProcessor as any,
+        getPaddleSecret: () => testWebhookSecret
+      });
+
+      let paddleStatus = 200;
+      let paddleJson: any = null;
+      await paddleHandler(
+        {
+          rawBody,
+          body: JSON.parse(rawBody),
+          headers: { "paddle-signature": `ts=${ts};h1=${validH1}` }
+        } as any,
+        {
+          status: (code: number) => {
+            paddleStatus = code;
+            return {
+              json: (payload: any) => {
+                paddleJson = payload;
+              }
+            };
+          }
+        } as any
+      );
+
+      expect(paddleStatus).toBe(500);
+      expect(JSON.stringify(paddleJson)).not.toContain("SECRET_DB_URI_LEAK");
+      expect(paddleJson).toEqual({
+        error: "Internal webhook processing error",
+        code: "WEBHOOK_INTERNAL_ERROR"
+      });
+
+      // Slick-Pay handler throwing an unexpected exception with SECRET_DB_URI_LEAK
+      const slickPayHandler = createSlickPayWebhookHandler({
+        getSlickPaySecret: () => {
+          throw new Error("SlickPay config read crash: SECRET_DB_URI_LEAK");
+        }
+      });
+
+      let slickStatus = 200;
+      let slickJson: any = null;
+      await slickPayHandler(
+        { body: {}, headers: {} } as any,
+        {
+          status: (code: number) => {
+            slickStatus = code;
+            return {
+              json: (payload: any) => {
+                slickJson = payload;
+              }
+            };
+          }
+        } as any
+      );
+
+      expect(slickStatus).toBe(500);
+      expect(JSON.stringify(slickJson)).not.toContain("SECRET_DB_URI_LEAK");
+      expect(slickJson).toEqual({
+        error: "Internal webhook processing error",
+        code: "WEBHOOK_INTERNAL_ERROR"
+      });
+    });
+
+    it("H7 (Server Error & 404 Masking): Vérification de server.ts — absence de fuite err.message / String(err) / req.path dans les réponses HTTP publiques", () => {
+      const serverPath = path.resolve(process.cwd(), "server.ts");
+      const serverContent = fs.readFileSync(serverPath, "utf-8");
+
+      // Plus aucune limite 50mb dans server.ts
+      expect(serverContent).not.toContain('limit: "50mb"');
+      expect(serverContent).not.toContain("limit: '50mb'");
+
+      // Masquage des erreurs sur /api/admin/set-user-role, /api/health/assets, /api/style/main.css et 404
+      expect(serverContent).toContain('code: "ADMIN_ROLE_UPDATE_FAILED"');
+      expect(serverContent).toContain('error: "Internal asset health check error"');
+      expect(serverContent).toContain('.send("Internal Server Error")');
+      expect(serverContent).toContain('.send("Asset not found")');
+      expect(serverContent).not.toContain('send("Erreur lecture CSS: "');
+      expect(serverContent).not.toContain('send("Asset introuvable: "');
+    });
+  });
+
+  describe("I — SEC-01-FIX-07-R1 : D4 — Audit Statique du Workflow GitHub Security Scan", () => {
+    it("I1: .github/workflows/security.yml définit permissions: contents: read, ne masque plus src/lib/firebase.ts, retire le faux positif AIzaSy et détecte les secrets Paddle et GitHub PAT", () => {
+      const workflowPath = path.resolve(process.cwd(), ".github/workflows/security.yml");
+      const workflowContent = fs.readFileSync(workflowPath, "utf-8");
+
+      // D4.1 : Permissions minimales explicites
+      expect(workflowContent).toMatch(/permissions:\s*\n\s*contents:\s*read/);
+
+      // D4.3 : src/lib/firebase.ts n'est plus exclu globalement et AIzaSy public n'est plus un motif bloquant
+      expect(workflowContent).not.toContain(":!src/lib/firebase.ts");
+      expect(workflowContent).not.toContain("AIzaSy[0-9A-Za-z_-]{33}");
+
+      // D4.4 : Motifs de secrets privés (PEM, Stripe, GitHub classic & fine-grained PAT, AWS, Paddle)
+      expect(workflowContent).toContain("PRIVATE KEY-----");
+      expect(workflowContent).toContain("sk_live_");
+      expect(workflowContent).toContain("ghp_");
+      expect(workflowContent).toContain("github_pat_");
+      expect(workflowContent).toContain("AKIA");
+      expect(workflowContent).toContain("pdl_ntfset_");
+      expect(workflowContent).toContain("pdl_live_apikey_");
+      expect(workflowContent).toContain("pdl_sdbx_apikey_");
     });
   });
 });

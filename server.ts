@@ -16,7 +16,13 @@ import { adminAuth, adminDb } from "./src/lib/firebase-admin.ts";
 import { 
   createBoundedRateLimiter,
   verifyProductionConfig,
-  isSuspiciousRequestPath
+  isSuspiciousRequestPath,
+  validateAllowedOrigins,
+  resolveCspFrameAncestors,
+  createPaddleWebhookBodyParser,
+  createStandardJsonParser,
+  createStandardUrlencodedParser,
+  createGlobalExpressErrorHandler
 } from "./src/security/sec01SecurityService.ts";
 import { createPendingOrderRepository } from "./src/security/webhooks/pendingOrderRepository.ts";
 import { createWebhookIdempotencyRepository } from "./src/security/webhooks/webhookIdempotencyRepository.ts";
@@ -64,16 +70,12 @@ app.use((req, res, next) => {
 const trustProxyConfig = process.env.TRUST_PROXY || (process.env.NODE_ENV === "production" ? 1 : false);
 app.set("trust proxy", trustProxyConfig);
 
-// Whitelist CORS dynamique contrôlée via environnement (Section E2)
-const defaultAllowedOrigins = [
-  "https://ais-dev-6etwlfzn4irzgw5ljyhzsh-76486687314.europe-west2.run.app",
-  "https://ais-pre-6etwlfzn4irzgw5ljyhzsh-76486687314.europe-west2.run.app",
-  ...(process.env.NODE_ENV !== "production" ? ["http://localhost:3000", "http://127.0.0.1:3000"] : [])
-];
-const envOrigins = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(",").map((s) => s.trim()).filter(Boolean)
-  : [];
-const ALLOWED_ORIGINS = Array.from(new Set([...defaultAllowedOrigins, ...envOrigins]));
+// Whitelist CORS dynamique contrôlée et validée via environnement (Section E2 & SEC-01-FIX-07-R1 D1.2)
+const allowedOriginsValidation = validateAllowedOrigins(process.env.ALLOWED_ORIGINS, {
+  isProduction: process.env.NODE_ENV === "production",
+  appUrl: process.env.APP_URL
+});
+const ALLOWED_ORIGINS = allowedOriginsValidation.origins;
 
 // In-Memory Rate Limiter BORNÉ pour protéger l'API sans fuite mémoire (Section F1)
 const apiRateLimiter = createBoundedRateLimiter({
@@ -102,12 +104,11 @@ app.use((req, res, next) => {
   res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
   res.setHeader("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload");
 
-  // Content-Security-Policy durcie : frame-ancestors restreint en production (Section E3)
-  const isProd = process.env.NODE_ENV === "production";
-  const frameAncestors = process.env.CSP_FRAME_ANCESTORS || (isProd ? "'self'" : "*");
+  // Content-Security-Policy durcie : frame-ancestors résolu et validé sans wildcard '*' en production (SEC-01-FIX-07-R1 D1.1)
+  const frameAncestorsPolicy = resolveCspFrameAncestors(process.env);
   res.setHeader(
     "Content-Security-Policy",
-    `default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://apis.google.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: https: blob:; connect-src 'self' https: wss:; frame-src 'self' https://ais-dev-6etwlfzn4irzgw5ljyhzsh-76486687314.europe-west2.run.app https://ais-pre-6etwlfzn4irzgw5ljyhzsh-76486687314.europe-west2.run.app; frame-ancestors ${frameAncestors}; object-src 'none'`
+    `default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://apis.google.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: https: blob:; connect-src 'self' https: wss:; frame-src 'self' https://ais-dev-6etwlfzn4irzgw5ljyhzsh-76486687314.europe-west2.run.app https://ais-pre-6etwlfzn4irzgw5ljyhzsh-76486687314.europe-west2.run.app; ${frameAncestorsPolicy.directive}; object-src 'none'`
   );
   res.setHeader("X-Engine-Vendor", "ORTHOGONAL - ENG");
   res.setHeader("X-Engine-Product", "Piping Design & Isometrics");
@@ -117,20 +118,9 @@ app.use((req, res, next) => {
 // Appliquer le rate limiter borné sur toutes les requêtes API (Section F1)
 app.use("/api", apiRateLimiter.middleware());
 
-// Parser JSON avec conservation du corps brut pour vérification de signature webhook (Section B2)
-interface RequestWithRawBody extends express.Request {
-  rawBody?: string;
-}
-
-app.use(
-  express.json({
-    limit: "50mb",
-    verify: (req: any, _res, buf) => {
-      req.rawBody = buf.toString("utf8");
-    }
-  })
-);
-app.use(express.urlencoded({ limit: "50mb", extended: true }));
+// Limites strictes des corps HTTP (256kb max, sans capture rawBody globale — SEC-01-FIX-07-R1 D2.1)
+app.use(createStandardJsonParser());
+app.use(createStandardUrlencodedParser());
 
 // Endpoints santé minimaux (Section E5)
 const handleHealthCheck = (_req: express.Request, res: express.Response) => {
@@ -198,7 +188,10 @@ app.post("/api/admin/set-user-role", requireAuth, requireSuperAdmin, requireEmai
     });
   } catch (err: any) {
     console.error("Error setting custom user claim:", err?.message || err);
-    res.status(500).json({ error: err?.message || "Échec de l'attribution du rôle utilisateur." });
+    res.status(500).json({
+      error: "Internal server error",
+      code: "ADMIN_ROLE_UPDATE_FAILED"
+    });
   }
 });
 
@@ -231,9 +224,10 @@ app.post(
 // Slick-Pay Webhook (Algeria - BaridiMob / Edahabia) — Strict Fail-Closed
 app.post("/api/webhooks/slickpay", createSlickPayWebhookHandler());
 
-// Paddle Webhook (International EUR/USD) — Strict RawBody Signature Verification & Order Association
+// Paddle Webhook (International EUR/USD) — Strict Isolated RawBody Parser (256kb) & Order Association (SEC-01-FIX-07-R1 D2.2)
 app.post(
   "/api/webhooks/paddle",
+  createPaddleWebhookBodyParser(),
   createPaddleWebhookHandler({
     processor: paymentWebhookProcessor
   })
@@ -335,7 +329,8 @@ async function startServer() {
           jsCount: files.filter((f) => f.endsWith(".js")).length,
         });
       } catch (err: any) {
-        res.status(500).json({ error: String(err?.message || err) });
+        console.error("Asset health check error:", err?.message || err);
+        res.status(500).json({ error: "Internal asset health check error" });
       }
     });
 
@@ -359,7 +354,8 @@ async function startServer() {
         res.setHeader("Cache-Control", "no-store");
         res.send(css);
       } catch (err: any) {
-        res.status(500).type("text/plain").send("Erreur lecture CSS: " + String(err));
+        console.error("Error reading CSS bundle:", err?.message || err);
+        res.status(500).type("text/plain").send("Internal Server Error");
       }
     });
 
@@ -368,13 +364,16 @@ async function startServer() {
       // C est ce fallback qui masquait l absence du bundle CSS : le navigateur
       // recevait du HTML en text/html et ignorait la feuille sans erreur.
       if (path.extname(req.path)) {
-        res.status(404).type("text/plain").send("Asset introuvable: " + req.path);
+        res.status(404).type("text/plain").send("Asset not found");
         return;
       }
       res.setHeader("Cache-Control", "no-store");
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
+
+  // Middleware global de gestion des erreurs de parsing (400 / 413) et d'erreurs internes (500) en fin de chaîne (SEC-01-FIX-07-R1 D2.4 & D3)
+  app.use(createGlobalExpressErrorHandler());
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://0.0.0.0:${PORT}`);

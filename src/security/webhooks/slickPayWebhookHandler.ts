@@ -37,7 +37,10 @@ export function createSlickPayWebhookHandler(deps: SlickPayWebhookHandlerDeps = 
       });
     } catch (err: any) {
       console.error("[Webhook Slick-Pay Error]:", err?.message || err);
-      return res.status(500).json({ error: err?.message || "Webhook processing failed" });
+      return res.status(500).json({
+        error: "Internal webhook processing error",
+        code: "WEBHOOK_INTERNAL_ERROR"
+      });
     }
   };
 }

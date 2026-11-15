@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ main ]
 
+permissions:
+  contents: read
+
 jobs:
   secret-scan:
     name: Public Repository Secret Scanner
@@ -15,36 +18,68 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
 
-      - name: Run Secret Leak Guard
+      - name: Run Secret Leak Guard (Working Tree & Commit Diff)
         run: |
-          echo "Scanning recent commits for exposed credentials and private keys..."
+          echo "Scanning current working tree and event commit diff for exposed private credentials and server secrets..."
           
-          # Check for private keys, AWS tokens, Google API keys, Stripe/Paddle secret tokens
+          # SEC-01-FIX-07-R1 (D4):
+          # - Scans 100% of application source files including src/lib/firebase.ts (never globally excluded).
+          # - Public client Firebase Web API key identifier (AIzaSy...) is not treated as a private server secret.
+          # - Covers PEM/RSA/EC/OPENSSH/DSA private keys, Stripe live keys, GitHub classic & fine-grained PATs,
+          #   Slack tokens, AWS access keys, and private Paddle API / webhook notification secrets.
           LEAKS_FOUND=0
           
           PATTERNS=(
             "-----BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"
-            "AIzaSy[0-9A-Za-z_-]{33}"
             "sk_live_[0-9a-zA-Z]{24,}"
             "ghp_[0-9a-zA-Z]{36}"
+            "github_pat_[0-9a-zA-Z_]{22,}"
             "xox[baprs]-[0-9a-zA-Z]{10,48}"
             "AKIA[0-9A-Z]{16}"
+            "pdl_ntfset_[0-9a-zA-Z_]{16,}"
+            "pdl_live_apikey_[0-9a-zA-Z_]{16,}"
+            "pdl_sdbx_apikey_[0-9a-zA-Z_]{16,}"
           )
           
+          # 1. Deterministic scan of current working tree (HEAD)
           for PATTERN in "${PATTERNS[@]}"; do
-            MATCHES=$(git grep -E -I -n "$PATTERN" -- ':!*.example' ':!*Security.spec.ts' ':!*.md' ':!src/lib/firebase.ts' ':!dist/**' || true)
+            MATCHES=$(git grep -E -I -n "$PATTERN" -- ':!*.example' ':!*Security.spec.ts' ':!dist/**' || true)
             if [ -n "$MATCHES" ]; then
-              echo "::error::Potential secret leak detected matching pattern: $PATTERN"
+              echo "::error::Potential secret leak detected in working tree matching pattern: $PATTERN"
               echo "$MATCHES"
               LEAKS_FOUND=1
             fi
           done
           
+          # 2. Deterministic scan of added lines in commit diff for push / pull_request
+          DIFF_RANGE=""
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ -n "${{ github.event.pull_request.base.sha }}" ]; then
+            DIFF_RANGE="${{ github.event.pull_request.base.sha }}..${{ github.sha }}"
+          elif [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            DIFF_RANGE="${{ github.event.before }}..${{ github.sha }}"
+          elif git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+            DIFF_RANGE="HEAD~1..HEAD"
+          fi
+          
+          if [ -n "$DIFF_RANGE" ]; then
+            echo "Scanning commit diff range: $DIFF_RANGE"
+            ADDED_LINES=$(git diff "$DIFF_RANGE" -- ':!*.example' ':!*Security.spec.ts' ':!dist/**' | grep -E '^\+[^+]' || true)
+            if [ -n "$ADDED_LINES" ]; then
+              for PATTERN in "${PATTERNS[@]}"; do
+                DIFF_MATCHES=$(printf "%s\n" "$ADDED_LINES" | grep -E "$PATTERN" || true)
+                if [ -n "$DIFF_MATCHES" ]; then
+                  echo "::error::Potential secret leak detected in commit diff ($DIFF_RANGE) matching pattern: $PATTERN"
+                  LEAKS_FOUND=1
+                fi
+              done
+            fi
+          fi
+          
           if [ $LEAKS_FOUND -ne 0 ]; then
-            echo "Security scan FAILED: Secrets detected in public repository!"
+            echo "Security scan FAILED: Private secrets detected in repository!"
             exit 1
           fi
           
-          echo "Security scan PASSED: No exposed secrets detected."
+          echo "Security scan PASSED: No exposed private secrets detected."
