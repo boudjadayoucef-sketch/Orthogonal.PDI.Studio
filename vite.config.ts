@@ -60,6 +60,26 @@ export default defineConfig(() => {
       },
     },
     server: {
+      allowedHosts: Array.from(
+        new Set([
+          'localhost',
+          '127.0.0.1',
+          'ais-dev-6etwlfzn4irzgw5ljyhzsh-76486687314.europe-west2.run.app',
+          'ais-pre-6etwlfzn4irzgw5ljyhzsh-76486687314.europe-west2.run.app',
+          ...(process.env.NG_ALLOWED_HOSTS
+            ? process.env.NG_ALLOWED_HOSTS.split(',').map((h) => h.trim()).filter(Boolean)
+            : []),
+          ...(process.env.APP_URL
+            ? (() => {
+                try {
+                  return [new URL(process.env.APP_URL).hostname];
+                } catch {
+                  return [];
+                }
+              })()
+            : []),
+        ])
+      ),
       // HMR is disabled in AI Studio via DISABLE_HMR env var.
       // Do not modifyâfile watching is disabled to prevent flickering during agent edits.
       hmr: process.env.DISABLE_HMR !== 'true',

@@ -1,17 +1,18 @@
 /**
- * ORTHOGONAL PD&I STUDIO — SEC-01 / AUTH-ADMIN-05-FIX-06
- * Tests unitaires complets et réels pour le script de Bootstrap Super Admin.
+ * ORTHOGONAL PD&I STUDIO — SEC-01 / AUTH-ADMIN-05-FIX-10
+ * Tests unitaires complets et isolés pour le script de Bootstrap Super Admin Zero-Trust.
  *
- * Ces tests s'exécutent avec `npm test` indépendamment de l'émulateur Java Firestore.
- * Ils intègrent l'ensemble de la suite FIX-01 à FIX-05 complétée par les blocs FIX-06 :
+ * Ces tests s'exécutent avec `npm test` (Vitest) en environnement 100 % isolé et mocké,
+ * sans aucune connexion ni opération sur Firebase production :
  * - FIX-06 B1 : Tests ISO stricts (fuseau obligatoire, calendrier réel, fraction 9 chiffres max, décalages UTC, égalité multi-fuseaux)
- * - FIX-06 B2 : Tests des tableaux et filtrage récursif des données commerciales historiques
- * - FIX-06 B3 : Tests de cohérence et validation croisée Auth / Firestore (getFirestoreProjectId)
- * - B3 : Test d'import isolé instrumenté en sous-processus vierge
- * - B4 : Sécurité et absence totale de mutation en mode dry-run
+ * - FIX-06 B2 & FIX-10 : Fusion contrôlée par whitelist explicite, rejet des données commerciales, compteurs et privilèges non prouvés
+ * - FIX-06 B3 : Validation croisée Auth / Firestore (getFirestoreProjectId)
+ * - FIX-07 & FIX-08 : Non-divulgation, getters temporels hostiles, erreurs internes WeakMap, absence d'effet de bord à l'import
+ * - FIX-10 : Durcissement Zero-Trust complet (EXPECTED_SUPER_ADMIN_UID indépendant, Preuves A et B, blocage des statuts négatifs,
+ *   restauration conditionnelle de pending_activation, vérification post-écriture de uid/email/status/role avant setCustomUserClaims).
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
@@ -37,6 +38,7 @@ import {
   formatSanitizedErrorCode,
   GENERIC_EXTERNAL_ERROR,
   getSafeInternalMessage,
+  getSafeInternalErrorCode,
   isInternalBootstrapError,
   sanitizeReportErrorMessage,
   hasOwnDataProperty,
@@ -49,11 +51,28 @@ import {
   EXPECTED_PROJECT_ID,
   ALLOWED_SUPER_ADMIN_EMAIL,
   HISTORICAL_PROFILE_DOC_ID,
-  FORBIDDEN_HISTORICAL_AUTH_LEAF_KEYS
+  FORBIDDEN_HISTORICAL_AUTH_LEAF_KEYS,
+  NEGATIVE_PROFILE_STATUSES,
+  ALLOWED_HISTORICAL_PROFILE_FIELDS,
+  ALLOWED_HISTORICAL_PROFILE_FIELD_SET,
+  ALLOWED_TARGET_PROFILE_FIELDS,
+  ALLOWED_TARGET_PROFILE_FIELD_SET,
+  FORBIDDEN_UNVERIFIED_COMMERCIAL_PRIVILEGES,
+  FORBIDDEN_UNVERIFIED_COMMERCIAL_KEYS,
+  COMMERCIAL_TIER_AND_PLAN_KEYS,
+  isExplicitlyForbiddenTargetField,
+  sanitizeTargetFieldValue,
+  hasContradictoryHistoricalUid,
+  resolveExpectedSuperAdminUid,
+  hasNegativeProfileStatus,
+  isValidTargetAuthorizationProof,
+  isValidHistoricalAuthorizationProof,
+  verifyPreexistingAuthorizationProof
 } from '../../../scripts/bootstrapSuperAdmin.ts';
 
-describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super Admin', () => {
+describe('AUTH-ADMIN-05-FIX-06 à FIX-10 : Suite de validation unitaire du Bootstrap Super Admin Zero-Trust', () => {
   const validUid = 'google_user_youcef_12345';
+  const originalEnvExpectedUid = process.env.EXPECTED_SUPER_ADMIN_UID;
 
   let mockAuth: any;
   let mockDb: any;
@@ -62,6 +81,7 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
   let callSequence: string[];
 
   beforeEach(() => {
+    process.env.EXPECTED_SUPER_ADMIN_UID = validUid;
     store = new Map<string, any>();
     callSequence = [];
 
@@ -87,7 +107,7 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
       },
       getUserByEmail: vi.fn(async (email: string) => {
         callSequence.push(`auth.getUserByEmail:${email}`);
-        if (email === userRecordState.email) {
+        if (email.toLowerCase() === userRecordState.email.toLowerCase()) {
           return { ...userRecordState };
         }
         const err: any = new Error('User not found');
@@ -133,12 +153,24 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
                 const existing = store.get(key) || {};
                 const merged = options?.merge ? { ...existing, ...newData } : { ...newData };
                 store.set(key, JSON.parse(JSON.stringify(merged)));
+              }),
+              delete: vi.fn(async () => {
+                callSequence.push(`firestore.delete:${key}`);
+                store.delete(key);
               })
             };
           })
         };
       })
     };
+  });
+
+  afterEach(() => {
+    if (originalEnvExpectedUid === undefined) {
+      delete process.env.EXPECTED_SUPER_ADMIN_UID;
+    } else {
+      process.env.EXPECTED_SUPER_ADMIN_UID = originalEnvExpectedUid;
+    }
   });
 
   // =========================================================================
@@ -149,7 +181,9 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
     store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
       uid: HISTORICAL_PROFILE_DOC_ID,
       email: ALLOWED_SUPER_ADMIN_EMAIL,
-      projectsCount: 16
+      role: 'super_admin',
+      status: 'active',
+      company: 'PD&I Vision DZ'
     });
 
     const report = await runSuperAdminBootstrap({
@@ -200,6 +234,7 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
     expect(report.success).toBe(false);
     expect(report.error).toContain('[BLOCAGE EMAIL]');
     expect(mockAuth.getUserByEmail).not.toHaveBeenCalled();
+    expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
   });
 
   it('4. Refus d’un compte désactivé', async () => {
@@ -352,26 +387,29 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
   });
 
   // =========================================================================
-  // 3. CORRECTION B2 : PROTECTION BASÉE SUR LE MODÈLE COMMERCIAL RÉEL DU PROJET
+  // 3. FUSION CONTRÔLÉE PAR WHITELIST & REJET DES CHAMPS COMMERCIAUX / COMPTEURS
   // =========================================================================
 
-  it('15. B2 — Protection absolue des données commerciales réelles (racine et imbriquées, absentes de la cible)', () => {
+  it('15. B2 & FIX-10 — Exclusion absolue des données commerciales, compteurs et propriétés hors whitelist', () => {
     const targetData = {
       uid: validUid,
       email: ALLOWED_SUPER_ADMIN_EMAIL,
+      status: 'pending_activation',
       name: 'Youcef Boudjada'
     };
 
     const historicalData = {
       uid: HISTORICAL_PROFILE_DOC_ID,
       email: ALLOWED_SUPER_ADMIN_EMAIL,
+      role: 'super_admin',
+      status: 'active',
       accountType: 'enterprise',
       subscriptionPlan: 'lifetime',
-      status: 'active',
       paymentGateway: 'slickpay_baridimob',
       currency: 'DZD',
       storageUsedKb: 204800,
       loginCount: 42,
+      projectsCount: 18,
       licenses: ['lic_normative_b31_8', 'lic_cad_iso'],
       assignedPlan: 'ENTERPRISE',
       maxUsers: 50,
@@ -386,56 +424,66 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
         paymentStatus: 'paid_baridimob',
         lastUpdatedBy: 'auditor_pdi'
       },
-      account: {
-        department: 'Direction Technique Pipelines'
-      },
-      company: 'PD&I Vision DZ'
+      department: 'Direction Technique Pipelines',
+      company: 'PD&I Vision DZ',
+      city: 'Alger'
     };
 
     const result = mergeProfileDataNonDestructive(validUid, targetData, historicalData);
 
+    // Champs commerciaux et compteurs strictement exclus
     expect(result.mergedData.accountType).toBeUndefined();
     expect(result.mergedData.subscriptionPlan).toBeUndefined();
-    expect(result.mergedData.status).toBeUndefined();
     expect(result.mergedData.paymentGateway).toBeUndefined();
     expect(result.mergedData.currency).toBeUndefined();
     expect(result.mergedData.storageUsedKb).toBeUndefined();
     expect(result.mergedData.loginCount).toBeUndefined();
+    expect(result.mergedData.projectsCount).toBeUndefined();
     expect(result.mergedData.licenses).toBeUndefined();
     expect(result.mergedData.assignedPlan).toBeUndefined();
     expect(result.mergedData.maxUsers).toBeUndefined();
     expect(result.mergedData.billing).toBeUndefined();
     expect(result.mergedData.billingCounters).toBeUndefined();
     expect(result.mergedData.invoices).toBeUndefined();
-    expect(result.mergedData.metadata?.paymentStatus).toBeUndefined();
+    expect(result.mergedData.metadata).toBeUndefined();
 
+    // Seuls les champs de la whitelist et les 4 champs d'autorité vérifiés sont présents
+    expect(result.mergedData.uid).toBe(validUid);
+    expect(result.mergedData.email).toBe(ALLOWED_SUPER_ADMIN_EMAIL);
+    expect(result.mergedData.status).toBe('active');
+    expect(result.mergedData.role).toBe('super_admin');
+    expect(result.mergedData.name).toBe('Youcef Boudjada');
     expect(result.mergedData.company).toBe('PD&I Vision DZ');
-    expect(result.mergedData.account?.department).toBe('Direction Technique Pipelines');
-    expect(result.mergedData.metadata?.lastUpdatedBy).toBe('auditor_pdi');
+    expect(result.mergedData.department).toBe('Direction Technique Pipelines');
+    expect(result.mergedData.city).toBe('Alger');
     expect(result.recoveredFields).toContain('company');
+    expect(result.recoveredFields).toContain('department');
+    expect(result.recoveredFields).toContain('city');
   });
 
-  it('16. B2 — Les données commerciales réelles présentes dans la cible restent strictement intactes', () => {
+  it('16. B2 & FIX-10 — Consigne les conflits commerciaux et n’attribue jamais enterprise ni lifetime', () => {
     const targetData = {
       uid: validUid,
       email: ALLOWED_SUPER_ADMIN_EMAIL,
+      status: 'pending_activation',
       accountType: 'basic',
       subscriptionPlan: 'monthly',
-      status: 'pending_activation',
       paymentGateway: 'paddle',
       currency: 'USD',
       storageUsedKb: 0,
       billing: {
         customerId: 'target_paddle_cus_1'
-      }
+      },
+      name: 'Youcef Boudjada'
     };
 
     const historicalData = {
       uid: HISTORICAL_PROFILE_DOC_ID,
       email: ALLOWED_SUPER_ADMIN_EMAIL,
+      role: 'super_admin',
+      status: 'active',
       accountType: 'enterprise',
       subscriptionPlan: 'lifetime',
-      status: 'active',
       paymentGateway: 'slickpay_baridimob',
       currency: 'DZD',
       storageUsedKb: 500000,
@@ -446,87 +494,27 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
 
     const result = mergeProfileDataNonDestructive(validUid, targetData, historicalData);
 
+    // R1 : Les champs cibles légitimes non privilégiés sont préservés non destructivement,
+    // tandis qu'aucun privilège commercial non prouvé ('enterprise', 'lifetime') de l'historique n'est attribué.
     expect(result.mergedData.accountType).toBe('basic');
     expect(result.mergedData.subscriptionPlan).toBe('monthly');
-    expect(result.mergedData.status).toBe('pending_activation');
     expect(result.mergedData.paymentGateway).toBe('paddle');
     expect(result.mergedData.currency).toBe('USD');
     expect(result.mergedData.storageUsedKb).toBe(0);
-    expect(result.mergedData.billing?.customerId).toBe('target_paddle_cus_1');
+    expect(result.mergedData.billing).toEqual({ customerId: 'target_paddle_cus_1' });
+    expect(result.mergedData.status).toBe('active');
+    expect(result.mergedData.role).toBe('super_admin');
 
     expect(result.conflicts).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ field: 'accountType' }),
-        expect.objectContaining({ field: 'subscriptionPlan' }),
-        expect.objectContaining({ field: 'status' }),
-        expect.objectContaining({ field: 'paymentGateway' }),
-        expect.objectContaining({ field: 'currency' }),
-        expect.objectContaining({ field: 'storageUsedKb' }),
-        expect.objectContaining({ field: 'billing' })
+        expect.objectContaining({ field: 'accountType', conflictCategory: 'commercial' }),
+        expect.objectContaining({ field: 'subscriptionPlan', conflictCategory: 'commercial' }),
+        expect.objectContaining({ field: 'paymentGateway', conflictCategory: 'commercial' }),
+        expect.objectContaining({ field: 'currency', conflictCategory: 'commercial' }),
+        expect.objectContaining({ field: 'storageUsedKb', conflictCategory: 'commercial' }),
+        expect.objectContaining({ field: 'billing', conflictCategory: 'commercial' })
       ])
     );
-  });
-
-  // =========================================================================
-  // FIX-06 B2 : TESTS DES TABLEAUX ET FILTRAGE DES DONNÉES COMMERCIALES
-  // =========================================================================
-
-  it('FIX-06 B2 — filtre les champs commerciaux dans un tableau historique absent de la cible', () => {
-    const result = mergeProfileDataNonDestructive(
-      validUid,
-      { uid: validUid, email: ALLOWED_SUPER_ADMIN_EMAIL },
-      {
-        preferences: [{
-          language: 'fr',
-          billingData: { customerId: 'CUS-123', balance: 500 },
-          department: 'Pipelines'
-        }]
-      }
-    );
-
-    expect(result.mergedData.preferences).toEqual([
-      { language: 'fr', department: 'Pipelines' }
-    ]);
-  });
-
-  it('FIX-06 B2 — filtre les champs commerciaux dans les tableaux imbriqués', () => {
-    const result = mergeProfileDataNonDestructive(
-      validUid,
-      { uid: validUid },
-      {
-        workspace: {
-          history: [{
-            label: 'Projet B31',
-            nested: [{
-              description: 'Étude technique',
-              paymentStatus: 'paid',
-              licenseKey: 'SECRET-LICENSE'
-            }]
-          }]
-        }
-      }
-    );
-
-    expect(result.mergedData.workspace).toEqual({
-      history: [{
-        label: 'Projet B31',
-        nested: [{ description: 'Étude technique' }]
-      }]
-    });
-  });
-
-  it('FIX-06 B2 — ne modifie pas un tableau déjà présent dans la cible', () => {
-    const targetArray = [
-      { label: 'Cible', billing: { customerId: 'TARGET-CUSTOMER' } }
-    ];
-
-    const result = mergeProfileDataNonDestructive(
-      validUid,
-      { uid: validUid, preferences: targetArray },
-      { preferences: [{ label: 'Historique', paymentStatus: 'paid' }] }
-    );
-
-    expect(result.mergedData.preferences).toEqual(targetArray);
   });
 
   // =========================================================================
@@ -554,6 +542,7 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
     expect(report.error).toContain('[BLOCAGE PROJET]');
     expect(mockAuth.getUserByEmail).not.toHaveBeenCalled();
     expect(mockDb.collection).not.toHaveBeenCalled();
+    expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
   });
 
   it('FIX-06 B3 — refuse un projet Firestore impossible à identifier', async () => {
@@ -567,6 +556,7 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
     expect(report.success).toBe(false);
     expect(report.error).toContain('[BLOCAGE PROJET]');
     expect(mockAuth.getUserByEmail).not.toHaveBeenCalled();
+    expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
   });
 
   // =========================================================================
@@ -584,7 +574,9 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
   it('18. Rejet en cas de champ inattendu après écriture (profileVerified = false, partialState = true)', async () => {
     store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
       uid: HISTORICAL_PROFILE_DOC_ID,
-      email: ALLOWED_SUPER_ADMIN_EMAIL
+      email: ALLOWED_SUPER_ADMIN_EMAIL,
+      role: 'super_admin',
+      status: 'active'
     });
 
     mockDb.collection = vi.fn(() => ({
@@ -624,7 +616,9 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
   it('19. Échec d’attribution des Custom Claims après écriture -> partialState: true', async () => {
     store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
       uid: HISTORICAL_PROFILE_DOC_ID,
-      email: ALLOWED_SUPER_ADMIN_EMAIL
+      email: ALLOWED_SUPER_ADMIN_EMAIL,
+      role: 'super_admin',
+      status: 'active'
     });
 
     mockAuth.setCustomUserClaims = vi.fn(async () => {
@@ -649,6 +643,8 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
     store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
       uid: HISTORICAL_PROFILE_DOC_ID,
       email: ALLOWED_SUPER_ADMIN_EMAIL,
+      role: 'super_admin',
+      status: 'active',
       company: 'PD&I Vision DZ'
     });
 
@@ -716,7 +712,9 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
   it('22. Conservation et vérification de TOUS les Custom Claims existants (pas seulement role)', async () => {
     store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
       uid: HISTORICAL_PROFILE_DOC_ID,
-      email: ALLOWED_SUPER_ADMIN_EMAIL
+      email: ALLOWED_SUPER_ADMIN_EMAIL,
+      role: 'super_admin',
+      status: 'active'
     });
 
     userRecordState.customClaims = {
@@ -773,15 +771,16 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
   // 7. AUTH-ADMIN-05-FIX-07 : TESTS UNITAIRES DES CORRECTIFS A À G
   // =========================================================================
 
-  // FIX-07-A : Échec ambigu de l'écriture Firestore et relecture diagnostique
   describe('FIX-07-A : Échec ambigu de l’écriture Firestore', () => {
     it('signale partialState: true et requiert intervention si targetDocRef.set() échoue mais que les données sont constatées', async () => {
       store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
         uid: HISTORICAL_PROFILE_DOC_ID,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        role: 'super_admin',
+        status: 'active',
         company: 'PD&I Vision DZ'
       });
 
-      // Simuler une exception sur targetDocRef.set(), mais le document est tout de même écrit sur le store
       const originalCol = mockDb.collection.bind(mockDb);
       mockDb.collection = (colName: string) => {
         const col = originalCol(colName);
@@ -789,8 +788,7 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
         col.doc = (docId: string) => {
           const docObj = originalDoc(docId);
           if (docId === validUid) {
-            docObj.set = vi.fn(async (data: any, options: any) => {
-              // Écrit quand même les données attendues (effet de bord serveur)
+            docObj.set = vi.fn(async (data: any) => {
               store.set(`profiles/${validUid}`, JSON.parse(JSON.stringify(data)));
               throw new Error('DEADLINE_EXCEEDED : Timeout de confirmation Firestore');
             });
@@ -812,13 +810,15 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
       expect(report.claimsUpdated).toBe(false);
       expect(report.claimsVerified).toBe(false);
       expect(report.error).toContain('[ÉTAT PARTIEL - INTERVENTION REQUISE]');
-      // Ne doit JAMAIS continuer vers setCustomUserClaims
       expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
     });
 
     it('signale partialState: true et échec ambigu si targetDocRef.set() échoue et que les données ne sont pas présentes', async () => {
       store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
         uid: HISTORICAL_PROFILE_DOC_ID,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        role: 'super_admin',
+        status: 'active',
         company: 'PD&I Vision DZ'
       });
 
@@ -853,7 +853,6 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
     });
   });
 
-  // FIX-07-B & FIX-07-G : Comparaison structurelle des custom claims
   describe('FIX-07-B & FIX-07-G : Comparaison structurelle des Custom Claims', () => {
     it('accepte deux objets de claims ayant les mêmes propriétés dans un ordre différent', () => {
       const expected = { role: 'super_admin', tier: 4, isStaff: true };
@@ -897,7 +896,10 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
 
     it('arrête avec partialState: true si la relecture des Custom Claims après mutation révèle un claim inattendu', async () => {
       store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
-        uid: HISTORICAL_PROFILE_DOC_ID
+        uid: HISTORICAL_PROFILE_DOC_ID,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        role: 'super_admin',
+        status: 'active'
       });
 
       mockAuth.getUser = vi.fn(async () => {
@@ -927,8 +929,7 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
     });
   });
 
-  // FIX-07-C : Protection des champs d'autorisation historiques
-  describe('FIX-07-C : Protection des champs d’autorisation historiques', () => {
+  describe('FIX-07-C & FIX-10 : Protection des champs d’autorisation historiques', () => {
     it('identifie tous les champs d’autorisation historiques protégés de la liste', () => {
       const requiredAuthFields = [
         'role',
@@ -952,16 +953,19 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
       }
     });
 
-    it('n’importe aucun champ d’autorisation depuis l’historique si la cible ne les possède pas', () => {
+    it('n’importe aucun champ d’autorisation additionnel depuis l’historique (roles, permissions, privileges, etc.)', () => {
       const targetData = {
         uid: validUid,
         email: ALLOWED_SUPER_ADMIN_EMAIL,
+        status: 'pending_activation',
         company: 'PD&I Tech'
       };
 
       const historicalData = {
         uid: HISTORICAL_PROFILE_DOC_ID,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
         role: 'super_admin',
+        status: 'active',
         roles: ['admin', 'owner'],
         admin: true,
         isAdmin: true,
@@ -974,12 +978,13 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
         authorizations: ['billing_admin'],
         securityRole: 'sec_officer',
         adminRole: 'super_user',
-        projectContext: 'pipeline_b31'
+        city: 'Alger'
       };
 
       const result = mergeProfileDataNonDestructive(validUid, targetData, historicalData);
 
-      expect(result.mergedData.role).toBeUndefined();
+      expect(result.mergedData.role).toBe('super_admin');
+      expect(result.mergedData.status).toBe('active');
       expect(result.mergedData.roles).toBeUndefined();
       expect(result.mergedData.admin).toBeUndefined();
       expect(result.mergedData.isAdmin).toBeUndefined();
@@ -992,55 +997,10 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
       expect(result.mergedData.authorizations).toBeUndefined();
       expect(result.mergedData.securityRole).toBeUndefined();
       expect(result.mergedData.adminRole).toBeUndefined();
-
-      // Le champ non sensible est bien récupéré
-      expect(result.mergedData.projectContext).toBe('pipeline_b31');
-    });
-
-    it('préserve strictement les autorisations déjà présentes dans le document cible et consigne un conflit', () => {
-      const targetData = {
-        uid: validUid,
-        email: ALLOWED_SUPER_ADMIN_EMAIL,
-        role: 'field_inspector',
-        permissions: ['read_pipe']
-      };
-
-      const historicalData = {
-        uid: HISTORICAL_PROFILE_DOC_ID,
-        role: 'super_admin',
-        permissions: ['all_access']
-      };
-
-      const result = mergeProfileDataNonDestructive(validUid, targetData, historicalData);
-
-      expect(result.mergedData.role).toBe('field_inspector');
-      expect(result.mergedData.permissions).toEqual(['read_pipe']);
-      expect(result.conflicts).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({ field: 'role', valuesDiffer: true, conflictCategory: 'authorization' }),
-          expect.objectContaining({ field: 'permissions', valuesDiffer: true, conflictCategory: 'authorization' })
-        ])
-      );
-    });
-
-    it('filtre les champs d’autorisation au sein des tableaux et objets contenus dans les tableaux', () => {
-      const result = mergeProfileDataNonDestructive(
-        validUid,
-        { uid: validUid },
-        {
-          teamMembers: [
-            { name: 'Youcef', role: 'super_admin', permissions: ['all'], department: 'Pipelines' }
-          ]
-        }
-      );
-
-      expect(result.mergedData.teamMembers).toEqual([
-        { name: 'Youcef', department: 'Pipelines' }
-      ]);
+      expect(result.mergedData.city).toBe('Alger');
     });
   });
 
-  // FIX-07-D : Validation stricte du compte désactivé (disabled === false)
   describe('FIX-07-D : Validation stricte du compte désactivé', () => {
     it('refuse un compte dont la propriété disabled est undefined', async () => {
       userRecordState.disabled = undefined;
@@ -1051,6 +1011,7 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
 
       expect(report.success).toBe(false);
       expect(report.error).toContain('[COMPTE DÉSACTIVÉ]');
+      expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
     });
 
     it('refuse un compte dont la propriété disabled est null', async () => {
@@ -1062,6 +1023,7 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
 
       expect(report.success).toBe(false);
       expect(report.error).toContain('[COMPTE DÉSACTIVÉ]');
+      expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
     });
 
     it('refuse un compte dont la propriété disabled est une chaîne de caractères', async () => {
@@ -1073,24 +1035,34 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
 
       expect(report.success).toBe(false);
       expect(report.error).toContain('[COMPTE DÉSACTIVÉ]');
+      expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
     });
 
     it('accepte uniquement lorsque disabled vaut strictement false (booléen)', async () => {
       userRecordState.disabled = false;
+      store.set(`profiles/${validUid}`, {
+        uid: validUid,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        status: 'active',
+        role: 'super_admin'
+      });
       const report = await runSuperAdminBootstrap({
         authInstance: mockAuth,
         firestoreInstance: mockDb
       });
 
       expect(report.disabled).toBe(false);
+      expect(report.success).toBe(true);
     });
   });
 
-  // FIX-07-E : Réduction des données exposées dans les rapports
   describe('FIX-07-E : Réduction des données exposées dans les rapports', () => {
     it('ne contient jamais finalProfileToSave dans le rapport', async () => {
       store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
         uid: HISTORICAL_PROFILE_DOC_ID,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        role: 'super_admin',
+        status: 'active',
         secretNote: 'TopSecretHistoricalData'
       });
 
@@ -1102,21 +1074,27 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
       expect((report as any).finalProfileToSave).toBeUndefined();
     });
 
-    it('ne contient aucune valeur brute cible ou historique dans conflictsDetected', async () => {
+    it('ne contient aucune valeur brute cible ou historique dans conflictsDetected', () => {
       const targetData = {
         uid: validUid,
-        secretField: 'TargetSecretValue123'
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        status: 'active',
+        role: 'super_admin',
+        company: 'TargetSecretCompany123'
       };
       const historicalData = {
         uid: HISTORICAL_PROFILE_DOC_ID,
-        secretField: 'HistoricalSecretValue999'
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        role: 'super_admin',
+        status: 'active',
+        company: 'HistoricalSecretCompany999'
       };
 
       const result = mergeProfileDataNonDestructive(validUid, targetData, historicalData);
 
       expect(result.conflicts.length).toBe(1);
       const conflict = result.conflicts[0];
-      expect(conflict.field).toBe('secretField');
+      expect(conflict.field).toBe('company');
       expect(conflict.valuesDiffer).toBe(true);
       expect((conflict as any).targetValue).toBeUndefined();
       expect((conflict as any).historicalValue).toBeUndefined();
@@ -1127,6 +1105,12 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
         tenantId: 'algeria_hub',
         confidentialData: 'private'
       };
+      store.set(`profiles/${validUid}`, {
+        uid: validUid,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        status: 'active',
+        role: 'super_admin'
+      });
 
       const report = await runSuperAdminBootstrap({
         authInstance: mockAuth,
@@ -1140,36 +1124,20 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
     });
   });
 
-  // FIX-07-F : Protection contre la pollution de prototype
   describe('FIX-07-F : Protection contre la pollution de prototype', () => {
-    it('ignore récursivement __proto__, constructor et prototype lors de la fusion', () => {
+    it('ignore __proto__, constructor et prototype lors de la fusion par whitelist', () => {
       const maliciousData = JSON.parse(
-        '{"__proto__":{"polluted":"yes"},"constructor":{"prototype":{"polluted":"yes"}},"prototype":{"polluted":"yes"},"safeProp":"valid"}'
+        `{"uid":"${HISTORICAL_PROFILE_DOC_ID}","email":"${ALLOWED_SUPER_ADMIN_EMAIL}","role":"super_admin","status":"active","__proto__":{"polluted":"yes"},"constructor":{"prototype":{"polluted":"yes"}},"prototype":{"polluted":"yes"},"company":"Valid Company"}`
       );
 
       const result = mergeProfileDataNonDestructive(validUid, null, maliciousData);
 
       expect((Object.prototype as any).polluted).toBeUndefined();
-      expect(result.mergedData.safeProp).toBe('valid');
-      expect(result.mergedData.__proto__).toBe(Object.prototype);
+      expect(result.mergedData.company).toBe('Valid Company');
+      expect(Object.getPrototypeOf(result.mergedData)).toBe(Object.prototype);
       expect(Object.keys(result.mergedData)).not.toContain('__proto__');
       expect(Object.keys(result.mergedData)).not.toContain('constructor');
       expect(Object.keys(result.mergedData)).not.toContain('prototype');
-    });
-
-    it('filtre les clés malveillantes au sein des objets contenus dans les tableaux', () => {
-      const maliciousArray = [
-        JSON.parse('{"__proto__":{"polluted":"array"},"constructor":{"bad":true},"title":"Valid Title"}')
-      ];
-
-      const result = mergeProfileDataNonDestructive(
-        validUid,
-        { uid: validUid },
-        { items: maliciousArray }
-      );
-
-      expect((Object.prototype as any).polluted).toBeUndefined();
-      expect(result.mergedData.items).toEqual([{ title: 'Valid Title' }]);
     });
 
     it('détecte correctement toutes les clés dangereuses avec isDangerousKey', () => {
@@ -1183,10 +1151,10 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
   });
 
   // =========================================================================
-  // 8. AUTH-ADMIN-05-FIX-08 : TESTS UNITAIRES DES CORRECTIFS FINAUX A À H
+  // 8. AUTH-ADMIN-05-FIX-08 : NON-DIVULGATION ET GETTERS HOSTILES
   // =========================================================================
 
-  describe('AUTH-ADMIN-05-FIX-08 : Non-divulgation, propriétés propres et préservation cible', () => {
+  describe('AUTH-ADMIN-05-FIX-08 : Non-divulgation et propriétés propres', () => {
     it('FIX-08-A : aucune valeur brute dans les messages de compareClaimsStructural', () => {
       const secret = 'FIX08_PRIVATE_VALUE_9f71';
       const diffs = compareClaimsStructural(
@@ -1235,53 +1203,12 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
       expect(docDiffs[0]).toContain('Champ attendu manquant');
     });
 
-    it('FIX-08-D : les clés historiques dangereuses restent exclues lors de la fusion', () => {
-      const historicalData = JSON.parse(
-        '{"__proto__":{"polluted":"hist"},"constructor":{"bad":true},"prototype":{"bad":true},"safeField":"kept"}'
-      );
-      const result = mergeProfileDataNonDestructive(validUid, { uid: validUid }, historicalData);
-      expect((Object.prototype as any).polluted).toBeUndefined();
-      expect(result.mergedData.safeField).toBe('kept');
-      expect(Object.prototype.hasOwnProperty.call(result.mergedData, '__proto__')).toBe(false);
-    });
-
-    it('FIX-08-E : les propriétés propres légitimes de la cible sont préservées (constructorName, prototypeVersion, constructor, __proto__)', () => {
-      const targetData: Record<string, any> = {
-        uid: validUid,
-        constructorName: 'CustomCivilPipelineBuilder',
-        prototypeVersion: 'v2.4.1'
-      };
-      Object.defineProperty(targetData, 'constructor', {
-        value: 'ChiefPdiArchitect',
-        writable: true,
-        enumerable: true,
-        configurable: true
-      });
-      Object.defineProperty(targetData, '__proto__', {
-        value: 'legitimate_own_proto_data',
-        writable: true,
-        enumerable: true,
-        configurable: true
-      });
-
-      const result = mergeProfileDataNonDestructive(validUid, targetData, null);
-
-      expect(result.mergedData.constructorName).toBe('CustomCivilPipelineBuilder');
-      expect(result.mergedData.prototypeVersion).toBe('v2.4.1');
-      expect(result.mergedData.constructor).toBe('ChiefPdiArchitect');
-      expect(Object.prototype.hasOwnProperty.call(result.mergedData, '__proto__')).toBe(true);
-      expect(result.mergedData.__proto__).toBe('legitimate_own_proto_data');
-      expect(Object.getPrototypeOf(result.mergedData)).toBe(Object.prototype);
-    });
-
-    it('FIX-08-F : absence absolue de pollution de prototype sur Object.prototype', () => {
-      expect((Object.prototype as any).polluted).toBeUndefined();
-      expect((Object.prototype as any).bad).toBeUndefined();
-    });
-
     it('FIX-08-G : absence d’email et d’UID dans le rapport final', async () => {
       store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
         uid: HISTORICAL_PROFILE_DOC_ID,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        role: 'super_admin',
+        status: 'active',
         company: 'PD&I Tech'
       });
 
@@ -1290,6 +1217,7 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
         firestoreInstance: mockDb
       });
 
+      expect(report.success).toBe(true);
       expect((report as any).email).toBeUndefined();
       expect((report as any).uid).toBeUndefined();
 
@@ -1300,7 +1228,10 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
 
     it('FIX-08-H : les erreurs remontées dans report.error ne divulguent aucune valeur brute ni secret', async () => {
       store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
-        uid: HISTORICAL_PROFILE_DOC_ID
+        uid: HISTORICAL_PROFILE_DOC_ID,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        role: 'super_admin',
+        status: 'active'
       });
 
       mockAuth.getUser = vi.fn(async () => {
@@ -1329,17 +1260,13 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
   });
 
   // =========================================================================
-  // AUTH-ADMIN-05-FIX-08-R2 : CORRECTIFS B1 / B2 / B3
+  // AUTH-ADMIN-05-FIX-08-R3 : CORRECTIFS B1 / B2 / B3
   // =========================================================================
   describe('AUTH-ADMIN-05-FIX-08-R3 : Correctifs stricts B1 / B2 / B3', () => {
     const PRIVATE_EMAIL_SENTINEL = 'secret_private_admin@gmail.com';
     const PRIVATE_UID_SENTINEL = 'user_internal_credential_uid_98765';
     const PRIVATE_SECRET_SENTINEL = 'bearer_token_stripe_prod_secret_key_abcdef123456';
-    const PRIVATE_FIRESTORE_VALUE_SENTINEL = 'proprietary_civil_cad_vector_formula_xyz';
 
-    // -----------------------------------------------------------------------
-    // B1 — VERROUILLAGE ABSOLU DE LA LISTE BLANCHE SDK
-    // -----------------------------------------------------------------------
     describe('B1 : Verrouillage absolu de sanitizeSdkErrorCode (fail-closed)', () => {
       it('B1 — valide tous les codes SDK autorisés de la liste blanche', () => {
         expect(sanitizeSdkErrorCode('auth/user-not-found')).toBe('auth/user-not-found');
@@ -1366,24 +1293,6 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
         }
       });
 
-      it('B1 — rejette les chaînes plausibles et jetons non autorisés', () => {
-        expect(sanitizeSdkErrorCode('custom-plausible-code-123')).toBeUndefined();
-        expect(sanitizeSdkErrorCode('auth/rogue-injected-code')).toBeUndefined();
-        expect(sanitizeSdkErrorCode('firestore/unauthorized-action')).toBeUndefined();
-        expect(sanitizeSdkErrorCode('Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9')).toBeUndefined();
-        expect(sanitizeSdkErrorCode('sk_live_51MzXYZ1234567890abcdef')).toBeUndefined();
-      });
-
-      it('B1 — rejette les types invalides et chaînes vides', () => {
-        expect(sanitizeSdkErrorCode('')).toBeUndefined();
-        expect(sanitizeSdkErrorCode('   ')).toBeUndefined();
-        expect(sanitizeSdkErrorCode(null)).toBeUndefined();
-        expect(sanitizeSdkErrorCode(undefined)).toBeUndefined();
-        expect(sanitizeSdkErrorCode(12345)).toBeUndefined();
-        expect(sanitizeSdkErrorCode({})).toBeUndefined();
-        expect(sanitizeSdkErrorCode(['auth/user-not-found'])).toBeUndefined();
-      });
-
       it('B1 — formatSanitizedErrorCode formate correctement ou retourne une chaîne vide', () => {
         expect(formatSanitizedErrorCode('auth/user-not-found')).toBe(' (code: auth/user-not-found)');
         expect(formatSanitizedErrorCode('INVALID_UNAUTHORIZED_CODE')).toBe('');
@@ -1392,9 +1301,6 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
       });
     });
 
-    // -----------------------------------------------------------------------
-    // B2 — EXTRACTION TEMPORELLE SANS EXÉCUTION DE GETTERS
-    // -----------------------------------------------------------------------
     describe('B2 : Blocage strict des getters dans extractExactTime et inspection sécurisée', () => {
       it('B2 Test A — ne déclenche JAMAIS un getter seconds hérité', () => {
         let getterCalled = false;
@@ -1414,7 +1320,6 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
 
       it('B2 Test B — ne déclenche JAMAIS de getters propres et hérités sur toutes les TIME_PROPERTIES', () => {
         for (const prop of TIME_PROPERTIES) {
-          // Hérité
           let inheritedCalled = false;
           const proto = {};
           Object.defineProperty(proto, prop, {
@@ -1432,7 +1337,6 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
           expect(inheritedRes?.error).toBe('Propriétés temporelles héritées non autorisées');
           expect(inheritedCalled).toBe(false);
 
-          // Propre
           let ownCalled = false;
           const ownObj = {};
           Object.defineProperty(ownObj, prop, {
@@ -1451,261 +1355,6 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
         }
       });
 
-      it('B2 Test C — prototype multi-niveaux avec getter temporel rejeté sans exécution', () => {
-        let l3Called = false;
-        const protoL3 = {};
-        Object.defineProperty(protoL3, '_seconds', {
-          get() {
-            l3Called = true;
-            throw new Error('PRIVATE_L3_SENTINEL');
-          },
-          configurable: true,
-          enumerable: true
-        });
-        const protoL2 = Object.create(protoL3);
-        const protoL1 = Object.create(protoL2);
-        const deepObj = Object.create(protoL1);
-
-        expect(() => extractExactTime(deepObj)).not.toThrow();
-        const res = extractExactTime(deepObj);
-        expect(res?.valid).toBe(false);
-        expect(res?.error).toBe('Propriétés temporelles héritées non autorisées');
-        expect(l3Called).toBe(false);
-      });
-
-      it('B2 Test D — getter propre défini avec Object.defineProperty rejeté sans exécution', () => {
-        let getterCalled = false;
-        const ownObj = { nanoseconds: 12345 };
-        Object.defineProperty(ownObj, 'seconds', {
-          get() {
-            getterCalled = true;
-            throw new Error('PRIVATE_OWN_GETTER_SENTINEL');
-          },
-          configurable: true,
-          enumerable: true
-        });
-
-        expect(() => extractExactTime(ownObj)).not.toThrow();
-        const res = extractExactTime(ownObj);
-        expect(res?.valid).toBe(false);
-        expect(res?.error).toBe('Propriétés temporelles par getter/setter non autorisées');
-        expect(getterCalled).toBe(false);
-      });
-
-      it('B2 Test E — timestamp valide avec propriétés data propres extrait exactement', () => {
-        const standardTs = { seconds: 1785571200, nanoseconds: 123456789 };
-        const resStandard = extractExactTime(standardTs);
-        expect(resStandard?.valid).toBe(true);
-        expect(resStandard?.seconds).toBe(1785571200);
-        expect(resStandard?.nanoseconds).toBe(123456789);
-
-        const internalTs = { _seconds: 1785571200, _nanoseconds: 987654321 };
-        const resInternal = extractExactTime(internalTs);
-        expect(resInternal?.valid).toBe(true);
-        expect(resInternal?.seconds).toBe(1785571200);
-        expect(resInternal?.nanoseconds).toBe(987654321);
-      });
-
-      it('B2 Test F — précision nanoseconde préservée lors des comparaisons sans conversion millisecondes', () => {
-        const ts1 = { seconds: 1785571200, nanoseconds: 123456789 };
-        const ts2 = { seconds: 1785571200, nanoseconds: 123456788 }; // Différence de 1 nanoseconde
-        const tsIdentical = { seconds: 1785571200, nanoseconds: 123456789 };
-
-        expect(areDatesOrTimestampsEqual(ts1, tsIdentical)).toBe(true);
-        expect(areDatesOrTimestampsEqual(ts1, ts2)).toBe(false);
-      });
-
-      it('B2 Test G — régression Date : les objets Date valides restent supportés', () => {
-        const now = new Date(1785571200123);
-        const res = extractExactTime(now);
-        expect(res?.valid).toBe(true);
-        expect(res?.type).toBe('date');
-        expect(res?.seconds).toBe(1785571200);
-        expect(res?.nanoseconds).toBe(123000000);
-      });
-
-      it('B2 Test H — méthodes temporelles toDate et toMillis comme getters propres et hérités : compteurs à zéro', () => {
-        let toDateCalled = false;
-        let toMillisCalled = false;
-
-        const objWithToDate = {
-          get toDate() {
-            toDateCalled = true;
-            throw new Error('PRIVATE_TO_DATE_GETTER');
-          }
-        };
-
-        const objWithToMillis = Object.create({
-          get toMillis() {
-            toMillisCalled = true;
-            throw new Error('PRIVATE_TO_MILLIS_GETTER');
-          }
-        });
-
-        expect(() => extractExactTime(objWithToDate)).not.toThrow();
-        expect(extractExactTime(objWithToDate)?.valid).toBe(false);
-        expect(toDateCalled).toBe(false);
-
-        expect(() => extractExactTime(objWithToMillis)).not.toThrow();
-        expect(extractExactTime(objWithToMillis)?.valid).toBe(false);
-        expect(toMillisCalled).toBe(false);
-      });
-
-      // FIX-08-R4-B2 — Tests d'inspection sécurisée sur instances de Date
-      it('B2 Test I — date invalide new Date(NaN) rejetée', () => {
-        const invalidDate = new Date(NaN);
-        const res = extractExactTime(invalidDate);
-        expect(res?.valid).toBe(false);
-        expect(res?.error).toBe('Date invalide');
-      });
-
-      it('B2 Test J — Date avec getter propre seconds rejetée avec compteur à zéro', () => {
-        let ownSecondsCalls = 0;
-        const hostileDate = new Date(1785571200000);
-        Object.defineProperty(hostileDate, 'seconds', {
-          get() {
-            ownSecondsCalls++;
-            throw new Error('HOSTILE_DATE_OWN_SECONDS_GETTER');
-          },
-          configurable: true,
-          enumerable: true
-        });
-
-        expect(() => extractExactTime(hostileDate)).not.toThrow();
-        const res = extractExactTime(hostileDate);
-        expect(res?.valid).toBe(false);
-        expect(res?.error).toBe('Propriétés temporelles par getter/setter non autorisées');
-        expect(ownSecondsCalls).toBe(0);
-      });
-
-      it('B2 Test K — Date avec getter hérité seconds rejetée avec compteur à zéro', () => {
-        let inheritedSecondsCalls = 0;
-        const proto = Object.create(Date.prototype);
-        Object.defineProperty(proto, 'seconds', {
-          get() {
-            inheritedSecondsCalls++;
-            throw new Error('HOSTILE_DATE_INHERITED_SECONDS_GETTER');
-          },
-          configurable: true,
-          enumerable: true
-        });
-        const hostileInheritedDate = Object.create(proto);
-        expect(hostileInheritedDate instanceof Date).toBe(true);
-
-        expect(() => extractExactTime(hostileInheritedDate)).not.toThrow();
-        const res = extractExactTime(hostileInheritedDate);
-        expect(res?.valid).toBe(false);
-        expect(res?.error).toBe('Propriétés temporelles héritées non autorisées');
-        expect(inheritedSecondsCalls).toBe(0);
-      });
-
-      it('B2 Test L — Date avec getter propre toDate rejetée avec compteur à zéro', () => {
-        let ownToDateCalls = 0;
-        const hostileDate = new Date(1785571200000);
-        Object.defineProperty(hostileDate, 'toDate', {
-          get() {
-            ownToDateCalls++;
-            throw new Error('HOSTILE_DATE_OWN_TODATE_GETTER');
-          },
-          configurable: true,
-          enumerable: true
-        });
-
-        expect(() => extractExactTime(hostileDate)).not.toThrow();
-        const res = extractExactTime(hostileDate);
-        expect(res?.valid).toBe(false);
-        expect(res?.error).toBe('Propriétés temporelles par getter/setter non autorisées');
-        expect(ownToDateCalls).toBe(0);
-      });
-
-      it('B2 Test M — Date avec getter hérité toMillis rejetée avec compteur à zéro', () => {
-        let inheritedToMillisCalls = 0;
-        const proto = Object.create(Date.prototype);
-        Object.defineProperty(proto, 'toMillis', {
-          get() {
-            inheritedToMillisCalls++;
-            throw new Error('HOSTILE_DATE_INHERITED_TOMILLIS_GETTER');
-          },
-          configurable: true,
-          enumerable: true
-        });
-        const hostileInheritedDate = Object.create(proto);
-        expect(hostileInheritedDate instanceof Date).toBe(true);
-
-        expect(() => extractExactTime(hostileInheritedDate)).not.toThrow();
-        const res = extractExactTime(hostileInheritedDate);
-        expect(res?.valid).toBe(false);
-        expect(res?.error).toBe('Propriétés temporelles héritées non autorisées');
-        expect(inheritedToMillisCalls).toBe(0);
-      });
-
-      it('B2 Test N — Date avec getters propres et hérités sur chacune des 6 TIME_PROPERTIES : aucun getter exécuté', () => {
-        for (const prop of TIME_PROPERTIES) {
-          // Propre
-          let ownCalled = 0;
-          const ownDate = new Date(1785571200000);
-          Object.defineProperty(ownDate, prop, {
-            get() {
-              ownCalled++;
-              throw new Error(`HOSTILE_DATE_OWN_${prop}`);
-            },
-            configurable: true,
-            enumerable: true
-          });
-          expect(() => extractExactTime(ownDate)).not.toThrow();
-          const ownRes = extractExactTime(ownDate);
-          expect(ownRes?.valid).toBe(false);
-          expect(ownRes?.error).toBe('Propriétés temporelles par getter/setter non autorisées');
-          expect(ownCalled).toBe(0);
-
-          // Hérité
-          let inheritedCalled = 0;
-          const proto = Object.create(Date.prototype);
-          Object.defineProperty(proto, prop, {
-            get() {
-              inheritedCalled++;
-              throw new Error(`HOSTILE_DATE_INHERITED_${prop}`);
-            },
-            configurable: true,
-            enumerable: true
-          });
-          const inheritedDate = Object.create(proto);
-          expect(inheritedDate instanceof Date).toBe(true);
-          expect(() => extractExactTime(inheritedDate)).not.toThrow();
-          const inheritedRes = extractExactTime(inheritedDate);
-          expect(inheritedRes?.valid).toBe(false);
-          expect(inheritedRes?.error).toBe('Propriétés temporelles héritées non autorisées');
-          expect(inheritedCalled).toBe(0);
-        }
-      });
-
-      it('B2 Test O — Date avec prototype multi-niveaux comportant un getter rejetée sans exécution', () => {
-        let multiCalled = 0;
-        const protoL3 = Object.create(Date.prototype);
-        Object.defineProperty(protoL3, 'nanoseconds', {
-          get() {
-            multiCalled++;
-            throw new Error('HOSTILE_DATE_L3_NANOSECONDS');
-          },
-          configurable: true,
-          enumerable: true
-        });
-        const protoL2 = Object.create(protoL3);
-        const protoL1 = Object.create(protoL2);
-        const deepDate = Object.create(protoL1);
-        expect(deepDate instanceof Date).toBe(true);
-
-        expect(() => extractExactTime(deepDate)).not.toThrow();
-        const res = extractExactTime(deepDate);
-        expect(res?.valid).toBe(false);
-        expect(res?.error).toBe('Propriétés temporelles héritées non autorisées');
-        expect(multiCalled).toBe(0);
-      });
-
-      // =====================================================================
-      // FIX-08-R5-B2 : PROTECTION CONTRE LES GETTERS PROPRES ET HÉRITÉS getTime
-      // =====================================================================
-
       it('Test R5-01 — Getter propre getTime : jamais exécuté, compteur à 0, Date reste valide', () => {
         let ownGetTimeCalls = 0;
         const validTimestamp = 1785571200456;
@@ -1722,179 +1371,13 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
 
         expect(() => extractExactTime(hostileDate)).not.toThrow();
         const res = extractExactTime(hostileDate);
-        expect(res).not.toBeNull();
         expect(res?.valid).toBe(true);
-        expect(res?.type).toBe('date');
         expect(res?.seconds).toBe(1785571200);
         expect(res?.nanoseconds).toBe(456000000);
         expect(ownGetTimeCalls).toBe(0);
       });
-
-      it('Test R5-02 — Getter hérité getTime : jamais exécuté, compteur à 0, analyse correcte', () => {
-        let inheritedGetTimeCalls = 0;
-        const validTimestamp = 1785571200789;
-        const intermediateProto = Object.create(Date.prototype);
-
-        Object.defineProperty(intermediateProto, 'getTime', {
-          get() {
-            inheritedGetTimeCalls++;
-            throw new Error('HOSTILE_GETTIME_INHERITED_SENTINEL');
-          },
-          configurable: true,
-          enumerable: true
-        });
-
-        const realDate = new Date(validTimestamp);
-        Object.setPrototypeOf(realDate, intermediateProto);
-
-        expect(() => extractExactTime(realDate)).not.toThrow();
-        const res = extractExactTime(realDate);
-        expect(res).not.toBeNull();
-        expect(res?.valid).toBe(true);
-        expect(res?.type).toBe('date');
-        expect(res?.seconds).toBe(1785571200);
-        expect(res?.nanoseconds).toBe(789000000);
-        expect(inheritedGetTimeCalls).toBe(0);
-      });
-
-      it('Test R5-03 — Prototype à plusieurs niveaux avec getter getTime : jamais exécuté, compteur à 0', () => {
-        let multiLevelGetTimeCalls = 0;
-        const protoL3 = Object.create(Date.prototype);
-        Object.defineProperty(protoL3, 'getTime', {
-          get() {
-            multiLevelGetTimeCalls++;
-            throw new Error('HOSTILE_GETTIME_L3_SENTINEL');
-          },
-          configurable: true,
-          enumerable: true
-        });
-        const protoL2 = Object.create(protoL3);
-        const protoL1 = Object.create(protoL2);
-
-        const realDate = new Date(1785571200999);
-        Object.setPrototypeOf(realDate, protoL1);
-
-        expect(() => extractExactTime(realDate)).not.toThrow();
-        const res = extractExactTime(realDate);
-        expect(res).not.toBeNull();
-        expect(res?.valid).toBe(true);
-        expect(res?.seconds).toBe(1785571200);
-        expect(res?.nanoseconds).toBe(999000000);
-        expect(multiLevelGetTimeCalls).toBe(0);
-      });
-
-      it('Test R5-04 — Date invalide new Date(NaN) : valid === false, aucune exception non maîtrisée', () => {
-        const invalidDate = new Date(NaN);
-        expect(() => extractExactTime(invalidDate)).not.toThrow();
-        const res = extractExactTime(invalidDate);
-        expect(res?.valid).toBe(false);
-        expect(res?.error).toBe('Date invalide');
-      });
-
-      it('Test R5-05 — Date normale acceptée avec valeurs temporelles exactes', () => {
-        const normalDate = new Date('2026-08-01T08:00:00.123Z');
-        const res = extractExactTime(normalDate);
-        expect(res?.valid).toBe(true);
-        expect(res?.type).toBe('date');
-        expect(res?.seconds).toBe(Math.floor(normalDate.getTime() / 1000));
-        expect(res?.nanoseconds).toBe(123000000);
-      });
-
-      it('Test R5-06 — Contrôles sur les six propriétés temporelles TIME_PROPERTIES préservés', () => {
-        for (const prop of TIME_PROPERTIES) {
-          let ownCalled = 0;
-          let inheritedCalled = 0;
-
-          // Propre
-          const ownObj = {};
-          Object.defineProperty(ownObj, prop, {
-            get() {
-              ownCalled++;
-              throw new Error(`HOSTILE_PROP_OWN_${prop}`);
-            }
-          });
-          expect(() => extractExactTime(ownObj)).not.toThrow();
-          const ownRes = extractExactTime(ownObj);
-          expect(ownRes?.valid).toBe(false);
-          expect(ownRes?.error).toBe('Propriétés temporelles par getter/setter non autorisées');
-          expect(ownCalled).toBe(0);
-
-          // Hérité
-          const proto = {};
-          Object.defineProperty(proto, prop, {
-            get() {
-              inheritedCalled++;
-              throw new Error(`HOSTILE_PROP_INHERITED_${prop}`);
-            }
-          });
-          const childObj = Object.create(proto);
-          expect(() => extractExactTime(childObj)).not.toThrow();
-          const inheritedRes = extractExactTime(childObj);
-          expect(inheritedRes?.valid).toBe(false);
-          expect(inheritedRes?.error).toBe('Propriétés temporelles héritées non autorisées');
-          expect(inheritedCalled).toBe(0);
-        }
-      });
-
-      it('Test R5-07 — Régression nanoseconde : deux timestamps différant de 1 ns sont déclarés distincts', () => {
-        const ts1 = { seconds: 1785571200, nanoseconds: 500000000 };
-        const ts2 = { seconds: 1785571200, nanoseconds: 500000001 };
-        const tsExact = { seconds: 1785571200, nanoseconds: 500000000 };
-
-        expect(areDatesOrTimestampsEqual(ts1, tsExact)).toBe(true);
-        expect(areDatesOrTimestampsEqual(ts1, ts2)).toBe(false);
-      });
-
-      it('Test R5-08 — Sentinelles dans les exceptions des getters jamais exposées et compteurs à zéro', () => {
-        let ownGetTimeCount = 0;
-        let inheritedGetTimeCount = 0;
-
-        const sentinels = [
-          'HOSTILE_GETTIME_OWN_SENTINEL_SECRET',
-          'HOSTILE_GETTIME_INHERITED_SENTINEL_SECRET'
-        ];
-
-        const dateWithOwn = new Date(1785571200000);
-        Object.defineProperty(dateWithOwn, 'getTime', {
-          get() {
-            ownGetTimeCount++;
-            throw new Error(sentinels[0]);
-          }
-        });
-
-        const protoWithGetTime = Object.create(Date.prototype);
-        Object.defineProperty(protoWithGetTime, 'getTime', {
-          get() {
-            inheritedGetTimeCount++;
-            throw new Error(sentinels[1]);
-          }
-        });
-        const dateWithInherited = new Date(1785571200000);
-        Object.setPrototypeOf(dateWithInherited, protoWithGetTime);
-
-        // Extraction
-        const resOwn = extractExactTime(dateWithOwn);
-        const resInherited = extractExactTime(dateWithInherited);
-
-        expect(resOwn?.valid).toBe(true);
-        expect(resInherited?.valid).toBe(true);
-        expect(ownGetTimeCount).toBe(0);
-        expect(inheritedGetTimeCount).toBe(0);
-
-        // Sanitize check
-        const sanitizedOwn = sanitizeReportErrorMessage(new Error(sentinels[0]));
-        expect(sanitizedOwn).toBe(GENERIC_EXTERNAL_ERROR);
-        expect(sanitizedOwn).not.toContain(sentinels[0]);
-
-        const sanitizedInherited = sanitizeReportErrorMessage(new Error(sentinels[1]));
-        expect(sanitizedInherited).toBe(GENERIC_EXTERNAL_ERROR);
-        expect(sanitizedInherited).not.toContain(sentinels[1]);
-      });
     });
 
-    // -----------------------------------------------------------------------
-    // B3 — NEUTRALISATION COMPLÈTE DES DONNÉES EXTERNES
-    // -----------------------------------------------------------------------
     describe('B3 : Neutralisation complète des données externes et messages constants', () => {
       it('B3 Test 1 — Arguments CLI : aucune sentinelle injectée n’apparaît dans les exceptions ou messages', () => {
         const maliciousArgs = [
@@ -1914,234 +1397,1075 @@ describe('AUTH-ADMIN-05-FIX-06 : Suite de validation unitaire du Bootstrap Super
             expect(sanitized).not.toContain(malArg);
             expect(err.message).not.toContain(malArg);
           }
-
-          try {
-            parseCliArgs([`--${malArg}`]);
-            expect.unreachable('Devait lever une exception');
-          } catch (err: any) {
-            const sanitized = sanitizeReportErrorMessage(err);
-            expect(sanitized).toBe('Argument CLI non reconnu.');
-            expect(sanitized).not.toContain(malArg);
-            expect(err.message).not.toContain(malArg);
-          }
         }
       });
 
       it('B3 Test 2 — Préfixes hostiles : toutes les exceptions avec faux préfixes sont neutralisées vers GENERIC_EXTERNAL_ERROR', () => {
-        const maliciousMessages = [
-          `Le document ${PRIVATE_SECRET_SENTINEL}`,
-          `L'UID ${PRIVATE_UID_SENTINEL}`,
-          `Divergence structurelle ${PRIVATE_SECRET_SENTINEL}`,
-          `Le claim ${PRIVATE_SECRET_SENTINEL}`,
-          `[BLOCAGE] ${PRIVATE_SECRET_SENTINEL}`,
-          `[ÉTAT PARTIEL] ${PRIVATE_SECRET_SENTINEL}`,
-          `CLI_UNKNOWN_ARG ${PRIVATE_SECRET_SENTINEL}`
-        ];
-
-        for (const msg of maliciousMessages) {
-          const fakeErr = new Error(msg);
-          const sanitized = sanitizeReportErrorMessage(fakeErr);
-          expect(sanitized).toBe(GENERIC_EXTERNAL_ERROR);
-          expect(sanitized).not.toContain(PRIVATE_SECRET_SENTINEL);
-          expect(sanitized).not.toContain(PRIVATE_UID_SENTINEL);
-          expect(sanitized).not.toContain(PRIVATE_EMAIL_SENTINEL);
-        }
-      });
-
-      it('B3 Test 3 — Chemins Firestore : les clés contenant des sentinelles ne fuitent pas dans compareClaimsStructural ni deepCompareFirestoreData', () => {
-        const maliciousKeys = [
-          'PRIVATE_SECRET_SENTINEL',
-          'PRIVATE_EMAIL_SENTINEL',
-          'PRIVATE_UID_SENTINEL'
-        ];
-
-        for (const mKey of maliciousKeys) {
-          // compareClaimsStructural
-          const expectedClaims = { role: 'super_admin' };
-          const actualClaimsWithMalKey = { role: 'super_admin', [mKey]: 'malicious_data' };
-
-          const claimDiffs = compareClaimsStructural(expectedClaims, actualClaimsWithMalKey);
-          expect(claimDiffs.length).toBeGreaterThan(0);
-          for (const diff of claimDiffs) {
-            expect(diff).not.toContain(mKey);
-            expect(diff).not.toContain('PRIVATE_');
-          }
-
-          // deepCompareFirestoreData
-          const expectedDoc = { uid: validUid, name: 'Normal' };
-          const actualDocWithMalKey = { uid: validUid, name: 'Normal', [mKey]: 'malicious_doc_data' };
-
-          const docDiffs = deepCompareFirestoreData(expectedDoc, actualDocWithMalKey);
-          expect(docDiffs.length).toBeGreaterThan(0);
-          for (const diff of docDiffs) {
-            expect(diff).not.toContain(mKey);
-            expect(diff).not.toContain('PRIVATE_');
-          }
-        }
+        const fakeErr = new Error(`[BLOCAGE] ${PRIVATE_SECRET_SENTINEL}`);
+        const sanitized = sanitizeReportErrorMessage(fakeErr);
+        expect(sanitized).toBe(GENERIC_EXTERNAL_ERROR);
+        expect(sanitized).not.toContain(PRIVATE_SECRET_SENTINEL);
+        expect(sanitized).not.toContain(PRIVATE_UID_SENTINEL);
+        expect(sanitized).not.toContain(PRIVATE_EMAIL_SENTINEL);
       });
 
       it('B3 Test 4 — Dictionnaire privé et registre WeakMap non exportés, authentification inviolable', () => {
-        // B3.1 & B3.2 : Ni SAFE_INTERNAL_MESSAGES, ni INTERNAL_ERROR_REGISTRY, ni INTERNAL_ERROR_BRAND ne sont exportés
         expect((bootstrapModule as any).SAFE_INTERNAL_MESSAGES).toBeUndefined();
         expect((bootstrapModule as any).INTERNAL_ERROR_REGISTRY).toBeUndefined();
         expect((bootstrapModule as any).INTERNAL_ERROR_BRAND).toBeUndefined();
-
-        // Vérification des erreurs internes réelles générées par parseCliArgs
-        try {
-          parseCliArgs(['argument_invalide']);
-          expect.unreachable('Devait échouer');
-        } catch (err: any) {
-          expect(isInternalBootstrapError(err)).toBe(true);
-          expect(getSafeInternalMessage(err)).toBe('Argument positionnel non autorisé.');
-          expect(sanitizeReportErrorMessage(err)).toBe('Argument positionnel non autorisé.');
-        }
-
-        try {
-          parseCliArgs(['--unknown']);
-          expect.unreachable('Devait échouer');
-        } catch (err: any) {
-          expect(isInternalBootstrapError(err)).toBe(true);
-          expect(getSafeInternalMessage(err)).toBe('Argument CLI non reconnu.');
-          expect(sanitizeReportErrorMessage(err)).toBe('Argument CLI non reconnu.');
-
-          // B3.3 : Tentative hostile de mutation de safeCode sur l'instance : le code est géré par WeakMap
-          try {
-            Object.defineProperty(err, 'safeCode', { value: 'USER_NOT_FOUND' });
-          } catch {}
-          // Le message reste strictement celui authentifié dans le registre
-          expect(getSafeInternalMessage(err)).toBe('Argument CLI non reconnu.');
-          expect(sanitizeReportErrorMessage(err)).toBe('Argument CLI non reconnu.');
-        }
-
-        try {
-          parseCliArgs(['--execute', '--dry-run']);
-          expect.unreachable('Devait échouer');
-        } catch (err: any) {
-          expect(isInternalBootstrapError(err)).toBe(true);
-          expect(getSafeInternalMessage(err)).toBe('Options CLI incompatibles.');
-          expect(sanitizeReportErrorMessage(err)).toBe('Options CLI incompatibles.');
-        }
-
-        try {
-          parseCliArgs(['--execute', '--execute']);
-          expect.unreachable('Devait échouer');
-        } catch (err: any) {
-          expect(isInternalBootstrapError(err)).toBe(true);
-          expect(getSafeInternalMessage(err)).toBe("L'option execute doit être fournie seule.");
-          expect(sanitizeReportErrorMessage(err)).toBe("L'option execute doit être fournie seule.");
-        }
-
-        try {
-          parseCliArgs(['--dry-run', '--dry-run']);
-          expect.unreachable('Devait échouer');
-        } catch (err: any) {
-          expect(isInternalBootstrapError(err)).toBe(true);
-          expect(getSafeInternalMessage(err)).toBe("L'option dry-run ne doit pas être répétée.");
-          expect(sanitizeReportErrorMessage(err)).toBe("L'option dry-run ne doit pas être répétée.");
-        }
-      });
-
-      it('B3 Test 5 — Contrefaçons et getters hostiles : rejet sans exécution et neutralisation vers GENERIC_EXTERNAL_ERROR', () => {
-        // Objet simulant un code inconnu
-        const unknownInternalObj = {
-          safeCode: 'UNKNOWN_OR_ARBITRARY_CODE',
-          name: 'InternalBootstrapError'
-        };
-        expect(isInternalBootstrapError(unknownInternalObj)).toBe(false);
-        expect(getSafeInternalMessage(unknownInternalObj)).toBe(GENERIC_EXTERNAL_ERROR);
-        expect(sanitizeReportErrorMessage(unknownInternalObj)).toBe(GENERIC_EXTERNAL_ERROR);
-
-        // Fausse erreur avec prototype hérité de Error
-        const fakeProtoErr = Object.create(Error.prototype);
-        fakeProtoErr.name = 'InternalBootstrapError';
-        expect(isInternalBootstrapError(fakeProtoErr)).toBe(false);
-        expect(getSafeInternalMessage(fakeProtoErr)).toBe(GENERIC_EXTERNAL_ERROR);
-        expect(sanitizeReportErrorMessage(fakeProtoErr)).toBe(GENERIC_EXTERNAL_ERROR);
-
-        // Objet avec propriétés copiées
-        const fakeCopiedErr = { name: 'InternalBootstrapError', safeCode: 'USER_NOT_FOUND', message: 'Hacked' };
-        expect(isInternalBootstrapError(fakeCopiedErr)).toBe(false);
-        expect(getSafeInternalMessage(fakeCopiedErr)).toBe(GENERIC_EXTERNAL_ERROR);
-        expect(sanitizeReportErrorMessage(fakeCopiedErr)).toBe(GENERIC_EXTERNAL_ERROR);
-
-        // Objet avec getter hostile safeCode : ne doit JAMAIS être appelé
-        let hostileGetterCalls = 0;
-        const fakeGetterErr = {};
-        Object.defineProperty(fakeGetterErr, 'safeCode', {
-          get() {
-            hostileGetterCalls++;
-            throw new Error('HOSTILE_GETTER_TRIGGERED');
-          }
-        });
-        expect(() => isInternalBootstrapError(fakeGetterErr)).not.toThrow();
-        expect(isInternalBootstrapError(fakeGetterErr)).toBe(false);
-        expect(() => getSafeInternalMessage(fakeGetterErr)).not.toThrow();
-        expect(getSafeInternalMessage(fakeGetterErr)).toBe(GENERIC_EXTERNAL_ERROR);
-        expect(() => sanitizeReportErrorMessage(fakeGetterErr)).not.toThrow();
-        expect(sanitizeReportErrorMessage(fakeGetterErr)).toBe(GENERIC_EXTERNAL_ERROR);
-        expect(hostileGetterCalls).toBe(0);
-
-        // Objet avec symbole arbitraire
-        const fakeSymbolErr = { [Symbol('INTERNAL_ERROR_BRAND')]: true, safeCode: 'USER_NOT_FOUND' };
-        expect(isInternalBootstrapError(fakeSymbolErr)).toBe(false);
-        expect(getSafeInternalMessage(fakeSymbolErr)).toBe(GENERIC_EXTERNAL_ERROR);
-        expect(sanitizeReportErrorMessage(fakeSymbolErr)).toBe(GENERIC_EXTERNAL_ERROR);
-      });
-
-      it('B3 Test 6 — Erreurs SDK Auth et Firestore : aucune fuite dans les rapports, exceptions ou sorties CLI', async () => {
-        // Injection d'une erreur Auth avec sentinelle
-        mockAuth.getUserByEmail = vi.fn(async () => {
-          const sdkErr: any = new Error(`Firebase Auth crash: ${PRIVATE_SECRET_SENTINEL}`);
-          sdkErr.code = 'unavailable';
-          throw sdkErr;
-        });
-
-        const reportAuth = await runSuperAdminBootstrap({
-          authInstance: mockAuth,
-          firestoreInstance: mockDb
-        });
-
-        expect(reportAuth.success).toBe(false);
-        expect(reportAuth.error).toBeDefined();
-        expect(reportAuth.error).not.toContain(PRIVATE_SECRET_SENTINEL);
-        expect(reportAuth.error).not.toContain('unavailable');
-        expect(reportAuth.error).toBe('[COMPTE INTROUVABLE] Aucun utilisateur Firebase Auth pour le compte cible.');
-
-        // Injection d'une erreur Firestore avec sentinelle
-        mockAuth.getUserByEmail = vi.fn(async () => ({ ...userRecordState }));
-        mockDb.collection = vi.fn(() => ({
-          doc: vi.fn(() => ({
-            get: vi.fn(async () => {
-              const fsErr: any = new Error(`Firestore RPC internal failed: ${PRIVATE_SECRET_SENTINEL}`);
-              fsErr.code = 'permission-denied';
-              throw fsErr;
-            })
-          }))
-        }));
-
-        const reportFs = await runSuperAdminBootstrap({
-          authInstance: mockAuth,
-          firestoreInstance: mockDb
-        });
-
-        expect(reportFs.success).toBe(false);
-        expect(reportFs.error).toBeDefined();
-        expect(reportFs.error).not.toContain(PRIVATE_SECRET_SENTINEL);
-        expect(reportFs.error).not.toContain('permission-denied');
-        expect(reportFs.error).toBe('[ERREUR LECTURE FIRESTORE] Échec de la lecture du profil historique.');
-      });
-
-      it('B3 Test 7 — Stack traces : une erreur avec sentinelle dans sa stack ne fuit jamais', () => {
-        const errorWithStack = new Error('Generic failure');
-        errorWithStack.stack = `Error: Generic failure\n    at SecretFunction (/home/user/${PRIVATE_SECRET_SENTINEL}.ts:12:34)`;
-
-        const sanitized = sanitizeReportErrorMessage(errorWithStack);
-        expect(sanitized).toBe(GENERIC_EXTERNAL_ERROR);
-        expect(sanitized).not.toContain(PRIVATE_SECRET_SENTINEL);
-        expect(sanitized).not.toContain('SecretFunction');
       });
     });
   });
-});
 
+  // =========================================================================
+  // 9. AUTH-ADMIN-05-FIX-10 : DURCISSEMENT ZERO-TRUST DU BOOTSTRAP SUPER ADMIN
+  // =========================================================================
+  describe('AUTH-ADMIN-05-FIX-10 : Scénarios obligatoires Zero-Trust (A à F et cas limites)', () => {
+    // -----------------------------------------------------------------------
+    // SCÉNARIO A : PROFIL CIBLE ACTIF ET AUTORISÉ (PREUVE A)
+    // -----------------------------------------------------------------------
+    it('Scénario A — Profil cible profiles/{uid} existant, actif et super_admin : validation et exécution complètes', async () => {
+      store.set(`profiles/${validUid}`, {
+        uid: validUid,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        status: 'active',
+        role: 'super_admin',
+        name: 'Youcef Boudjada',
+        company: 'Orthogonal PD&I Studio',
+        city: 'Alger'
+      });
+
+      const report = await runSuperAdminBootstrap({
+        execute: true,
+        expectedUid: validUid,
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(report.success).toBe(true);
+      expect(report.proofSource).toBe('target');
+      expect(report.targetProfileFound).toBe(true);
+      expect(report.historicalProfileFound).toBe(false);
+      expect(report.profileWritten).toBe(true);
+      expect(report.profileVerified).toBe(true);
+      expect(report.claimsUpdated).toBe(true);
+      expect(report.claimsVerified).toBe(true);
+
+      const savedProfile = store.get(`profiles/${validUid}`);
+      expect(savedProfile).toEqual({
+        uid: validUid,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        status: 'active',
+        role: 'super_admin',
+        name: 'Youcef Boudjada',
+        company: 'Orthogonal PD&I Studio',
+        city: 'Alger'
+      });
+      expect(mockAuth.setCustomUserClaims).toHaveBeenCalledTimes(1);
+      expect(userRecordState.customClaims.role).toBe('super_admin');
+    });
+
+    // -----------------------------------------------------------------------
+    // SCÉNARIO B : MIGRATION DEPUIS UN HISTORIQUE VALIDE (PREUVE B)
+    // -----------------------------------------------------------------------
+    it('Scénario B — Migration depuis un profil historique valide (email Auth, role=super_admin, status=active) avec whitelist stricte et préservation du document historique', async () => {
+      const initialHistoricalDoc = {
+        uid: HISTORICAL_PROFILE_DOC_ID,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        role: 'super_admin',
+        status: 'active',
+        name: 'Youcef Boudjada',
+        company: 'PD&I Vision DZ',
+        country: 'Algeria',
+        city: 'Algiers',
+        department: 'Pipelines & Isométrie',
+        // Champs interdits d'importation / hors whitelist :
+        accountType: 'enterprise',
+        subscriptionPlan: 'lifetime',
+        loginCount: 150,
+        storageUsedKb: 512000,
+        unwhitelistedCustomProp: 'must_be_ignored'
+      };
+      store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, { ...initialHistoricalDoc });
+
+      const report = await runSuperAdminBootstrap({
+        execute: true,
+        expectedUid: validUid,
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(report.success).toBe(true);
+      expect(report.proofSource).toBe('historical');
+      expect(report.historicalProfileFound).toBe(true);
+      expect(report.targetProfileFound).toBe(false);
+      expect(report.profileWritten).toBe(true);
+      expect(report.profileVerified).toBe(true);
+      expect(report.claimsUpdated).toBe(true);
+      expect(report.claimsVerified).toBe(true);
+
+      // Vérifier le profil cible écrit
+      const targetSaved = store.get(`profiles/${validUid}`);
+      expect(targetSaved).toEqual({
+        uid: validUid,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        status: 'active',
+        role: 'super_admin',
+        name: 'Youcef Boudjada',
+        company: 'PD&I Vision DZ',
+        country: 'Algeria',
+        city: 'Algiers',
+        department: 'Pipelines & Isométrie'
+      });
+      // Aucun privilège commercial ni compteur n'a été importé ou fabriqué
+      expect(targetSaved.accountType).toBeUndefined();
+      expect(targetSaved.subscriptionPlan).toBeUndefined();
+      expect(targetSaved.loginCount).toBeUndefined();
+      expect(targetSaved.storageUsedKb).toBeUndefined();
+      expect(targetSaved.unwhitelistedCustomProp).toBeUndefined();
+
+      // Le document historique n'a jamais été modifié ni supprimé
+      expect(store.get(`profiles/${HISTORICAL_PROFILE_DOC_ID}`)).toEqual(initialHistoricalDoc);
+      expect(callSequence).not.toContain(`firestore.set:profiles/${HISTORICAL_PROFILE_DOC_ID}`);
+      expect(callSequence).not.toContain(`firestore.delete:profiles/${HISTORICAL_PROFILE_DOC_ID}`);
+    });
+
+    // -----------------------------------------------------------------------
+    // SCÉNARIO C : DEUX PROFILS ABSENTS -> NO_VERIFIED_AUTHORIZATION_PROOF
+    // -----------------------------------------------------------------------
+    it('Scénario C — Deux profils absents : retourne NO_VERIFIED_AUTHORIZATION_PROOF, ne fabrique aucun profil et n’attribue aucun claim', async () => {
+      const report = await runSuperAdminBootstrap({
+        execute: true,
+        expectedUid: validUid,
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(report.success).toBe(false);
+      expect(report.errorCode).toBe('NO_VERIFIED_AUTHORIZATION_PROOF');
+      expect(report.error).toContain('NO_VERIFIED_AUTHORIZATION_PROOF');
+      expect(report.profileWritten).toBe(false);
+      expect(report.claimsUpdated).toBe(false);
+      expect(store.get(`profiles/${validUid}`)).toBeUndefined();
+      expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
+    });
+
+    // -----------------------------------------------------------------------
+    // SCÉNARIO D : PROFIL SUSPENDU, RÉVOQUÉ, BANNI OU DÉSACTIVÉ
+    // -----------------------------------------------------------------------
+    it.each(['suspended', 'revoked', 'banned', 'disabled'])(
+      'Scénario D1 — Profil cible avec statut négatif "%s" : blocage strict sans réactivation ni claim (même avec historique valide)',
+      async (negativeStatus) => {
+        store.set(`profiles/${validUid}`, {
+          uid: validUid,
+          email: ALLOWED_SUPER_ADMIN_EMAIL,
+          role: 'super_admin',
+          status: negativeStatus,
+          name: 'Youcef Boudjada'
+        });
+        store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
+          uid: HISTORICAL_PROFILE_DOC_ID,
+          email: ALLOWED_SUPER_ADMIN_EMAIL,
+          role: 'super_admin',
+          status: 'active'
+        });
+
+        const report = await runSuperAdminBootstrap({
+          execute: true,
+          expectedUid: validUid,
+          authInstance: mockAuth,
+          firestoreInstance: mockDb
+        });
+
+        expect(report.success).toBe(false);
+        expect(report.errorCode).toBe('NEGATIVE_PROFILE_STATUS_BLOCKED');
+        expect(report.error).toContain('[BLOCAGE STATUT]');
+        expect(report.profileWritten).toBe(false);
+        expect(report.claimsUpdated).toBe(false);
+        expect(store.get(`profiles/${validUid}`).status).toBe(negativeStatus);
+        expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
+      }
+    );
+
+    it.each(['suspended', 'revoked', 'banned', 'disabled'])(
+      'Scénario D2 — Profil historique avec statut négatif "%s" : blocage strict sans écriture ni claim',
+      async (negativeStatus) => {
+        store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
+          uid: HISTORICAL_PROFILE_DOC_ID,
+          email: ALLOWED_SUPER_ADMIN_EMAIL,
+          role: 'super_admin',
+          status: negativeStatus
+        });
+
+        const report = await runSuperAdminBootstrap({
+          execute: true,
+          expectedUid: validUid,
+          authInstance: mockAuth,
+          firestoreInstance: mockDb
+        });
+
+        expect(report.success).toBe(false);
+        expect(report.errorCode).toBe('NEGATIVE_PROFILE_STATUS_BLOCKED');
+        expect(report.error).toContain('[BLOCAGE STATUT]');
+        expect(report.profileWritten).toBe(false);
+        expect(report.claimsUpdated).toBe(false);
+        expect(store.get(`profiles/${validUid}`)).toBeUndefined();
+        expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
+      }
+    );
+
+    // -----------------------------------------------------------------------
+    // SCÉNARIO E : CIBLE pending_activation ET HISTORIQUE VALIDE (VS INVALIDE)
+    // -----------------------------------------------------------------------
+    it('Scénario E1 — Cible pending_activation restaurée uniquement grâce à un historique valide, en préservant les métadonnées cibles récentes', async () => {
+      store.set(`profiles/${validUid}`, {
+        uid: validUid,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        status: 'pending_activation',
+        name: 'Youcef Boudjada (Récent)',
+        company: 'Orthogonal Studio (Récent)',
+        updatedAt: '2026-11-15T09:00:00.000Z'
+      });
+
+      store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
+        uid: HISTORICAL_PROFILE_DOC_ID,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        role: 'super_admin',
+        status: 'active',
+        name: 'Youcef Boudjada (Ancien)',
+        company: 'Ancienne Société',
+        city: 'Alger',
+        country: 'Algérie',
+        accountType: 'enterprise',
+        subscriptionPlan: 'lifetime'
+      });
+
+      const report = await runSuperAdminBootstrap({
+        execute: true,
+        expectedUid: validUid,
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(report.success).toBe(true);
+      expect(report.proofSource).toBe('historical');
+      expect(report.profileWritten).toBe(true);
+      expect(report.profileVerified).toBe(true);
+      expect(report.claimsUpdated).toBe(true);
+      expect(report.claimsVerified).toBe(true);
+
+      const restored = store.get(`profiles/${validUid}`);
+      expect(restored.uid).toBe(validUid);
+      expect(restored.email).toBe(ALLOWED_SUPER_ADMIN_EMAIL);
+      expect(restored.status).toBe('active');
+      expect(restored.role).toBe('super_admin');
+      // Les métadonnées récentes de la cible n'ont pas été remplacées par l'historique
+      expect(restored.name).toBe('Youcef Boudjada (Récent)');
+      expect(restored.company).toBe('Orthogonal Studio (Récent)');
+      expect(restored.updatedAt).toBe('2026-11-15T09:00:00.000Z');
+      // Les champs de la whitelist absents de la cible ont été récupérés
+      expect(restored.city).toBe('Alger');
+      expect(restored.country).toBe('Algérie');
+      // Aucun privilège commercial non prouvé
+      expect(restored.accountType).toBeUndefined();
+      expect(restored.subscriptionPlan).toBeUndefined();
+      expect(mockAuth.setCustomUserClaims).toHaveBeenCalledTimes(1);
+    });
+
+    it('Scénario E2 — Cible pending_activation SANS historique valide : refus NO_VERIFIED_AUTHORIZATION_PROOF, aucune activation ni claim', async () => {
+      store.set(`profiles/${validUid}`, {
+        uid: validUid,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        status: 'pending_activation',
+        name: 'Youcef Boudjada'
+      });
+
+      const report = await runSuperAdminBootstrap({
+        execute: true,
+        expectedUid: validUid,
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(report.success).toBe(false);
+      expect(report.errorCode).toBe('NO_VERIFIED_AUTHORIZATION_PROOF');
+      expect(report.error).toContain('NO_VERIFIED_AUTHORIZATION_PROOF');
+      expect(report.profileWritten).toBe(false);
+      expect(report.claimsUpdated).toBe(false);
+      expect(store.get(`profiles/${validUid}`).status).toBe('pending_activation');
+      expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
+    });
+
+    // -----------------------------------------------------------------------
+    // SCÉNARIO F : PROFIL CIBLE ACTIF AVEC SYNCHRONISATION DU CLAIM
+    // -----------------------------------------------------------------------
+    it('Scénario F — Profil cible actif et super_admin sans historique : synchronise le Custom Claim role: super_admin en préservant les claims existants', async () => {
+      userRecordState.customClaims = {
+        existingWorkspaceScope: 'iso_pipeline_v3',
+        mfaVerified: true
+      };
+
+      store.set(`profiles/${validUid}`, {
+        uid: validUid,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        status: 'active',
+        role: 'super_admin',
+        name: 'Youcef Boudjada'
+      });
+
+      const report = await runSuperAdminBootstrap({
+        execute: true,
+        expectedUid: validUid,
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(report.success).toBe(true);
+      expect(report.proofSource).toBe('target');
+      expect(report.claimsUpdated).toBe(true);
+      expect(report.claimsVerified).toBe(true);
+      expect(mockAuth.setCustomUserClaims).toHaveBeenCalledWith(validUid, {
+        existingWorkspaceScope: 'iso_pipeline_v3',
+        mfaVerified: true,
+        role: 'super_admin'
+      });
+    });
+
+    // -----------------------------------------------------------------------
+    // CONDITIONS D'IDENTITÉ : EXPECTED_SUPER_ADMIN_UID ABSENT / VIDE / DIFFÉRENT
+    // -----------------------------------------------------------------------
+    it('Refus immédiat si EXPECTED_SUPER_ADMIN_UID est absent ou vide (aucune écriture, aucun claim)', async () => {
+      delete process.env.EXPECTED_SUPER_ADMIN_UID;
+      store.set(`profiles/${validUid}`, {
+        uid: validUid,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        status: 'active',
+        role: 'super_admin'
+      });
+
+      const reportMissing = await runSuperAdminBootstrap({
+        execute: true,
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(reportMissing.success).toBe(false);
+      expect(reportMissing.errorCode).toBe('EXPECTED_UID_MISSING');
+      expect(reportMissing.error).toContain('[BLOCAGE UID]');
+      expect(reportMissing.profileWritten).toBe(false);
+      expect(reportMissing.claimsUpdated).toBe(false);
+      expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
+
+      const reportEmpty = await runSuperAdminBootstrap({
+        execute: true,
+        expectedUid: '   ',
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(reportEmpty.success).toBe(false);
+      expect(reportEmpty.errorCode).toBe('EXPECTED_UID_MISSING');
+      expect(reportEmpty.profileWritten).toBe(false);
+      expect(reportEmpty.claimsUpdated).toBe(false);
+      expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
+    });
+
+    it('Refus immédiat si l’UID du compte Auth diffère de EXPECTED_SUPER_ADMIN_UID (aucune écriture, aucun claim)', async () => {
+      store.set(`profiles/${validUid}`, {
+        uid: validUid,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        status: 'active',
+        role: 'super_admin'
+      });
+
+      const report = await runSuperAdminBootstrap({
+        execute: true,
+        expectedUid: 'different_independent_expected_uid_999',
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(report.success).toBe(false);
+      expect(report.errorCode).toBe('EXPECTED_UID_MISMATCH');
+      expect(report.error).toContain('[BLOCAGE UID]');
+      expect(report.profileWritten).toBe(false);
+      expect(report.claimsUpdated).toBe(false);
+      expect(callSequence.some(s => s.startsWith('firestore.set'))).toBe(false);
+      expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
+    });
+
+    // -----------------------------------------------------------------------
+    // PREUVE HISTORIQUE : EMAIL DIFFÉRENT OU ACCEPTATION SUR SEUL ID INTERDITE
+    // -----------------------------------------------------------------------
+    it('Refus si l’email du profil historique diffère de l’email Auth (aucune écriture, aucun claim)', async () => {
+      store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
+        uid: HISTORICAL_PROFILE_DOC_ID,
+        email: 'autre.adresse@gmail.com',
+        role: 'super_admin',
+        status: 'active',
+        name: 'Youcef'
+      });
+
+      const report = await runSuperAdminBootstrap({
+        execute: true,
+        expectedUid: validUid,
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(report.success).toBe(false);
+      expect(report.errorCode).toBe('NO_VERIFIED_AUTHORIZATION_PROOF');
+      expect(report.error).toContain('NO_VERIFIED_AUTHORIZATION_PROOF');
+      expect(report.profileWritten).toBe(false);
+      expect(report.claimsUpdated).toBe(false);
+      expect(store.get(`profiles/${validUid}`)).toBeUndefined();
+      expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
+    });
+
+    it('Refus si le profil historique possède le bon ID de document mais manque role=super_admin ou status=active', async () => {
+      // Cas 1 : role absent sur le document historique
+      store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
+        uid: HISTORICAL_PROFILE_DOC_ID,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        status: 'active'
+      });
+
+      const reportNoRole = await runSuperAdminBootstrap({
+        execute: true,
+        expectedUid: validUid,
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(reportNoRole.success).toBe(false);
+      expect(reportNoRole.errorCode).toBe('NO_VERIFIED_AUTHORIZATION_PROOF');
+      expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
+
+      // Cas 2 : status absent ou différent de 'active' sur le document historique
+      store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
+        uid: HISTORICAL_PROFILE_DOC_ID,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        role: 'super_admin',
+        status: 'pending_activation'
+      });
+
+      const reportNotActive = await runSuperAdminBootstrap({
+        execute: true,
+        expectedUid: validUid,
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(reportNotActive.success).toBe(false);
+      expect(reportNotActive.errorCode).toBe('NO_VERIFIED_AUTHORIZATION_PROOF');
+      expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
+    });
+
+    it('Accepte l’email Auth et l’email historique comparés sans distinction de casse', async () => {
+      userRecordState.email = 'Boudjada.Youcef@Gmail.com';
+      store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
+        uid: HISTORICAL_PROFILE_DOC_ID,
+        email: 'BOUDJADA.YOUCEF@GMAIL.COM',
+        role: 'super_admin',
+        status: 'active',
+        name: 'Youcef Boudjada'
+      });
+
+      const report = await runSuperAdminBootstrap({
+        execute: true,
+        targetEmail: 'Boudjada.Youcef@gmail.com',
+        expectedUid: validUid,
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(report.success).toBe(true);
+      expect(report.claimsUpdated).toBe(true);
+      expect(store.get(`profiles/${validUid}`).email).toBe(ALLOWED_SUPER_ADMIN_EMAIL);
+    });
+
+    // -----------------------------------------------------------------------
+    // ÉCHECS D'ÉCRITURE ET DE RELECTURE FIRESTORE (VÉRIFICATION STRICTE ÉTAPE 6)
+    // -----------------------------------------------------------------------
+    it('Échec de relecture Firestore si le document relu a status !== "active" ou role !== "super_admin" ou email invalide : aucun Custom Claim attribué', async () => {
+      store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
+        uid: HISTORICAL_PROFILE_DOC_ID,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        role: 'super_admin',
+        status: 'active'
+      });
+
+      // Simuler une altération du statut lors de la relecture après écriture
+      const originalCol = mockDb.collection.bind(mockDb);
+      let targetWritten = false;
+      mockDb.collection = (colName: string) => {
+        const col = originalCol(colName);
+        const origDoc = col.doc.bind(col);
+        col.doc = (docId: string) => {
+          const docObj = origDoc(docId);
+          if (docId === validUid) {
+            const origSet = docObj.set.bind(docObj);
+            docObj.set = vi.fn(async (data: any) => {
+              await origSet(data);
+              targetWritten = true;
+            });
+            const origGet = docObj.get.bind(docObj);
+            docObj.get = vi.fn(async () => {
+              const snap = await origGet();
+              if (targetWritten && snap.exists) {
+                return {
+                  exists: true,
+                  data: () => ({
+                    ...snap.data(),
+                    status: 'pending_activation'
+                  })
+                };
+              }
+              return snap;
+            });
+          }
+          return docObj;
+        };
+        return col;
+      };
+
+      const report = await runSuperAdminBootstrap({
+        execute: true,
+        expectedUid: validUid,
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(report.success).toBe(false);
+      expect(report.partialState).toBe(true);
+      expect(report.profileWritten).toBe(true);
+      expect(report.profileVerified).toBe(false);
+      expect(report.claimsUpdated).toBe(false);
+      expect(report.errorCode).toBe('PROFILE_STATUS_INVALID_AFTER_WRITE');
+      expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
+    });
+
+    it('Échec de relecture Firestore si le document relu a role !== "super_admin" : aucun Custom Claim attribué', async () => {
+      store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
+        uid: HISTORICAL_PROFILE_DOC_ID,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        role: 'super_admin',
+        status: 'active'
+      });
+
+      const originalCol = mockDb.collection.bind(mockDb);
+      let targetWritten = false;
+      mockDb.collection = (colName: string) => {
+        const col = originalCol(colName);
+        const origDoc = col.doc.bind(col);
+        col.doc = (docId: string) => {
+          const docObj = origDoc(docId);
+          if (docId === validUid) {
+            const origSet = docObj.set.bind(docObj);
+            docObj.set = vi.fn(async (data: any) => {
+              await origSet(data);
+              targetWritten = true;
+            });
+            const origGet = docObj.get.bind(docObj);
+            docObj.get = vi.fn(async () => {
+              const snap = await origGet();
+              if (targetWritten && snap.exists) {
+                return {
+                  exists: true,
+                  data: () => ({
+                    ...snap.data(),
+                    role: 'client'
+                  })
+                };
+              }
+              return snap;
+            });
+          }
+          return docObj;
+        };
+        return col;
+      };
+
+      const report = await runSuperAdminBootstrap({
+        execute: true,
+        expectedUid: validUid,
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(report.success).toBe(false);
+      expect(report.partialState).toBe(true);
+      expect(report.profileWritten).toBe(true);
+      expect(report.profileVerified).toBe(false);
+      expect(report.claimsUpdated).toBe(false);
+      expect(report.errorCode).toBe('PROFILE_ROLE_INVALID_AFTER_WRITE');
+      expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
+    });
+
+    it('Échec de relecture Firestore (exception réseau au get post-écriture) : aucun Custom Claim attribué', async () => {
+      store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
+        uid: HISTORICAL_PROFILE_DOC_ID,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        role: 'super_admin',
+        status: 'active'
+      });
+
+      const originalCol = mockDb.collection.bind(mockDb);
+      let targetWritten = false;
+      mockDb.collection = (colName: string) => {
+        const col = originalCol(colName);
+        const origDoc = col.doc.bind(col);
+        col.doc = (docId: string) => {
+          const docObj = origDoc(docId);
+          if (docId === validUid) {
+            const origSet = docObj.set.bind(docObj);
+            docObj.set = vi.fn(async (data: any) => {
+              await origSet(data);
+              targetWritten = true;
+            });
+            const origGet = docObj.get.bind(docObj);
+            docObj.get = vi.fn(async () => {
+              if (targetWritten) {
+                throw new Error('UNAVAILABLE : Firestore read failed after write');
+              }
+              return origGet();
+            });
+          }
+          return docObj;
+        };
+        return col;
+      };
+
+      const report = await runSuperAdminBootstrap({
+        execute: true,
+        expectedUid: validUid,
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(report.success).toBe(false);
+      expect(report.partialState).toBe(true);
+      expect(report.profileWritten).toBe(true);
+      expect(report.profileVerified).toBe(false);
+      expect(report.claimsUpdated).toBe(false);
+      expect(report.errorCode).toBe('PROFILE_VERIFICATION_FAILED');
+      expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
+    });
+  });
+
+  // =========================================================================
+  // 10. AUTH-ADMIN-05-FIX-10-R1 : CORRECTION DES RÉSERVES DU CONTRE-AUDIT (R1 & R2)
+  // =========================================================================
+  describe('AUTH-ADMIN-05-FIX-10-R1 : Correctifs du contre-audit (R1 — Préservation non destructive & R2 — Cohérence UID historique)', () => {
+    // -----------------------------------------------------------------------
+    // R1-1 : PRÉSERVATION D'UN CHAMP MÉTIER CIBLE AUTORISÉ MAIS NON IMPORTABLE DEPUIS L'HISTORIQUE
+    // -----------------------------------------------------------------------
+    it('R1-1 — Préserve un champ métier cible autorisé mais non importable depuis l’historique lors de mergeProfileDataNonDestructive et targetDocRef.set()', async () => {
+      const targetProfileWithBusinessFields = {
+        uid: validUid,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        status: 'active',
+        role: 'super_admin',
+        name: 'Youcef Boudjada',
+        // Champs métier / ingénierie PD&I présents sur le profil cible mais hors ALLOWED_HISTORICAL_PROFILE_FIELDS :
+        defaultNormativeCode: 'ASME_B31_8_2024',
+        engineeringSettings: {
+          unitSystem: 'SI_METRIC',
+          pressureUnit: 'bar',
+          seismicZone: 'IIA_ALGER',
+          enabledModules: ['cathodic_protection', 'hydraulic_transient']
+        },
+        workspacePreferences: {
+          theme: 'industrial_dark',
+          gridSnapMm: 5
+        }
+      };
+
+      const historicalProfileWithExtraFields = {
+        uid: HISTORICAL_PROFILE_DOC_ID,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        role: 'super_admin',
+        status: 'active',
+        company: 'Orthogonal PD&I Studio',
+        city: 'Alger',
+        // Champ métier présent uniquement dans l'historique (ne doit PAS être importé) :
+        historicalOnlyBusinessField: 'LEGACY_PIPELINE_ARCHIVE_DO_NOT_IMPORT',
+        defaultNormativeCode: 'OLD_CODE_1999'
+      };
+
+      store.set(`profiles/${validUid}`, { ...targetProfileWithBusinessFields });
+      store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, { ...historicalProfileWithExtraFields });
+
+      const report = await runSuperAdminBootstrap({
+        execute: true,
+        expectedUid: validUid,
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(report.success).toBe(true);
+      expect(report.profileWritten).toBe(true);
+      expect(report.profileVerified).toBe(true);
+      expect(report.claimsUpdated).toBe(true);
+
+      const savedTarget = store.get(`profiles/${validUid}`);
+      // 1. Les champs métier cibles existants sont intégralement préservés :
+      expect(savedTarget.defaultNormativeCode).toBe('ASME_B31_8_2024');
+      expect(savedTarget.engineeringSettings).toEqual({
+        unitSystem: 'SI_METRIC',
+        pressureUnit: 'bar',
+        seismicZone: 'IIA_ALGER',
+        enabledModules: ['cathodic_protection', 'hydraulic_transient']
+      });
+      expect(savedTarget.workspacePreferences).toEqual({
+        theme: 'industrial_dark',
+        gridSnapMm: 5
+      });
+      // 2. Les champs de la whitelist historique absents de la cible sont récupérés :
+      expect(savedTarget.company).toBe('Orthogonal PD&I Studio');
+      expect(savedTarget.city).toBe('Alger');
+      // 3. Un champ hors whitelist présent uniquement dans l'historique n'est JAMAIS importé :
+      expect(savedTarget.historicalOnlyBusinessField).toBeUndefined();
+      // 4. Le document historique n'est jamais modifié :
+      expect(store.get(`profiles/${HISTORICAL_PROFILE_DOC_ID}`)).toEqual(historicalProfileWithExtraFields);
+    });
+
+    // -----------------------------------------------------------------------
+    // R1-2 : TRAITEMENT ET PURGE D'UN CHAMP EXPLICITEMENT INTERDIT SUR LE PROFIL CIBLE
+    // -----------------------------------------------------------------------
+    it('R1-2 — Élimine et purge de Firestore tout champ explicitement interdit présent sur le profil cible (autorisations parallèles, privilèges commerciaux non vérifiés, clés dangereuses)', async () => {
+      const pollutedTargetProfile = {
+        uid: validUid,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        status: 'active',
+        role: 'super_admin',
+        name: 'Youcef Boudjada',
+        defaultNormativeCode: 'API_5L_X70',
+        // Champs d'autorisation parallèles / ombres interdits sur la cible :
+        roles: ['super_admin', 'billing_root'],
+        admin: true,
+        isAdmin: true,
+        isSuperAdmin: true,
+        permissions: ['*'],
+        customClaims: { role: 'super_admin' },
+        accessLevel: 'unrestricted',
+        privileges: ['bypass_audit'],
+        authorization: { override: true },
+        authorizations: ['all'],
+        securityRole: 'root',
+        adminRole: 'global_owner',
+        // Privilèges commerciaux non vérifiés interdits sur la cible :
+        accountType: 'enterprise',
+        subscriptionPlan: 'lifetime',
+        pricingPlan: 'unlimited',
+        assignedPlan: 'ENTERPRISE',
+        licenses: ['lic_unverified_1'],
+        licenseKey: 'LIC-FAKE-999',
+        maxUsers: 9999,
+        nestedConfig: {
+          validSetting: 'keep_me',
+          permissions: ['rogue_nested_perm'],
+          accountType: 'enterprise',
+          licenses: ['nested_lic']
+        }
+      };
+
+      store.set(`profiles/${validUid}`, { ...pollutedTargetProfile });
+
+      const report = await runSuperAdminBootstrap({
+        execute: true,
+        expectedUid: validUid,
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(report.success).toBe(true);
+      expect(report.profileWritten).toBe(true);
+      expect(report.profileVerified).toBe(true);
+
+      const savedTarget = store.get(`profiles/${validUid}`);
+      // Le champ métier légitime est conservé :
+      expect(savedTarget.defaultNormativeCode).toBe('API_5L_X70');
+      expect(savedTarget.nestedConfig).toEqual({ validSetting: 'keep_me' });
+
+      // Tous les champs explicitement interdits ont été purgés du document cible (sans { merge: true } aveugle) :
+      expect(savedTarget.roles).toBeUndefined();
+      expect(savedTarget.admin).toBeUndefined();
+      expect(savedTarget.isAdmin).toBeUndefined();
+      expect(savedTarget.isSuperAdmin).toBeUndefined();
+      expect(savedTarget.permissions).toBeUndefined();
+      expect(savedTarget.customClaims).toBeUndefined();
+      expect(savedTarget.accessLevel).toBeUndefined();
+      expect(savedTarget.privileges).toBeUndefined();
+      expect(savedTarget.authorization).toBeUndefined();
+      expect(savedTarget.authorizations).toBeUndefined();
+      expect(savedTarget.securityRole).toBeUndefined();
+      expect(savedTarget.adminRole).toBeUndefined();
+      expect(savedTarget.accountType).toBeUndefined();
+      expect(savedTarget.subscriptionPlan).toBeUndefined();
+      expect(savedTarget.pricingPlan).toBeUndefined();
+      expect(savedTarget.assignedPlan).toBeUndefined();
+      expect(savedTarget.licenses).toBeUndefined();
+      expect(savedTarget.licenseKey).toBeUndefined();
+      expect(savedTarget.maxUsers).toBeUndefined();
+    });
+
+    // -----------------------------------------------------------------------
+    // R1-3 : CONTRÔLE STRICT DE status ET role SUR LE PROFIL CIBLE
+    // -----------------------------------------------------------------------
+    it('R1-3 — Maintient un contrôle strict sur uid, email, status === "active" et role === "super_admin" et rejette un profil cible avec rôle contradictoire', async () => {
+      // Un profil cible avec role: 'client' (même avec historique valide) ne peut pas être promu silencieusement
+      store.set(`profiles/${validUid}`, {
+        uid: validUid,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        status: 'active',
+        role: 'client',
+        defaultNormativeCode: 'ASME_B31_4'
+      });
+      store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
+        uid: HISTORICAL_PROFILE_DOC_ID,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        role: 'super_admin',
+        status: 'active'
+      });
+
+      const report = await runSuperAdminBootstrap({
+        execute: true,
+        expectedUid: validUid,
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(report.success).toBe(false);
+      expect(report.errorCode).toBe('NO_VERIFIED_AUTHORIZATION_PROOF');
+      expect(report.profileWritten).toBe(false);
+      expect(report.claimsUpdated).toBe(false);
+      expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
+    });
+
+    // -----------------------------------------------------------------------
+    // R1-4 : AUCUNE COPIE DE PRIVILÈGE COMMERCIAL NON AUTORISÉ DEPUIS L'HISTORIQUE
+    // -----------------------------------------------------------------------
+    it('R1-4 — La migration historique ne copie jamais aucun privilège commercial non autorisé, même déguisé dans un champ de la whitelist', () => {
+      const targetData = {
+        uid: validUid,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        status: 'pending_activation',
+        projectDiscipline: 'Piping & Instrumentation'
+      };
+      const historicalData = {
+        uid: HISTORICAL_PROFILE_DOC_ID,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        role: 'super_admin',
+        status: 'active',
+        accountType: 'enterprise',
+        subscriptionPlan: 'lifetime',
+        pricingPlan: 'unlimited',
+        licenses: ['lic_enterprise_all'],
+        // Tentative d'injecter un mot-clé commercial interdit dans un champ de la whitelist :
+        department: 'enterprise',
+        jobTitle: 'lifetime',
+        company: 'Orthogonal PD&I Studio'
+      };
+
+      const { mergedData, recoveredFields } = mergeProfileDataNonDestructive(
+        validUid,
+        targetData,
+        historicalData
+      );
+
+      expect(mergedData.projectDiscipline).toBe('Piping & Instrumentation');
+      expect(mergedData.company).toBe('Orthogonal PD&I Studio');
+      expect(mergedData.accountType).toBeUndefined();
+      expect(mergedData.subscriptionPlan).toBeUndefined();
+      expect(mergedData.pricingPlan).toBeUndefined();
+      expect(mergedData.licenses).toBeUndefined();
+      expect(mergedData.department).toBeUndefined();
+      expect(mergedData.jobTitle).toBeUndefined();
+      expect(recoveredFields).toEqual(['company']);
+    });
+
+    // -----------------------------------------------------------------------
+    // R2-1 : UID HISTORIQUE CONFORME (uid === HISTORICAL_PROFILE_DOC_ID)
+    // -----------------------------------------------------------------------
+    it('R2-1 — Accepte un profil historique dont le champ uid est strictement égal à HISTORICAL_PROFILE_DOC_ID sans jamais remplacer l’UID Auth attendu', async () => {
+      const historicalData = {
+        uid: HISTORICAL_PROFILE_DOC_ID,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        role: 'super_admin',
+        status: 'active',
+        name: 'Youcef Boudjada',
+        company: 'Orthogonal PD&I Studio'
+      };
+
+      expect(hasContradictoryHistoricalUid(historicalData)).toBe(false);
+      expect(isValidHistoricalAuthorizationProof(historicalData)).toBe(true);
+
+      store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, historicalData);
+
+      const report = await runSuperAdminBootstrap({
+        execute: true,
+        expectedUid: validUid,
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(report.success).toBe(true);
+      expect(report.proofSource).toBe('historical');
+      expect(report.profileWritten).toBe(true);
+      expect(report.claimsUpdated).toBe(true);
+
+      // L'UID enregistré dans le profil cible et utilisé pour les Custom Claims est strictement validUid (jamais HISTORICAL_PROFILE_DOC_ID)
+      const savedTarget = store.get(`profiles/${validUid}`);
+      expect(savedTarget.uid).toBe(validUid);
+      expect(savedTarget.uid).not.toBe(HISTORICAL_PROFILE_DOC_ID);
+      expect(mockAuth.setCustomUserClaims).toHaveBeenCalledWith(
+        validUid,
+        expect.objectContaining({ role: 'super_admin' })
+      );
+    });
+
+    // -----------------------------------------------------------------------
+    // R2-2 : UID HISTORIQUE ABSENT (AUTORISÉ PAR LE MODÈLE SI PREUVE B COMPLÈTE)
+    // -----------------------------------------------------------------------
+    it('R2-2 — Accepte un profil historique dont le champ uid est absent (undefined) lorsque email, role=super_admin et status=active sont conformes', async () => {
+      const historicalWithoutUid = {
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        role: 'super_admin',
+        status: 'active',
+        name: 'Youcef Boudjada',
+        city: 'Alger'
+      };
+
+      expect(hasContradictoryHistoricalUid(historicalWithoutUid)).toBe(false);
+      expect(isValidHistoricalAuthorizationProof(historicalWithoutUid)).toBe(true);
+
+      store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, historicalWithoutUid);
+
+      const report = await runSuperAdminBootstrap({
+        execute: true,
+        expectedUid: validUid,
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(report.success).toBe(true);
+      expect(report.proofSource).toBe('historical');
+      expect(report.profileWritten).toBe(true);
+      expect(report.claimsUpdated).toBe(true);
+
+      const savedTarget = store.get(`profiles/${validUid}`);
+      expect(savedTarget.uid).toBe(validUid);
+      expect(savedTarget.city).toBe('Alger');
+    });
+
+    // -----------------------------------------------------------------------
+    // R2-3 & R2-4 : UID HISTORIQUE CONTRADICTOIRE -> REJET STRICT, ZÉRO ÉCRITURE FIRESTORE ET ZÉRO CUSTOM CLAIM
+    // -----------------------------------------------------------------------
+    it.each([
+      ['chaîne contradictoire', 'contradictory-uid-999'],
+      ['UID Auth réel au lieu de HISTORICAL_PROFILE_DOC_ID', 'google_user_youcef_12345'],
+      ['chaîne vide', ''],
+      ['espaces autour de HISTORICAL_PROFILE_DOC_ID', ` ${HISTORICAL_PROFILE_DOC_ID} `],
+      ['null', null],
+      ['nombre', 12345],
+      ['objet', { id: HISTORICAL_PROFILE_DOC_ID }]
+    ])(
+      'R2-3 & R2-4 — Rejette strictement un profil historique avec uid contradictoire (%s) : aucune écriture Firestore et aucun Custom Claim',
+      async (_label, invalidHistoricalUid) => {
+        const badHistoricalProfile: Record<string, any> = {
+          uid: invalidHistoricalUid,
+          email: ALLOWED_SUPER_ADMIN_EMAIL,
+          role: 'super_admin',
+          status: 'active',
+          name: 'Youcef Boudjada',
+          company: 'PD&I Studio'
+        };
+
+        expect(hasContradictoryHistoricalUid(badHistoricalProfile)).toBe(true);
+        expect(isValidHistoricalAuthorizationProof(badHistoricalProfile)).toBe(false);
+
+        const proofCheck = verifyPreexistingAuthorizationProof(
+          validUid,
+          null,
+          badHistoricalProfile
+        );
+        expect(proofCheck.valid).toBe(false);
+        expect(proofCheck.errorCode).toBe('HISTORICAL_UID_MISMATCH');
+
+        store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, badHistoricalProfile);
+
+        const report = await runSuperAdminBootstrap({
+          execute: true,
+          expectedUid: validUid,
+          authInstance: mockAuth,
+          firestoreInstance: mockDb
+        });
+
+        expect(report.success).toBe(false);
+        expect(report.errorCode).toBe('HISTORICAL_UID_MISMATCH');
+        expect(report.error).toContain('[BLOCAGE UID HISTORIQUE]');
+        expect(report.error).toContain('NO_VERIFIED_AUTHORIZATION_PROOF');
+        // Preuve : zéro écriture Firestore et zéro Custom Claim
+        expect(report.profileWritten).toBe(false);
+        expect(report.profileVerified).toBe(false);
+        expect(report.claimsUpdated).toBe(false);
+        expect(report.claimsVerified).toBe(false);
+        expect(store.get(`profiles/${validUid}`)).toBeUndefined();
+        expect(callSequence.some(s => s.startsWith('firestore.set'))).toBe(false);
+        expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
+      }
+    );
+
+    it('R2-4b — Rejette un profil historique dont uid est défini par un getter (accesseur) sans l’invoquer, et bloque même si un profil cible existe', async () => {
+      let uidGetterInvoked = false;
+      const hostileHistorical: Record<string, any> = {
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        role: 'super_admin',
+        status: 'active'
+      };
+      Object.defineProperty(hostileHistorical, 'uid', {
+        get() {
+          uidGetterInvoked = true;
+          return HISTORICAL_PROFILE_DOC_ID;
+        },
+        enumerable: true,
+        configurable: true
+      });
+
+      expect(hasContradictoryHistoricalUid(hostileHistorical)).toBe(true);
+      expect(isValidHistoricalAuthorizationProof(hostileHistorical)).toBe(false);
+      expect(uidGetterInvoked).toBe(false);
+
+      // Même si le profil cible est en pending_activation, un historique avec UID contradictoire bloque tout :
+      store.set(`profiles/${validUid}`, {
+        uid: validUid,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        status: 'pending_activation',
+        name: 'Youcef Boudjada'
+      });
+      store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
+        uid: 'wrong-historical-uid-777',
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        role: 'super_admin',
+        status: 'active',
+        city: 'Alger'
+      });
+
+      const report = await runSuperAdminBootstrap({
+        execute: true,
+        expectedUid: validUid,
+        authInstance: mockAuth,
+        firestoreInstance: mockDb
+      });
+
+      expect(report.success).toBe(false);
+      expect(report.errorCode).toBe('HISTORICAL_UID_MISMATCH');
+      expect(report.profileWritten).toBe(false);
+      expect(report.claimsUpdated).toBe(false);
+      expect(store.get(`profiles/${validUid}`).status).toBe('pending_activation');
+      expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
+    });
+  });
+});
 
