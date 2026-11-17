@@ -15,7 +15,7 @@
  */
 
 import crypto from "node:crypto";
-import { Timestamp } from "firebase-admin/firestore";
+import { Timestamp } from "@google-cloud/firestore";
 import {
   deriveWebhookEventDocumentId,
   parseFirestoreTimeMs

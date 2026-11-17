@@ -29,9 +29,16 @@
 
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { adminAuth, adminDb } from '../src/lib/firebase-admin.ts';
+import {
+  adminAuth,
+  adminDb,
+  EXPECTED_SERVER_DATABASE_ID,
+  extractServerFirestoreProjectId,
+  extractServerFirestoreDatabaseId
+} from '../src/lib/firebase-admin.ts';
 
 export const EXPECTED_PROJECT_ID = 'graphical-router-x18qq';
+export const EXPECTED_DATABASE_ID = EXPECTED_SERVER_DATABASE_ID;
 export const ALLOWED_SUPER_ADMIN_EMAIL = 'boudjada.youcef@gmail.com';
 export const HISTORICAL_PROFILE_DOC_ID = 'superadmin-youcef-boudjada';
 
@@ -213,6 +220,8 @@ const SAFE_INTERNAL_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
     "[BLOCAGE UID] L'UID du compte Firebase Auth ne correspond pas à EXPECTED_SUPER_ADMIN_UID.",
   PROJECT_MISMATCH:
     "[BLOCAGE PROJET] Projet Auth/Firestore non autorisé ou non vérifiable. Attendu='graphical-router-x18qq'.",
+  DATABASE_MISMATCH:
+    "[BLOCAGE BASE FIRESTORE] Base de données Firestore non autorisée ou non vérifiable. Attendu='ai-studio-pdivisdz-12e4b2ec-ffc7-48b8-9472-8a77deb300cf'.",
   EMAIL_MISMATCH:
     "[BLOCAGE EMAIL] L'adresse email fournie n'est pas autorisée pour le bootstrap Super Admin.",
   USER_NOT_FOUND:
@@ -583,6 +592,7 @@ export interface BootstrapReport {
   mode: 'dry-run' | 'execute';
   timestamp: string;
   projectId: string;
+  databaseId?: string;
   emailVerified?: boolean;
   disabled?: boolean;
   hasGoogleProvider?: boolean;
@@ -1624,10 +1634,11 @@ export function mergeProfileDataNonDestructive(
 }
 
 export function getFirestoreProjectId(firestoreInstance: any): string | null {
-  const projectId = firestoreInstance?.app?.options?.projectId;
-  return typeof projectId === 'string' && projectId.length > 0
-    ? projectId
-    : null;
+  return extractServerFirestoreProjectId(firestoreInstance);
+}
+
+export function getFirestoreDatabaseId(firestoreInstance: any): string | null {
+  return extractServerFirestoreDatabaseId(firestoreInstance);
 }
 
 export function parseCliArgs(argv: string[]): { isExecute: boolean } {
@@ -1696,12 +1707,14 @@ export async function runSuperAdminBootstrap(options: BootstrapOptions = {}): Pr
 
   const authProjectId = authSdk?.app?.options?.projectId;
   const firestoreProjectId = getFirestoreProjectId(dbSdk);
+  const firestoreDatabaseId = getFirestoreDatabaseId(dbSdk);
 
   // FIX-08-D : Ni email ni uid dans le rapport final exposé
   const report: BootstrapReport = {
     mode: isExecute ? 'execute' : 'dry-run',
     timestamp: new Date().toISOString(),
     projectId: authProjectId || firestoreProjectId || '',
+    databaseId: firestoreDatabaseId || '',
     historicalProfileFound: false,
     targetProfileFound: false,
     conflictsDetected: [],
@@ -1715,7 +1728,7 @@ export async function runSuperAdminBootstrap(options: BootstrapOptions = {}): Pr
 
   try {
     // =========================================================================
-    // ÉTAPE 1 : VALIDATION INTÉGRALE DE L'IDENTITÉ AUTH
+    // ÉTAPE 1 : VALIDATION INTÉGRALE DE L'IDENTITÉ AUTH & DE LA CIBLE FIRESTORE
     // =========================================================================
 
     // 1.1 Contrôle strict, croisé et exclusif des projets Auth et Firestore avant toute lecture
@@ -1725,6 +1738,15 @@ export async function runSuperAdminBootstrap(options: BootstrapOptions = {}): Pr
       authProjectId !== firestoreProjectId
     ) {
       throw new InternalBootstrapError('PROJECT_MISMATCH');
+    }
+
+    // 1.1b Contrôle strict de la base de données Firestore nommée avant toute lecture ou écriture (FIRESTORE-NAMED-DB-01-FIX-01)
+    if (
+      !firestoreDatabaseId ||
+      firestoreDatabaseId === '(default)' ||
+      firestoreDatabaseId !== EXPECTED_DATABASE_ID
+    ) {
+      throw new InternalBootstrapError('DATABASE_MISMATCH');
     }
 
     // 1.2 Contrôle strict de l'adresse email autorisée (comparaison sans distinction de casse)

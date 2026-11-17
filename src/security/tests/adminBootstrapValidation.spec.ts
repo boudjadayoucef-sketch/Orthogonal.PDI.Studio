@@ -49,6 +49,8 @@ import {
   inspectSafeTimeProperty,
   TIME_PROPERTIES,
   EXPECTED_PROJECT_ID,
+  EXPECTED_DATABASE_ID,
+  getFirestoreDatabaseId,
   ALLOWED_SUPER_ADMIN_EMAIL,
   HISTORICAL_PROFILE_DOC_ID,
   FORBIDDEN_HISTORICAL_AUTH_LEAF_KEYS,
@@ -69,6 +71,25 @@ import {
   isValidHistoricalAuthorizationProof,
   verifyPreexistingAuthorizationProof
 } from '../../../scripts/bootstrapSuperAdmin.ts';
+import {
+  adminDb as realServerAdminDb,
+  adminAuth as realServerAdminAuth,
+  EXPECTED_SERVER_PROJECT_ID,
+  EXPECTED_SERVER_DATABASE_ID,
+  validateServerProjectId,
+  validateServerDatabaseId,
+  validateServerFirebaseAppProjectId,
+  getOrInitializeServerFirebaseApp,
+  createServerAdminAuth,
+  resolveServerFirestoreConfig,
+  extractServerFirestoreProjectId,
+  extractServerFirestoreDatabaseId,
+  assertValidServerFirestoreInstance,
+  createServerFirestoreClient
+} from '../../lib/firebase-admin.ts';
+import { Firestore, Timestamp as GCloudTimestamp } from '@google-cloud/firestore';
+import { createWebhookIdempotencyRepository } from '../webhooks/webhookIdempotencyRepository.ts';
+import fs from 'node:fs';
 
 describe('AUTH-ADMIN-05-FIX-06 à FIX-10 : Suite de validation unitaire du Bootstrap Super Admin Zero-Trust', () => {
   const validUid = 'google_user_youcef_12345';
@@ -135,6 +156,8 @@ describe('AUTH-ADMIN-05-FIX-06 à FIX-10 : Suite de validation unitaire du Boots
           projectId: EXPECTED_PROJECT_ID
         }
       },
+      projectId: EXPECTED_PROJECT_ID,
+      databaseId: EXPECTED_DATABASE_ID,
       collection: vi.fn((colName: string) => {
         return {
           doc: vi.fn((docId: string) => {
@@ -523,7 +546,8 @@ describe('AUTH-ADMIN-05-FIX-06 à FIX-10 : Suite de validation unitaire du Boots
 
   it('FIX-06 B3 — reconnaît le projet Firestore autorisé', () => {
     expect(getFirestoreProjectId({
-      app: { options: { projectId: EXPECTED_PROJECT_ID } }
+      projectId: EXPECTED_PROJECT_ID,
+      _settings: { projectId: EXPECTED_PROJECT_ID }
     })).toBe(EXPECTED_PROJECT_ID);
   });
 
@@ -2467,5 +2491,452 @@ describe('AUTH-ADMIN-05-FIX-06 à FIX-10 : Suite de validation unitaire du Boots
       expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
     });
   });
+
+  // =========================================================================
+  // 11. FIRESTORE-NAMED-DB-01-FIX-01 : SERVEUR @GOOGLE-CLOUD/FIRESTORE, VALIDATION STRICTE & BOOTSTRAP (SECTIONS 6.A, 6.C, 6.D, 6.E)
+  // =========================================================================
+  describe('FIRESTORE-NAMED-DB-01-FIX-01 : Migration sécurisée vers la base Firestore nommée côté serveur et bootstrap', () => {
+    it('6.A & 6.C — Validation stricte côté serveur : accepte uniquement graphical-router-x18qq et ai-studio-pdivisdz-12e4b2ec-ffc7-48b8-9472-8a77deb300cf, refuse absent, (default) ou projet invalide', () => {
+      expect(validateServerProjectId(EXPECTED_SERVER_PROJECT_ID)).toBe('graphical-router-x18qq');
+      expect(validateServerDatabaseId(EXPECTED_SERVER_DATABASE_ID)).toBe(
+        'ai-studio-pdivisdz-12e4b2ec-ffc7-48b8-9472-8a77deb300cf'
+      );
+
+      // Refus de Database ID absent, vide, '(default)' ou incorrect
+      expect(() => validateServerDatabaseId(undefined)).toThrow(/absent ou vide/);
+      expect(() => validateServerDatabaseId(null)).toThrow(/absent ou vide/);
+      expect(() => validateServerDatabaseId('')).toThrow(/absent ou vide/);
+      expect(() => validateServerDatabaseId('   ')).toThrow(/absent ou vide/);
+      expect(() => validateServerDatabaseId('(default)')).toThrow(/\(default\)['"]? est formellement interdite/);
+      expect(() => validateServerDatabaseId(' (default) ')).toThrow(/\(default\)['"]? est formellement interdite/);
+      expect(() => validateServerDatabaseId('wrong-db-id')).toThrow(/Database ID non autorisé/);
+
+      // Refus de Project ID absent, vide, demo-* ou incorrect
+      expect(() => validateServerProjectId(undefined)).toThrow(/absent ou vide/);
+      expect(() => validateServerProjectId('')).toThrow(/absent ou vide/);
+      expect(() => validateServerProjectId('demo-orthogonal-rules-pdi')).toThrow(/Cannot use demo project ID/);
+      expect(() => validateServerProjectId('wrong-project')).toThrow(/Project ID non autorisé/);
+
+      // Le serveur ignore toute variable VITE_ et échoue si FIREBASE_DATABASE_ID ou FIREBASE_PROJECT_ID est vide ou invalide
+      expect(
+        resolveServerFirestoreConfig({
+          VITE_FIREBASE_PROJECT_ID: 'wrong-vite-project',
+          VITE_FIREBASE_DATABASE_ID: '(default)'
+        })
+      ).toEqual({
+        projectId: EXPECTED_SERVER_PROJECT_ID,
+        databaseId: EXPECTED_SERVER_DATABASE_ID
+      });
+
+      expect(() =>
+        resolveServerFirestoreConfig({ FIREBASE_DATABASE_ID: '' })
+      ).toThrow(/absent ou vide/);
+      expect(() =>
+        resolveServerFirestoreConfig({ FIREBASE_DATABASE_ID: '(default)' })
+      ).toThrow(/\(default\)['"]? est formellement interdite/);
+      expect(() =>
+        resolveServerFirestoreConfig({ FIREBASE_DATABASE_ID: 'other-db' })
+      ).toThrow(/Database ID non autorisé/);
+      expect(() =>
+        resolveServerFirestoreConfig({ FIREBASE_PROJECT_ID: 'other-proj' })
+      ).toThrow(/Project ID non autorisé/);
+      expect(() =>
+        resolveServerFirestoreConfig({}, { requireExplicitEnv: true })
+      ).toThrow(/absent ou vide/);
+    });
+
+    it('6.C — Client serveur adminDb construit via @google-cloud/firestore avec Project ID et Database ID nommés explicites, méthodes compatibles et zéro secret exposé', () => {
+      expect(realServerAdminDb).toBeInstanceOf(Firestore);
+      expect(extractServerFirestoreProjectId(realServerAdminDb)).toBe('graphical-router-x18qq');
+      expect(extractServerFirestoreDatabaseId(realServerAdminDb)).toBe(
+        'ai-studio-pdivisdz-12e4b2ec-ffc7-48b8-9472-8a77deb300cf'
+      );
+      expect((realServerAdminDb as any).databaseId).toBe(
+        'ai-studio-pdivisdz-12e4b2ec-ffc7-48b8-9472-8a77deb300cf'
+      );
+      expect((realServerAdminDb as any).databaseId).not.toBe('(default)');
+
+      // Vérification de compatibilité des méthodes utilisées par les consommateurs serveur (bootstrap, webhooks, ordres)
+      expect(typeof realServerAdminDb.collection).toBe('function');
+      expect(typeof realServerAdminDb.doc).toBe('function');
+      expect(typeof realServerAdminDb.runTransaction).toBe('function');
+      expect(typeof realServerAdminDb.batch).toBe('function');
+
+      const colRef = realServerAdminDb.collection('profiles');
+      expect(typeof colRef.doc).toBe('function');
+      expect(typeof colRef.where).toBe('function');
+      expect(typeof colRef.limit).toBe('function');
+      expect(typeof colRef.get).toBe('function');
+
+      const docRef = colRef.doc('test_doc_check');
+      expect(typeof docRef.get).toBe('function');
+      expect(typeof docRef.set).toBe('function');
+      expect(typeof docRef.update).toBe('function');
+      expect(typeof docRef.delete).toBe('function');
+
+      // Vérification de assertValidServerFirestoreInstance avant opération administrative
+      expect(assertValidServerFirestoreInstance(realServerAdminDb)).toEqual({
+        projectId: 'graphical-router-x18qq',
+        databaseId: 'ai-studio-pdivisdz-12e4b2ec-ffc7-48b8-9472-8a77deb300cf'
+      });
+
+      // Refus immédiat si une instance pointe vers '(default)' ou un mauvais Database ID
+      const defaultDbFake = {
+        app: { options: { projectId: 'graphical-router-x18qq' } },
+        projectId: 'graphical-router-x18qq',
+        databaseId: '(default)'
+      };
+      expect(() => assertValidServerFirestoreInstance(defaultDbFake)).toThrow(/non conforme à la base nommée/);
+
+      expect(() =>
+        createServerFirestoreClient({
+          projectId: 'graphical-router-x18qq',
+          databaseId: '(default)'
+        })
+      ).toThrow(/\(default\)['"]? est formellement interdite/);
+
+      // Vérification statique que src/lib/firebase-admin.ts n'utilise pas getFirestore de firebase-admin/firestore ni de variable VITE_ ni de clé privée
+      const adminSource = fs.readFileSync(resolve(process.cwd(), 'src/lib/firebase-admin.ts'), 'utf-8');
+      expect(adminSource).not.toContain('firebase-admin/firestore');
+      expect(adminSource).not.toContain('VITE_FIREBASE_');
+      expect(adminSource).not.toContain('BEGIN PRIVATE KEY');
+      expect(realServerAdminAuth).toBeDefined();
+    });
+
+    it('6.D — Le bootstrap refuse un Database ID égal à (default), absent ou incorrect avant toute lecture Auth ou Firestore', async () => {
+      store.set(`profiles/${HISTORICAL_PROFILE_DOC_ID}`, {
+        uid: HISTORICAL_PROFILE_DOC_ID,
+        email: ALLOWED_SUPER_ADMIN_EMAIL,
+        role: 'super_admin',
+        status: 'active'
+      });
+
+      // 1. Refus de '(default)'
+      const defaultDb = {
+        ...mockDb,
+        databaseId: '(default)'
+      };
+      const reportDefault = await runSuperAdminBootstrap({
+        execute: true,
+        expectedUid: validUid,
+        authInstance: mockAuth,
+        firestoreInstance: defaultDb
+      });
+      expect(reportDefault.success).toBe(false);
+      expect(reportDefault.errorCode).toBe('DATABASE_MISMATCH');
+      expect(reportDefault.error).toContain('[BLOCAGE BASE FIRESTORE]');
+      expect(reportDefault.profileWritten).toBe(false);
+      expect(reportDefault.claimsUpdated).toBe(false);
+      expect(mockAuth.getUserByEmail).not.toHaveBeenCalled();
+      expect(mockDb.collection).not.toHaveBeenCalled();
+      expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
+
+      // 2. Refus d'un Database ID incorrect
+      const wrongNamedDb = {
+        ...mockDb,
+        databaseId: 'wrong-named-database-id'
+      };
+      const reportWrongDb = await runSuperAdminBootstrap({
+        execute: true,
+        expectedUid: validUid,
+        authInstance: mockAuth,
+        firestoreInstance: wrongNamedDb
+      });
+      expect(reportWrongDb.success).toBe(false);
+      expect(reportWrongDb.errorCode).toBe('DATABASE_MISMATCH');
+      expect(reportWrongDb.error).toContain('[BLOCAGE BASE FIRESTORE]');
+      expect(mockAuth.getUserByEmail).not.toHaveBeenCalled();
+      expect(mockDb.collection).not.toHaveBeenCalled();
+      expect(mockAuth.setCustomUserClaims).not.toHaveBeenCalled();
+
+      // 3. Refus d'un Database ID absent / non vérifiable
+      const missingDbId = {
+        ...mockDb,
+        databaseId: undefined
+      };
+      const reportMissingDb = await runSuperAdminBootstrap({
+        execute: false,
+        expectedUid: validUid,
+        authInstance: mockAuth,
+        firestoreInstance: missingDbId
+      });
+      expect(reportMissingDb.success).toBe(false);
+      expect(reportMissingDb.errorCode).toBe('DATABASE_MISMATCH');
+      expect(mockAuth.getUserByEmail).not.toHaveBeenCalled();
+
+      // 4. Refus d'une incohérence entre databaseId et _settings.databaseId
+      const inconsistentDb = {
+        ...mockDb,
+        databaseId: EXPECTED_DATABASE_ID,
+        _settings: { databaseId: '(default)' }
+      };
+      expect(getFirestoreDatabaseId(inconsistentDb)).toBeNull();
+      const reportInconsistent = await runSuperAdminBootstrap({
+        execute: false,
+        expectedUid: validUid,
+        authInstance: mockAuth,
+        firestoreInstance: inconsistentDb
+      });
+      expect(reportInconsistent.success).toBe(false);
+      expect(reportInconsistent.errorCode).toBe('DATABASE_MISMATCH');
+      expect(mockAuth.getUserByEmail).not.toHaveBeenCalled();
+    });
+
+    it('FIX-02-B & FIX-02-C — Identité Firebase Admin App [DEFAULT], suppression de .app artificiel et rejet des faux objets ou divergences', async () => {
+      // 1. Une application Admin [DEFAULT] du bon projet est acceptée
+      const validDefaultAdminApp = {
+        name: '[DEFAULT]',
+        options: { projectId: 'graphical-router-x18qq' }
+      };
+      const initAdminSpy = vi.fn();
+      const getAppAdminSpy = vi.fn(() => validDefaultAdminApp as any);
+      const selectedAdminApp = getOrInitializeServerFirebaseApp(
+        { projectId: 'graphical-router-x18qq' },
+        {
+          getApps: () => [validDefaultAdminApp as any],
+          getApp: getAppAdminSpy as any,
+          initializeApp: initAdminSpy as any
+        }
+      );
+      expect(selectedAdminApp).toBe(validDefaultAdminApp);
+      expect(getAppAdminSpy).toHaveBeenCalledTimes(1);
+      expect(initAdminSpy).not.toHaveBeenCalled();
+      expect(validateServerFirebaseAppProjectId(selectedAdminApp)).toBe('graphical-router-x18qq');
+
+      // 2. Une application Admin [DEFAULT] d'un autre projet est rejetée AVANT getAuth()
+      const wrongDefaultAdminApp = {
+        name: '[DEFAULT]',
+        options: { projectId: 'wrong-admin-project' }
+      };
+      const getAuthSpy = vi.fn();
+      expect(() =>
+        getOrInitializeServerFirebaseApp(
+          { projectId: 'graphical-router-x18qq' },
+          {
+            getApps: () => [wrongDefaultAdminApp as any],
+            getApp: () => wrongDefaultAdminApp as any,
+            initializeApp: vi.fn() as any
+          }
+        )
+      ).toThrow(/Project ID non autorisé/);
+      expect(() =>
+        createServerAdminAuth(wrongDefaultAdminApp, 'graphical-router-x18qq', getAuthSpy as any)
+      ).toThrow(/Project ID non autorisé/);
+      expect(getAuthSpy).not.toHaveBeenCalled();
+
+      // 3. Une application secondaire préexistante ne doit jamais être sélectionnée à la place de [DEFAULT]
+      const secondaryAdminApp = {
+        name: 'secondary-worker-app',
+        options: { projectId: 'other-worker-project' }
+      };
+      const newlyCreatedDefaultApp = {
+        name: '[DEFAULT]',
+        options: { projectId: 'graphical-router-x18qq' }
+      };
+      const getAppShouldNotBeCalled = vi.fn(() => {
+        throw new Error('Default app does not exist yet');
+      });
+      const createDefaultAdminSpy = vi.fn(() => newlyCreatedDefaultApp as any);
+      const resolvedWhenSecondaryExists = getOrInitializeServerFirebaseApp(
+        { projectId: 'graphical-router-x18qq' },
+        {
+          getApps: () => [secondaryAdminApp as any],
+          getApp: getAppShouldNotBeCalled as any,
+          initializeApp: createDefaultAdminSpy as any
+        }
+      );
+      expect(resolvedWhenSecondaryExists).toBe(newlyCreatedDefaultApp);
+      expect(getAppShouldNotBeCalled).not.toHaveBeenCalled();
+      expect(createDefaultAdminSpy).toHaveBeenCalledTimes(1);
+      expect(createDefaultAdminSpy).toHaveBeenCalledWith({
+        projectId: 'graphical-router-x18qq'
+      });
+
+      // 4. Le client Firestore réel utilise le projet et la base nommée attendus et NE possède PAS de propriété artificielle .app
+      expect(realServerAdminDb).toBeInstanceOf(Firestore);
+      expect('app' in (realServerAdminDb as any)).toBe(false);
+      expect((realServerAdminDb as any).app).toBeUndefined();
+      expect((realServerAdminDb as any).projectId).toBe('graphical-router-x18qq');
+      expect((realServerAdminDb as any)._settings?.projectId).toBe('graphical-router-x18qq');
+      expect((realServerAdminDb as any).databaseId).toBe(
+        'ai-studio-pdivisdz-12e4b2ec-ffc7-48b8-9472-8a77deb300cf'
+      );
+      expect((realServerAdminDb as any)._settings?.databaseId).toBe(
+        'ai-studio-pdivisdz-12e4b2ec-ffc7-48b8-9472-8a77deb300cf'
+      );
+
+      // 5. Un faux objet dont seul .app.options.projectId est renseigné ne passe PAS la validation
+      const fakeOnlyAppDb = {
+        app: { options: { projectId: 'graphical-router-x18qq' } },
+        databaseId: EXPECTED_DATABASE_ID
+      };
+      expect(extractServerFirestoreProjectId(fakeOnlyAppDb)).toBeNull();
+      expect(getFirestoreProjectId(fakeOnlyAppDb)).toBeNull();
+      expect(() => assertValidServerFirestoreInstance(fakeOnlyAppDb)).toThrow(
+        /Project ID réel du client \('inconnu'\) non conforme/
+      );
+
+      const reportFakeOnlyApp = await runSuperAdminBootstrap({
+        execute: true,
+        expectedUid: validUid,
+        authInstance: mockAuth,
+        firestoreInstance: fakeOnlyAppDb
+      });
+      expect(reportFakeOnlyApp.success).toBe(false);
+      expect(reportFakeOnlyApp.errorCode).toBe('PROJECT_MISMATCH');
+      expect(mockAuth.getUserByEmail).not.toHaveBeenCalled();
+
+      // 6. Une divergence entre le projet de l'application Admin et celui du client Firestore est rejetée
+      expect(() =>
+        assertValidServerFirestoreInstance(
+          realServerAdminDb,
+          {
+            projectId: EXPECTED_SERVER_PROJECT_ID,
+            databaseId: EXPECTED_SERVER_DATABASE_ID
+          },
+          { name: '[DEFAULT]', options: { projectId: 'wrong-admin-project' } }
+        )
+      ).toThrow(/Project ID non autorisé/);
+
+      expect(() =>
+        createServerFirestoreClient(
+          {
+            projectId: EXPECTED_SERVER_PROJECT_ID,
+            databaseId: EXPECTED_SERVER_DATABASE_ID
+          },
+          { name: '[DEFAULT]', options: { projectId: 'wrong-admin-project' } }
+        )
+      ).toThrow(/Project ID non autorisé/);
+    });
+
+    it('FIX-02-D — Détection stricte des conflits et valeurs vides entre FIREBASE_PROJECT_ID, GOOGLE_CLOUD_PROJECT et GCLOUD_PROJECT', () => {
+      // 1. FIREBASE_PROJECT_ID=graphical-router-x18qq et GOOGLE_CLOUD_PROJECT=wrong-project -> rejeté
+      expect(() =>
+        resolveServerFirestoreConfig({
+          FIREBASE_PROJECT_ID: 'graphical-router-x18qq',
+          GOOGLE_CLOUD_PROJECT: 'wrong-project'
+        })
+      ).toThrow(/conflit entre les variables d'environnement de projet/);
+
+      // 2. FIREBASE_PROJECT_ID=graphical-router-x18qq et GCLOUD_PROJECT="" -> rejeté
+      expect(() =>
+        resolveServerFirestoreConfig({
+          FIREBASE_PROJECT_ID: 'graphical-router-x18qq',
+          GCLOUD_PROJECT: ''
+        })
+      ).toThrow(/GCLOUD_PROJECT.*absent ou vide/);
+
+      // 3. FIREBASE_PROJECT_ID=wrong-project et GCLOUD_PROJECT=graphical-router-x18qq -> rejeté
+      expect(() =>
+        resolveServerFirestoreConfig({
+          FIREBASE_PROJECT_ID: 'wrong-project',
+          GCLOUD_PROJECT: 'graphical-router-x18qq'
+        })
+      ).toThrow(/conflit entre les variables d'environnement de projet/);
+
+      // 4. Les trois variables renseignées avec des valeurs contradictoires -> rejeté
+      expect(() =>
+        resolveServerFirestoreConfig({
+          FIREBASE_PROJECT_ID: 'graphical-router-x18qq',
+          GOOGLE_CLOUD_PROJECT: 'other-project-1',
+          GCLOUD_PROJECT: 'other-project-2'
+        })
+      ).toThrow(/conflit entre les variables d'environnement de projet/);
+
+      // 5. Les trois variables renseignées et cohérentes avec graphical-router-x18qq -> accepté
+      expect(
+        resolveServerFirestoreConfig({
+          FIREBASE_PROJECT_ID: 'graphical-router-x18qq',
+          GOOGLE_CLOUD_PROJECT: 'graphical-router-x18qq',
+          GCLOUD_PROJECT: 'graphical-router-x18qq',
+          FIREBASE_DATABASE_ID: 'ai-studio-pdivisdz-12e4b2ec-ffc7-48b8-9472-8a77deb300cf'
+        })
+      ).toEqual({
+        projectId: 'graphical-router-x18qq',
+        databaseId: 'ai-studio-pdivisdz-12e4b2ec-ffc7-48b8-9472-8a77deb300cf'
+      });
+
+      // 6. Les trois variables absentes conservent le fallback attendu lorsque requireExplicitEnv est désactivé
+      expect(resolveServerFirestoreConfig({})).toEqual({
+        projectId: 'graphical-router-x18qq',
+        databaseId: 'ai-studio-pdivisdz-12e4b2ec-ffc7-48b8-9472-8a77deb300cf'
+      });
+    });
+
+    it('FIX-02-E & FIX-02-F — Alignement de Timestamp sur @google-cloud/firestore dans les transactions de webhooks et chargement de dotenv avant firebase-admin', async () => {
+      // 1. Vérification statique de webhookIdempotencyRepository.ts
+      const webhookRepoSource = fs.readFileSync(
+        resolve(process.cwd(), 'src/security/webhooks/webhookIdempotencyRepository.ts'),
+        'utf-8'
+      );
+      expect(webhookRepoSource).toContain('import { Timestamp } from "@google-cloud/firestore";');
+      expect(webhookRepoSource).not.toContain('firebase-admin/firestore');
+
+      // 2. Vérification dynamique que les objets Timestamp écrits dans les transactions sont des instances @google-cloud/firestore Timestamp
+      const persistedEventDocs = new Map<string, Record<string, unknown>>();
+      const mockTxDb = {
+        collection: (colName: string) => ({
+          doc: (docId: string) => {
+            const key = `${colName}/${docId}`;
+            return {
+              id: docId,
+              get: async () => ({
+                id: docId,
+                exists: persistedEventDocs.has(key),
+                data: () => persistedEventDocs.get(key)
+              }),
+              set: async (data: Record<string, unknown>) => {
+                persistedEventDocs.set(key, data);
+              }
+            };
+          }
+        }),
+        runTransaction: async <T>(fn: (tx: any) => Promise<T>): Promise<T> => {
+          const tx = {
+            get: async (docRef: any) => docRef.get(),
+            set: async (docRef: any, data: Record<string, unknown>) => docRef.set(data)
+          };
+          return fn(tx);
+        }
+      };
+
+      const idempRepo = createWebhookIdempotencyRepository({
+        adminDb: mockTxDb as any,
+        nowMs: () => 1785571200123
+      });
+
+      const acquired = await idempRepo.acquireEventLease({
+        provider: 'paddle',
+        eventId: 'evt_fix02_timestamp_check',
+        eventType: 'transaction.completed'
+      });
+      expect(acquired.outcome).toBe('acquired');
+      if (acquired.outcome === 'acquired') {
+        expect(acquired.record.createdAt).toBeInstanceOf(GCloudTimestamp);
+        expect(acquired.record.updatedAt).toBeInstanceOf(GCloudTimestamp);
+        expect(acquired.record.leaseExpiresAt).toBeInstanceOf(GCloudTimestamp);
+
+        const completed = await idempRepo.completeEventLease({
+          provider: 'paddle',
+          eventId: 'evt_fix02_timestamp_check',
+          leaseToken: acquired.leaseToken
+        });
+        expect(completed.ok).toBe(true);
+        if (completed.ok) {
+          expect(completed.record.completedAt).toBeInstanceOf(GCloudTimestamp);
+          expect(completed.record.updatedAt).toBeInstanceOf(GCloudTimestamp);
+        }
+      }
+
+      // 3. Vérification statique de l'ordre de chargement dotenv dans server.ts (FIX-02-F)
+      const serverSource = fs.readFileSync(resolve(process.cwd(), 'server.ts'), 'utf-8');
+      const dotenvImportIndex = serverSource.indexOf('import "dotenv/config";');
+      const firebaseAdminImportIndex = serverSource.indexOf('./src/lib/firebase-admin.ts');
+      expect(dotenvImportIndex).toBeGreaterThanOrEqual(0);
+      expect(firebaseAdminImportIndex).toBeGreaterThan(dotenvImportIndex);
+      expect(serverSource).not.toContain('dotenv.config()');
+    });
+  });
 });
+
 

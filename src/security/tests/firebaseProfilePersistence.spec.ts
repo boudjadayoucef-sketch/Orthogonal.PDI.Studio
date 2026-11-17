@@ -15,6 +15,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 
 const firestoreMocks = vi.hoisted(() => ({
+  initializeFirestore: vi.fn(() => ({ type: "mock-firestore" })),
   getDoc: vi.fn(),
   getDocs: vi.fn(),
   setDoc: vi.fn(),
@@ -58,7 +59,7 @@ vi.mock("firebase/app", () => ({
 }));
 
 vi.mock("firebase/firestore", () => ({
-  initializeFirestore: vi.fn(() => ({ type: "mock-firestore" })),
+  initializeFirestore: firestoreMocks.initializeFirestore,
   persistentLocalCache: vi.fn(() => ({})),
   persistentMultipleTabManager: vi.fn(() => ({})),
   collection: firestoreMocks.collection,
@@ -112,8 +113,22 @@ import {
   classifyFirestoreProfileReadError,
   resolveAuthoritativeWorkspaceSession,
   PdiAuthAccessError,
+  EXPECTED_FIREBASE_PROJECT_ID,
+  EXPECTED_FIRESTORE_DATABASE_ID,
+  validateClientFirebaseProjectId,
+  validateClientFirestoreDatabaseId,
+  validateClientFirebaseAppProjectId,
+  resolveClientFirebaseConfig,
+  getOrInitializeClientFirebaseApp,
+  getOrInitializeClientFirestore,
+  activeConfig,
+  app,
+  db,
+  auth,
   type PdiUserProfile
 } from "../../lib/firebase";
+import fs from "node:fs";
+import path from "node:path";
 
 function createMemoryStorage(): Storage {
   const store = new Map<string, string>();
@@ -1678,6 +1693,217 @@ describe("AUTH-ADMIN-05-FIX-11-R2 : Session Hygiene, Firestore Error Classificat
     expect(activeResolution.authMode).toBe("client");
     expect(activeResolution.profile?.status).toBe("active");
   });
+
+  // =========================================================================
+  // FIRESTORE-NAMED-DB-01-FIX-01 : TESTS DE CONFIGURATION, CLIENT WEB & FIREBASE.JSON (SECTIONS 6.A, 6.B, 6.E)
+  // =========================================================================
+  it("FIRESTORE-NAMED-DB-01-FIX-01 [6.A] : Validation stricte du Database ID et du Project ID côté client (aucun fallback vers (default))", () => {
+    // 1. Database ID correct accepté
+    expect(
+      validateClientFirestoreDatabaseId("ai-studio-pdivisdz-12e4b2ec-ffc7-48b8-9472-8a77deb300cf")
+    ).toBe(EXPECTED_FIRESTORE_DATABASE_ID);
+
+    // 2. Database ID absent refusé
+    expect(() => validateClientFirestoreDatabaseId(undefined)).toThrow(/absent ou vide/);
+    expect(() => validateClientFirestoreDatabaseId(null)).toThrow(/absent ou vide/);
+    expect(() => validateClientFirestoreDatabaseId("")).toThrow(/absent ou vide/);
+    expect(() => validateClientFirestoreDatabaseId("   ")).toThrow(/absent ou vide/);
+
+    // 3. '(default)' formellement refusé
+    expect(() => validateClientFirestoreDatabaseId("(default)")).toThrow(/\(default\)['"]? est interdite/);
+    expect(() => validateClientFirestoreDatabaseId(" (default) ")).toThrow(/\(default\)['"]? est interdite/);
+
+    // 4. Database ID incorrect refusé
+    expect(() => validateClientFirestoreDatabaseId("wrong-firestore-db")).toThrow(/invalide/);
+
+    // 5. Project ID correct accepté et Project ID incorrect ou absent refusé
+    expect(validateClientFirebaseProjectId("graphical-router-x18qq")).toBe(EXPECTED_FIREBASE_PROJECT_ID);
+    expect(() => validateClientFirebaseProjectId(undefined)).toThrow(/absent ou vide/);
+    expect(() => validateClientFirebaseProjectId("")).toThrow(/absent ou vide/);
+    expect(() => validateClientFirebaseProjectId("wrong-project-id")).toThrow(/projectId invalide/);
+
+    // 6. resolveClientFirebaseConfig refuse explicitement une variable VITE_FIREBASE_DATABASE_ID vide, '(default)' ou erronée sans fallback
+    expect(() =>
+      resolveClientFirebaseConfig({ VITE_FIREBASE_DATABASE_ID: "" })
+    ).toThrow(/absent ou vide/);
+    expect(() =>
+      resolveClientFirebaseConfig({ VITE_FIREBASE_DATABASE_ID: "(default)" })
+    ).toThrow(/\(default\)['"]? est interdite/);
+    expect(() =>
+      resolveClientFirebaseConfig({ VITE_FIREBASE_DATABASE_ID: "other-db" })
+    ).toThrow(/invalide/);
+    expect(() =>
+      resolveClientFirebaseConfig({ VITE_FIREBASE_PROJECT_ID: "other-project" })
+    ).toThrow(/projectId invalide/);
+    expect(() =>
+      resolveClientFirebaseConfig({}, { requireExplicitEnv: true })
+    ).toThrow(/absent ou vide/);
+  });
+
+  it("FIRESTORE-NAMED-DB-01-FIX-01 [6.B] : Initialisation Firestore client avec la base nommée, absence de double initialisation et préservation de Firebase Auth", () => {
+    // 1. La configuration active utilise explicitement la base nommée
+    expect(activeConfig.projectId).toBe("graphical-router-x18qq");
+    expect(activeConfig.firestoreDatabaseId).toBe(
+      "ai-studio-pdivisdz-12e4b2ec-ffc7-48b8-9472-8a77deb300cf"
+    );
+    expect(activeConfig.firestoreDatabaseId).not.toBe("(default)");
+
+    // 2. Absence de double initialisation sur l'instance d'application existante
+    firestoreMocks.initializeFirestore.mockClear();
+    const sameDb = getOrInitializeClientFirestore(app, activeConfig);
+    expect(sameDb).toBe(db);
+    expect(firestoreMocks.initializeFirestore).not.toHaveBeenCalled();
+
+    // 3. Sur une nouvelle instance d'application, initializeFirestore reçoit explicitement la base nommée en 3e argument
+    const customApp = { name: "secondary-test-app", options: { projectId: EXPECTED_FIREBASE_PROJECT_ID } };
+    const secondaryDb = getOrInitializeClientFirestore(customApp, {
+      projectId: EXPECTED_FIREBASE_PROJECT_ID,
+      firestoreDatabaseId: EXPECTED_FIRESTORE_DATABASE_ID
+    });
+    expect(firestoreMocks.initializeFirestore).toHaveBeenCalledTimes(1);
+    expect(firestoreMocks.initializeFirestore).toHaveBeenCalledWith(
+      customApp,
+      expect.any(Object),
+      "ai-studio-pdivisdz-12e4b2ec-ffc7-48b8-9472-8a77deb300cf"
+    );
+
+    // Un second appel sur customApp retourne exactement la même instance sans réinitialiser Firestore
+    const secondaryDbAgain = getOrInitializeClientFirestore(customApp, {
+      projectId: EXPECTED_FIREBASE_PROJECT_ID,
+      firestoreDatabaseId: EXPECTED_FIRESTORE_DATABASE_ID
+    });
+    expect(secondaryDbAgain).toBe(secondaryDb);
+    expect(firestoreMocks.initializeFirestore).toHaveBeenCalledTimes(1);
+
+    // Un appel sur customApp avec un Database ID absent ou '(default)' échoue immédiatement
+    expect(() =>
+      getOrInitializeClientFirestore({ name: "bad-app", options: { projectId: EXPECTED_FIREBASE_PROJECT_ID } }, {
+        projectId: EXPECTED_FIREBASE_PROJECT_ID,
+        firestoreDatabaseId: "(default)"
+      })
+    ).toThrow(/\(default\)['"]? est interdite/);
+
+    // 4. Firebase Authentication reste opérationnel
+    expect(auth).toBeDefined();
+    expect(auth.currentUser?.uid).toBe("user_123");
+  });
+
+  it("FIRESTORE-NAMED-DB-01-FIX-01 [6.E] : firebase.json déclare un tableau Firestore ciblant exactement la base nommée et conserve firestore.rules et l'émulateur", () => {
+    const firebaseJsonRaw = fs.readFileSync(path.resolve(process.cwd(), "firebase.json"), "utf-8");
+    const parsed = JSON.parse(firebaseJsonRaw);
+
+    expect(Array.isArray(parsed.firestore)).toBe(true);
+    expect(parsed.firestore).toHaveLength(1);
+    expect(parsed.firestore[0]).toEqual({
+      database: "ai-studio-pdivisdz-12e4b2ec-ffc7-48b8-9472-8a77deb300cf",
+      rules: "firestore.rules"
+    });
+    expect(parsed.emulators).toEqual({
+      firestore: {
+        port: 8080
+      }
+    });
+  });
+
+  // =========================================================================
+  // FIRESTORE-NAMED-DB-01-FIX-02 : IDENTITÉ FIREBASE APP CÔTÉ CLIENT (FIX-02-A)
+  // =========================================================================
+  it("FIRESTORE-NAMED-DB-01-FIX-02 [FIX-02-A] : Sélection explicite de l'application [DEFAULT], rejet d'un mauvais projet et gestion sûre des applications secondaires", () => {
+    // 1. Une application [DEFAULT] préexistante du bon projet est acceptée sans réinitialisation
+    const validPreexistingDefaultApp = {
+      name: "[DEFAULT]",
+      options: { projectId: "graphical-router-x18qq" }
+    };
+    const initSpyValid = vi.fn();
+    const getAppSpyValid = vi.fn(() => validPreexistingDefaultApp as any);
+    const reusedApp = getOrInitializeClientFirebaseApp(activeConfig, {
+      getApps: () => [validPreexistingDefaultApp as any],
+      getApp: getAppSpyValid,
+      initializeApp: initSpyValid as any
+    });
+    expect(reusedApp).toBe(validPreexistingDefaultApp);
+    expect(getAppSpyValid).toHaveBeenCalledTimes(1);
+    expect(initSpyValid).not.toHaveBeenCalled();
+    expect(validateClientFirebaseAppProjectId(reusedApp)).toBe("graphical-router-x18qq");
+
+    // 2. Une application [DEFAULT] préexistante d'un autre projet est immédiatement rejetée
+    const wrongProjectDefaultApp = {
+      name: "[DEFAULT]",
+      options: { projectId: "wrong-firebase-project" }
+    };
+    expect(() =>
+      getOrInitializeClientFirebaseApp(activeConfig, {
+        getApps: () => [wrongProjectDefaultApp as any],
+        getApp: () => wrongProjectDefaultApp as any,
+        initializeApp: vi.fn() as any
+      })
+    ).toThrow(/projectId invalide/);
+
+    // Une application [DEFAULT] préexistante sans options.projectId est également rejetée
+    const missingProjectDefaultApp = {
+      name: "[DEFAULT]",
+      options: {}
+    };
+    expect(() =>
+      getOrInitializeClientFirebaseApp(activeConfig, {
+        getApps: () => [missingProjectDefaultApp as any],
+        getApp: () => missingProjectDefaultApp as any,
+        initializeApp: vi.fn() as any
+      })
+    ).toThrow(/absent ou vide/);
+
+    // 3. Une application secondaire préexistante sans application [DEFAULT] ne provoque pas d'erreur non contrôlée :
+    // getApp() n'est pas appelé à tort et [DEFAULT] est initialisée avec activeConfig
+    const preexistingSecondaryApp = {
+      name: "secondary-analytics-app",
+      options: { projectId: "other-secondary-project" }
+    };
+    const createdDefaultApp = {
+      name: "[DEFAULT]",
+      options: { projectId: "graphical-router-x18qq" }
+    };
+    const getAppThrowIfCalled = vi.fn(() => {
+      throw new Error("No Firebase App '[DEFAULT]' has been created");
+    });
+    const initDefaultSpy = vi.fn(() => createdDefaultApp as any);
+
+    const initializedDefault = getOrInitializeClientFirebaseApp(activeConfig, {
+      getApps: () => [preexistingSecondaryApp as any],
+      getApp: getAppThrowIfCalled as any,
+      initializeApp: initDefaultSpy as any
+    });
+    expect(initializedDefault).toBe(createdDefaultApp);
+    expect(getAppThrowIfCalled).not.toHaveBeenCalled();
+    expect(initDefaultSpy).toHaveBeenCalledTimes(1);
+    expect(initDefaultSpy).toHaveBeenCalledWith(activeConfig);
+
+    // 4. getOrInitializeClientFirestore() rejette toute application dont le projet diverge de la configuration validée
+    firestoreMocks.initializeFirestore.mockClear();
+    expect(() =>
+      getOrInitializeClientFirestore(
+        { name: "[DEFAULT]", options: { projectId: "wrong-project-id" } },
+        activeConfig
+      )
+    ).toThrow(/projectId invalide/);
+    expect(() =>
+      getOrInitializeClientFirestore(
+        { name: "[DEFAULT]", options: {} },
+        activeConfig
+      )
+    ).toThrow(/absent ou vide/);
+    expect(() =>
+      getOrInitializeClientFirestore(
+        {
+          name: "[DEFAULT]",
+          options: { projectId: "graphical-router-x18qq" },
+          projectId: "divergent-direct-project"
+        },
+        activeConfig
+      )
+    ).toThrow(/projectId invalide/);
+    expect(firestoreMocks.initializeFirestore).not.toHaveBeenCalled();
+  });
 });
+
 
 

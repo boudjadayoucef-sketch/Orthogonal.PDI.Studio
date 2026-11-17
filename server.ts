@@ -5,11 +5,11 @@
  * UNAUTHORIZED DUPLICATION OR USAGE IS STRICTLY PROHIBITED.
  */
 
+import "dotenv/config";
 import express from "express";
 import path from "path";
 // PATCH 017G : inspection reelle du dossier dist/assets.
 import fs from "fs";
-import dotenv from "dotenv";
 import { createServer as createViteServer } from "vite";
 import { requireAuth, requireSuperAdmin, requireEmailVerified, AuthRequest } from "./src/middleware/auth.ts";
 import { adminAuth, adminDb } from "./src/lib/firebase-admin.ts";
@@ -39,7 +39,6 @@ import {
 } from "./src/db/projects.ts";
 import { getOrCreateUser } from "./src/db/users.ts";
 
-dotenv.config();
 
 // Validation sûre de la configuration au démarrage (Section D2)
 const configValidation = verifyProductionConfig();

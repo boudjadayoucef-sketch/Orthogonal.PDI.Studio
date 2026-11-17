@@ -88,36 +88,266 @@ export async function testConnection() {
     // Silent fallback to local persistence when offline or backend unreachable
   }
 }
-// Allow the user to override Firebase configuration via client-side environment variables
+// ==========================================
+// FIRESTORE NAMED DATABASE & CLIENT CONFIG VALIDATION (FIRESTORE-NAMED-DB-01-FIX-01)
+// ==========================================
+export const EXPECTED_FIREBASE_PROJECT_ID = "graphical-router-x18qq";
+export const EXPECTED_FIRESTORE_DATABASE_ID =
+  "ai-studio-pdivisdz-12e4b2ec-ffc7-48b8-9472-8a77deb300cf";
+
+export function validateClientFirebaseProjectId(projectId: unknown): string {
+  if (typeof projectId !== "string" || projectId.trim().length === 0) {
+    throw new Error(
+      "Configuration Firebase refusée : l'identifiant de projet (VITE_FIREBASE_PROJECT_ID) est absent ou vide."
+    );
+  }
+  const normalized = projectId.trim();
+  if (normalized !== EXPECTED_FIREBASE_PROJECT_ID) {
+    throw new Error(
+      `Configuration Firebase refusée : projectId invalide ('${normalized}'). Attendu : '${EXPECTED_FIREBASE_PROJECT_ID}'.`
+    );
+  }
+  return EXPECTED_FIREBASE_PROJECT_ID;
+}
+
+export function validateClientFirestoreDatabaseId(databaseId: unknown): string {
+  if (typeof databaseId !== "string" || databaseId.trim().length === 0) {
+    throw new Error(
+      "Configuration Firestore refusée : l'identifiant de base de données (VITE_FIREBASE_DATABASE_ID) est absent ou vide. Aucun fallback vers '(default)' n'est autorisé."
+    );
+  }
+  const normalized = databaseId.trim();
+  if (normalized === "(default)") {
+    throw new Error(
+      "Configuration Firestore refusée : la base '(default)' est interdite. La base nommée explicite est requise."
+    );
+  }
+  if (normalized !== EXPECTED_FIRESTORE_DATABASE_ID) {
+    throw new Error(
+      `Configuration Firestore refusée : identifiant de base Firestore invalide ('${normalized}'). Attendu : '${EXPECTED_FIRESTORE_DATABASE_ID}'.`
+    );
+  }
+  return EXPECTED_FIRESTORE_DATABASE_ID;
+}
+
+export interface ClientFirebaseConfig {
+  apiKey: string;
+  authDomain: string;
+  projectId: string;
+  storageBucket: string;
+  messagingSenderId: string;
+  appId: string;
+  firestoreDatabaseId: string;
+}
+
+export function resolveClientFirebaseConfig(
+  env?: Record<string, unknown>,
+  options?: { requireExplicitEnv?: boolean }
+): ClientFirebaseConfig {
+  const sourceEnv = env && typeof env === "object" ? env : {};
+  const requireExplicit = Boolean(options?.requireExplicitEnv);
+
+  const hasExplicitProjectId =
+    Object.prototype.hasOwnProperty.call(sourceEnv, "VITE_FIREBASE_PROJECT_ID") &&
+    sourceEnv.VITE_FIREBASE_PROJECT_ID !== undefined;
+  const rawProjectId =
+    requireExplicit || hasExplicitProjectId
+      ? sourceEnv.VITE_FIREBASE_PROJECT_ID
+      : EXPECTED_FIREBASE_PROJECT_ID;
+  const validatedProjectId = validateClientFirebaseProjectId(rawProjectId);
+
+  const hasExplicitDatabaseId =
+    Object.prototype.hasOwnProperty.call(sourceEnv, "VITE_FIREBASE_DATABASE_ID") &&
+    sourceEnv.VITE_FIREBASE_DATABASE_ID !== undefined;
+  const rawDatabaseId =
+    requireExplicit || hasExplicitDatabaseId
+      ? sourceEnv.VITE_FIREBASE_DATABASE_ID
+      : EXPECTED_FIRESTORE_DATABASE_ID;
+  const validatedDatabaseId = validateClientFirestoreDatabaseId(rawDatabaseId);
+
+  return {
+    apiKey:
+      typeof sourceEnv.VITE_FIREBASE_API_KEY === "string" && sourceEnv.VITE_FIREBASE_API_KEY.trim().length > 0
+        ? sourceEnv.VITE_FIREBASE_API_KEY.trim()
+        : "AIzaSyDdmbiKphCDABf83fWOcBix72FOMT-ZGGo",
+    authDomain:
+      typeof sourceEnv.VITE_FIREBASE_AUTH_DOMAIN === "string" && sourceEnv.VITE_FIREBASE_AUTH_DOMAIN.trim().length > 0
+        ? sourceEnv.VITE_FIREBASE_AUTH_DOMAIN.trim()
+        : "graphical-router-x18qq.firebaseapp.com",
+    projectId: validatedProjectId,
+    storageBucket:
+      typeof sourceEnv.VITE_FIREBASE_STORAGE_BUCKET === "string" &&
+      sourceEnv.VITE_FIREBASE_STORAGE_BUCKET.trim().length > 0
+        ? sourceEnv.VITE_FIREBASE_STORAGE_BUCKET.trim()
+        : "graphical-router-x18qq.firebasestorage.app",
+    messagingSenderId:
+      typeof sourceEnv.VITE_FIREBASE_MESSAGING_SENDER_ID === "string" &&
+      sourceEnv.VITE_FIREBASE_MESSAGING_SENDER_ID.trim().length > 0
+        ? sourceEnv.VITE_FIREBASE_MESSAGING_SENDER_ID.trim()
+        : "757027531011",
+    appId:
+      typeof sourceEnv.VITE_FIREBASE_APP_ID === "string" && sourceEnv.VITE_FIREBASE_APP_ID.trim().length > 0
+        ? sourceEnv.VITE_FIREBASE_APP_ID.trim()
+        : "1:757027531011:web:758a7df99506a6e9dc6136",
+    firestoreDatabaseId: validatedDatabaseId
+  };
+}
+
+const CLIENT_FIRESTORE_INSTANCES = new WeakMap<
+  object,
+  { databaseId: string; projectId: string; instance: ReturnType<typeof initializeFirestore> }
+>();
+
+/**
+ * FIRESTORE-NAMED-DB-01-FIX-02 (FIX-02-A) :
+ * Vérifie que l'instance FirebaseApp possède un options.projectId valide et conforme au projet autorisé.
+ */
+export function validateClientFirebaseAppProjectId(
+  appInstance: any,
+  expectedProjectId: unknown = EXPECTED_FIREBASE_PROJECT_ID
+): string {
+  if (!appInstance || typeof appInstance !== "object") {
+    throw new Error(
+      "Configuration Firebase refusée : instance FirebaseApp absente ou invalide."
+    );
+  }
+  const validatedExpected = validateClientFirebaseProjectId(expectedProjectId);
+  const rawAppProjectId = appInstance?.options?.projectId;
+  const validatedAppProjectId = validateClientFirebaseProjectId(rawAppProjectId);
+
+  if (validatedAppProjectId !== validatedExpected) {
+    throw new Error(
+      `Configuration Firebase refusée : le projectId de l'application Firebase ('${validatedAppProjectId}') diverge de la configuration validée ('${validatedExpected}').`
+    );
+  }
+  return validatedAppProjectId;
+}
+
+/**
+ * FIRESTORE-NAMED-DB-01-FIX-02 (FIX-02-A) :
+ * Sélectionne explicitement l'application Firebase '[DEFAULT]' si elle existe,
+ * ou l'initialise avec la configuration validée si elle n'existe pas (y compris lorsqu'une application
+ * secondaire préexistante est présente sans application '[DEFAULT]').
+ * Vérifie systématiquement que app.options.projectId === 'graphical-router-x18qq' avant tout appel à Auth ou Firestore.
+ */
+export function getOrInitializeClientFirebaseApp(
+  config: ClientFirebaseConfig,
+  sdk?: {
+    getApps?: typeof getApps;
+    getApp?: typeof getApp;
+    initializeApp?: typeof initializeApp;
+  }
+): ReturnType<typeof initializeApp> {
+  const validatedProjectId = validateClientFirebaseProjectId(config?.projectId);
+  validateClientFirestoreDatabaseId(config?.firestoreDatabaseId);
+
+  const listApps = sdk?.getApps ?? getApps;
+  const fetchDefaultApp = sdk?.getApp ?? getApp;
+  const createApp = sdk?.initializeApp ?? initializeApp;
+
+  const existingApps = listApps();
+  const defaultAppInList = Array.isArray(existingApps)
+    ? existingApps.find(
+        (candidate: any) =>
+          candidate && typeof candidate === "object" && candidate.name === "[DEFAULT]"
+      )
+    : undefined;
+
+  let resolvedApp: any;
+  if (defaultAppInList) {
+    const fetchedApp = typeof fetchDefaultApp === "function" ? fetchDefaultApp() : defaultAppInList;
+    resolvedApp =
+      fetchedApp && typeof fetchedApp === "object" && fetchedApp.options !== undefined
+        ? fetchedApp
+        : defaultAppInList;
+
+    if (resolvedApp?.name !== undefined && resolvedApp.name !== "[DEFAULT]") {
+      throw new Error(
+        `Configuration Firebase refusée : l'application sélectionnée ('${String(resolvedApp.name)}') n'est pas l'application '[DEFAULT]'.`
+      );
+    }
+    validateClientFirebaseAppProjectId(resolvedApp, validatedProjectId);
+  } else {
+    resolvedApp = createApp(config);
+    if (resolvedApp && typeof resolvedApp === "object" && resolvedApp.options === undefined) {
+      (resolvedApp as any).options = { ...config, projectId: validatedProjectId };
+    }
+    validateClientFirebaseAppProjectId(resolvedApp, validatedProjectId);
+  }
+
+  return resolvedApp;
+}
+
+/**
+ * FIRESTORE-NAMED-DB-01-FIX-01 & FIX-02 (4.1 & FIX-02-A) :
+ * Initialise Firestore côté client exclusivement sur la base nommée validée,
+ * sans aucun fallback vers '(default)', en vérifiant la cohérence du projectId de l'application,
+ * et en garantissant une seule initialisation par instance d'application.
+ */
+export function getOrInitializeClientFirestore(
+  appInstance: any,
+  config: { projectId?: unknown; firestoreDatabaseId?: unknown }
+): ReturnType<typeof initializeFirestore> {
+  if (!appInstance || typeof appInstance !== "object") {
+    throw new Error("Initialisation Firestore refusée : instance FirebaseApp absente ou invalide.");
+  }
+
+  const validatedProjectId = validateClientFirebaseProjectId(config?.projectId);
+  const validatedDatabaseId = validateClientFirestoreDatabaseId(config?.firestoreDatabaseId);
+
+  validateClientFirebaseAppProjectId(appInstance, validatedProjectId);
+  if ("projectId" in appInstance && appInstance.projectId !== undefined) {
+    const directAppProj = validateClientFirebaseProjectId(appInstance.projectId);
+    if (directAppProj !== validatedProjectId) {
+      throw new Error(
+        "Initialisation Firestore refusée : divergence entre le projectId de l'application et la configuration validée."
+      );
+    }
+  }
+
+  const existing = CLIENT_FIRESTORE_INSTANCES.get(appInstance);
+  if (existing) {
+    if (existing.databaseId !== validatedDatabaseId || existing.projectId !== validatedProjectId) {
+      throw new Error(
+        "Initialisation Firestore refusée : une instance Firestore est déjà initialisée avec une configuration différente."
+      );
+    }
+    return existing.instance;
+  }
+
+  const instance = initializeFirestore(
+    appInstance,
+    {
+      localCache: persistentLocalCache({
+        tabManager: persistentMultipleTabManager(),
+      }),
+    },
+    validatedDatabaseId
+  );
+
+  CLIENT_FIRESTORE_INSTANCES.set(appInstance, {
+    databaseId: validatedDatabaseId,
+    projectId: validatedProjectId,
+    instance
+  });
+
+  return instance;
+}
+
 const metaEnv = (typeof import.meta !== "undefined" && (import.meta as any)?.env) || {};
 
-const activeConfig = {
-  apiKey: metaEnv.VITE_FIREBASE_API_KEY || "AIzaSyDdmbiKphCDABf83fWOcBix72FOMT-ZGGo",
-  authDomain: metaEnv.VITE_FIREBASE_AUTH_DOMAIN || "graphical-router-x18qq.firebaseapp.com",
-  projectId: metaEnv.VITE_FIREBASE_PROJECT_ID || "graphical-router-x18qq",
-  storageBucket: metaEnv.VITE_FIREBASE_STORAGE_BUCKET || "graphical-router-x18qq.firebasestorage.app",
-  messagingSenderId: metaEnv.VITE_FIREBASE_MESSAGING_SENDER_ID || "757027531011",
-  appId: metaEnv.VITE_FIREBASE_APP_ID || "1:757027531011:web:758a7df99506a6e9dc6136",
-  firestoreDatabaseId: metaEnv.VITE_FIREBASE_DATABASE_ID || undefined
-};
+const activeConfig = resolveClientFirebaseConfig(metaEnv);
 
-// Initialize Firebase
-const app = getApps().length === 0 ? initializeApp(activeConfig) : getApp();
+// Initialize or select [DEFAULT] Firebase App with strict projectId verification (FIX-02-A)
+const app = getOrInitializeClientFirebaseApp(activeConfig);
+validateClientFirebaseAppProjectId(app, activeConfig.projectId);
 
-// Initialize Firestore with robust local offline persistence (IndexedDB)
-const db = initializeFirestore(
-  app,
-  {
-    localCache: persistentLocalCache({
-      tabManager: persistentMultipleTabManager(),
-    }),
-  },
-  activeConfig.firestoreDatabaseId || undefined
-);
+// Initialize Firestore with robust local offline persistence (IndexedDB) and explicit named database ID
+const db = getOrInitializeClientFirestore(app, activeConfig);
 
 const auth = getAuth(app);
 
-export { db, auth, activeConfig };
+export { app, db, auth, activeConfig };
 
 // ==========================================
 // MODELS & SERVICES

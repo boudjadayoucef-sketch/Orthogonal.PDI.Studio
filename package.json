@@ -13,6 +13,7 @@
     "test:rules": "firebase emulators:exec --project demo-orthogonal-rules-pdi --only firestore \"npx vitest run src/security/tests/firestoreRulesEmulator.spec.ts\""
   },
   "dependencies": {
+    "@google-cloud/firestore": "8.7.1",
     "@google/genai": "^2.4.0",
     "@microsoft/clarity": "^1.0.2",
     "@sanity/client": "^8.6.1",
