@@ -24,6 +24,12 @@ import {
   attachSuperAdminTokenMonitor,
   type TokenMonitorUser
 } from "../clientAuthorization";
+import {
+  evaluateWorkspaceAccessGuard,
+  resolveStageTransition
+} from "../../pdi/app/PdiUnifiedApp";
+import { isCoherentAuthorizedLoginResult } from "../../pdi/auth/PdiAuthPage";
+import type { PdiUserProfile, WorkspaceSessionResolution } from "../../lib/firebase";
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -495,3 +501,351 @@ describe("SEC-01-FIX-03-R1 & R2: Strict Claims Validation & Invariants", () => {
     expect(isRestrictedAdminView("isometric")).toBe(false);
   });
 });
+
+// ===========================================================================
+// AUTH-ADMIN-05-FIX-11-R2 — BLOC B, BLOC C, BLOC D & BLOC E (8.2 / 8.3 / 8.4)
+// Garde central du workspace, état authReady, navigation (#app, ?app, pdi:navigate),
+// isolation pending_activation et cohérence PdiAuthPage
+// ===========================================================================
+describe("AUTH-ADMIN-05-FIX-11-R2 : Centralized Workspace Guard, authReady, Navigation & Super Admin Matrix", () => {
+  const activeClientProfile: PdiUserProfile = {
+    uid: "uid_client_active",
+    email: "client@orthogonal.dz",
+    name: "Client Actif",
+    role: "client",
+    accountType: "pro",
+    subscriptionPlan: "yearly",
+    status: "active",
+    createdAt: "2026-04-12T10:00:00.000Z"
+  };
+
+  const pendingClientProfile: PdiUserProfile = {
+    uid: "uid_client_pending",
+    email: "pending@orthogonal.dz",
+    name: "Client En Attente",
+    role: "client",
+    accountType: "basic",
+    subscriptionPlan: "monthly",
+    status: "pending_activation",
+    createdAt: "2026-04-12T10:00:00.000Z"
+  };
+
+  const suspendedClientProfile: PdiUserProfile = {
+    uid: "uid_client_suspended",
+    email: "suspended@orthogonal.dz",
+    name: "Client Suspendu",
+    role: "client",
+    accountType: "basic",
+    subscriptionPlan: "monthly",
+    status: "suspended",
+    createdAt: "2026-04-12T10:00:00.000Z"
+  };
+
+  const activeSuperAdminProfile: PdiUserProfile = {
+    uid: "uid_super_admin",
+    email: "boudjada.youcef@gmail.com",
+    name: "Youcef Boudjada",
+    role: "super_admin",
+    accountType: "enterprise",
+    subscriptionPlan: "lifetime",
+    status: "active",
+    createdAt: "2026-04-12T10:00:00.000Z"
+  };
+
+  const activeClientSession: WorkspaceSessionResolution = {
+    status: "active",
+    profile: activeClientProfile,
+    isSuperAdmin: false,
+    authMode: "client",
+    canAccessWorkspace: true,
+    canAccessActivation: false
+  };
+
+  const pendingClientSession: WorkspaceSessionResolution = {
+    status: "pending_activation",
+    reason: "pending_activation",
+    profile: pendingClientProfile,
+    isSuperAdmin: false,
+    authMode: "pending_email",
+    canAccessWorkspace: false,
+    canAccessActivation: true
+  };
+
+  const suspendedClientSession: WorkspaceSessionResolution = {
+    status: "denied",
+    reason: "suspended",
+    profile: null,
+    isSuperAdmin: false,
+    authMode: "guest",
+    canAccessWorkspace: false,
+    canAccessActivation: false
+  };
+
+  const activeSuperAdminSession: WorkspaceSessionResolution = {
+    status: "active",
+    profile: activeSuperAdminProfile,
+    isSuperAdmin: true,
+    authMode: "super_admin",
+    canAccessWorkspace: true,
+    canAccessActivation: false
+  };
+
+  it("FIX-11-R2 [8.3.1 & 8.3.2] : Chargement initial non connecté vs connecté active", () => {
+    // 1. Chargement initial non connecté (landing)
+    const unauthLanding = resolveStageTransition({
+      intent: "initial_load",
+      requestedStage: "landing",
+      authReady: true,
+      session: null,
+      currentAuthUser: null
+    });
+    expect(unauthLanding).toEqual({
+      stage: "landing",
+      loadingWorkspace: false,
+      authPageTab: "login",
+      authMode: "guest",
+      activeModule: "home"
+    });
+
+    // 2. Chargement initial connecté active demandant #app
+    const authActiveApp = resolveStageTransition({
+      intent: "initial_load",
+      requestedStage: "app",
+      requestedModule: "isometric",
+      authReady: true,
+      session: activeClientSession,
+      currentAuthUser: { uid: "uid_client_active", emailVerified: true }
+    });
+    expect(authActiveApp).toEqual({
+      stage: "app",
+      loadingWorkspace: false,
+      authPageTab: "login",
+      authMode: "client",
+      activeModule: "isometric"
+    });
+  });
+
+  it("FIX-11-R2 [8.3.3] : Rechargement de page avec session valide (état authReady)", () => {
+    // Tant que authReady === false, loadingWorkspace === true (affiche l'écran de chargement, ne déconnecte pas l'utilisateur et n'expose pas le workspace)
+    const beforeAuthReady = resolveStageTransition({
+      intent: "initial_load",
+      requestedStage: "app",
+      requestedModule: "projects",
+      authReady: false,
+      session: null,
+      currentAuthUser: null
+    });
+    expect(beforeAuthReady.stage).toBe("app");
+    expect(beforeAuthReady.loadingWorkspace).toBe(true);
+
+    // Dès que Firebase Auth et Firestore ont résolu le profil actif (authReady === true), le workspace est autorisé
+    const afterAuthReady = resolveStageTransition({
+      intent: "initial_load",
+      requestedStage: "app",
+      requestedModule: "projects",
+      authReady: true,
+      session: activeClientSession,
+      currentAuthUser: { uid: "uid_client_active", emailVerified: true }
+    });
+    expect(afterAuthReady.stage).toBe("app");
+    expect(afterAuthReady.loadingWorkspace).toBe(false);
+    expect(afterAuthReady.authMode).toBe("client");
+    expect(afterAuthReady.activeModule).toBe("projects");
+  });
+
+  it("FIX-11-R2 [8.3.4, 8.3.5, 8.3.6] : Aucun contournement via #app, ?app, hashchange, pdi:navigate, enterApp ou openModuleInTab sans session active", () => {
+    const intents: Array<"initial_load" | "hashchange" | "pdi_navigate" | "enter_app" | "open_module"> = [
+      "initial_load", // ?app ou #app initial
+      "hashchange",   // #app dynamique
+      "pdi_navigate", // événement pdi:navigate
+      "enter_app",    // enterApp()
+      "open_module"   // openModuleInTab()
+    ];
+
+    for (const intent of intents) {
+      const decisionUnauth = resolveStageTransition({
+        intent,
+        requestedStage: "app",
+        requestedModule: "isometric",
+        authReady: true,
+        session: null,
+        currentAuthUser: null
+      });
+      expect(decisionUnauth.stage).toBe("auth");
+      expect(decisionUnauth.authPageTab).toBe("login");
+      expect(decisionUnauth.authMode).toBe("guest");
+    }
+  });
+
+  it("FIX-11-R2 [8.2.3, 8.2.4, 8.2.5, 8.2.6 & 8.3.7] : Utilisateur pending_activation isolé sur l'écran d'activation, bloqué sur #app, ?app, workspace et admin", () => {
+    const pendingAuthUser = { uid: "uid_client_pending", emailVerified: false };
+
+    // 1. Garde central du workspace refuse l'accès et redirige vers l'onglet activation
+    const guardPending = evaluateWorkspaceAccessGuard(pendingClientSession, "isometric", pendingAuthUser);
+    expect(guardPending).toEqual({
+      allowed: false,
+      targetStage: "auth",
+      authPageTab: "activation",
+      resolvedAuthMode: "pending_email",
+      authorizedModule: "home",
+      reason: "pending_activation"
+    });
+
+    // 2. Tentative d'accès direct via #app, ?app ou pdi:navigate -> redirigé vers stage="auth", authPageTab="activation"
+    for (const intent of ["initial_load", "hashchange", "pdi_navigate", "enter_app", "open_module"] as const) {
+      const navPending = resolveStageTransition({
+        intent,
+        requestedStage: "app",
+        requestedModule: "super_admin_console",
+        authReady: true,
+        session: pendingClientSession,
+        currentAuthUser: pendingAuthUser
+      });
+      expect(navPending.stage).toBe("auth");
+      expect(navPending.authPageTab).toBe("activation");
+      expect(navPending.authMode).toBe("pending_email");
+    }
+  });
+
+  it("FIX-11-R2 [8.3.8, 8.3.9, 8.3.10] : Utilisateur suspended bloqué, déconnexion depuis le workspace et changement d'utilisateur", () => {
+    // 1. Utilisateur suspended tentant d'ouvrir le workspace -> bloqué et redirigé vers login
+    const suspendedGuard = evaluateWorkspaceAccessGuard(
+      suspendedClientSession,
+      "isometric",
+      { uid: "uid_client_suspended", emailVerified: true }
+    );
+    expect(suspendedGuard.allowed).toBe(false);
+    expect(suspendedGuard.targetStage).toBe("auth");
+    expect(suspendedGuard.authPageTab).toBe("login");
+    expect(suspendedGuard.resolvedAuthMode).toBe("guest");
+
+    // 2. Déconnexion depuis le workspace -> retour immédiat à auth / login / guest
+    const logoutTransition = resolveStageTransition({
+      intent: "logout",
+      authReady: true,
+      session: activeClientSession,
+      currentAuthUser: null
+    });
+    expect(logoutTransition).toEqual({
+      stage: "auth",
+      loadingWorkspace: false,
+      authPageTab: "login",
+      authMode: "guest",
+      activeModule: "home"
+    });
+
+    // 3. Changement d'utilisateur : session précédente Super Admin mais currentAuthUser.uid a changé -> refus immédiat (fail-closed)
+    const switchGuard = evaluateWorkspaceAccessGuard(
+      activeSuperAdminSession,
+      "super_admin_console",
+      { uid: "uid_client_active", emailVerified: true }
+    );
+    expect(switchGuard.allowed).toBe(false);
+    expect(switchGuard.resolvedAuthMode).toBe("guest");
+    expect(switchGuard.targetStage).toBe("auth");
+  });
+
+  it("FIX-11-R2 [8.4 & BLOC D] : Matrice complète Super Admin et vérification de cohérence PdiAuthPage avant onSuccess", () => {
+    // 1. Pas de claim Super Admin -> pas d'accès admin (redirigé vers isometric)
+    const clientTryingAdmin = evaluateWorkspaceAccessGuard(
+      activeClientSession,
+      "super_admin_console",
+      { uid: "uid_client_active", emailVerified: true }
+    );
+    expect(clientTryingAdmin.allowed).toBe(true);
+    expect(clientTryingAdmin.resolvedAuthMode).toBe("client");
+    expect(clientTryingAdmin.authorizedModule).toBe("isometric");
+
+    // 2. profile.role = "super_admin" sans claim Super Admin valide -> refus total (invalid_claims)
+    const forgedProfileSession: WorkspaceSessionResolution = {
+      status: "active",
+      profile: activeSuperAdminProfile, // role: "super_admin"
+      isSuperAdmin: false,              // claim absent
+      authMode: "client",
+      canAccessWorkspace: true,
+      canAccessActivation: false
+    };
+    const forgedDecision = evaluateWorkspaceAccessGuard(
+      forgedProfileSession,
+      "home",
+      { uid: "uid_super_admin", emailVerified: true }
+    );
+    expect(forgedDecision.allowed).toBe(false);
+    expect(forgedDecision.reason).toBe("invalid_claims");
+
+    // 3. Claim Super Admin valide mais sans profil actif (ex: profil absent ou pending_activation) -> refus du workspace
+    const superWithoutProfileSession: WorkspaceSessionResolution = {
+      status: "denied",
+      reason: "profile_not_found",
+      profile: null,
+      isSuperAdmin: false,
+      authMode: "guest",
+      canAccessWorkspace: false,
+      canAccessActivation: false
+    };
+    const noProfileDecision = evaluateWorkspaceAccessGuard(
+      superWithoutProfileSession,
+      "super_admin_console",
+      { uid: "uid_super_admin", emailVerified: true }
+    );
+    expect(noProfileDecision.allowed).toBe(false);
+
+    // 4. Profil actif + claims Super Admin valides + emailVerified=true -> accès Super Admin autorisé
+    const validSuperDecision = evaluateWorkspaceAccessGuard(
+      activeSuperAdminSession,
+      "super_admin_console",
+      { uid: "uid_super_admin", emailVerified: true }
+    );
+    expect(validSuperDecision).toEqual({
+      allowed: true,
+      targetStage: "app",
+      authPageTab: "login",
+      resolvedAuthMode: "super_admin",
+      authorizedModule: "super_admin_console"
+    });
+
+    // 5. BLOC D : isCoherentAuthorizedLoginResult bloque onSuccess si profil non actif, UID incohérent ou Super Admin non vérifié
+    expect(
+      isCoherentAuthorizedLoginResult(
+        { profile: activeClientProfile, isSuperAdmin: false },
+        { uid: "uid_client_active", emailVerified: false }
+      )
+    ).toBe(true);
+
+    expect(
+      isCoherentAuthorizedLoginResult(
+        { profile: pendingClientProfile, isSuperAdmin: false },
+        { uid: "uid_client_pending", emailVerified: true }
+      )
+    ).toBe(false);
+
+    expect(
+      isCoherentAuthorizedLoginResult(
+        { profile: suspendedClientProfile, isSuperAdmin: false },
+        { uid: "uid_client_suspended", emailVerified: true }
+      )
+    ).toBe(false);
+
+    expect(
+      isCoherentAuthorizedLoginResult(
+        { profile: activeClientProfile, isSuperAdmin: false },
+        { uid: "other_uid", emailVerified: true }
+      )
+    ).toBe(false);
+
+    expect(
+      isCoherentAuthorizedLoginResult(
+        { profile: activeSuperAdminProfile, isSuperAdmin: true },
+        { uid: "uid_super_admin", emailVerified: false }
+      )
+    ).toBe(false);
+
+    expect(
+      isCoherentAuthorizedLoginResult(
+        { profile: activeSuperAdminProfile, isSuperAdmin: true },
+        { uid: "uid_super_admin", emailVerified: true }
+      )
+    ).toBe(true);
+  });
+});
+

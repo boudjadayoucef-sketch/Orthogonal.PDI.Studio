@@ -140,7 +140,7 @@ export interface PdiUserProfile {
   role: PdiUserRole;
   accountType: PdiAccountType;
   subscriptionPlan: PdiSubscriptionPlan;
-  status: "active" | "suspended" | "pending_activation";
+  status: "active" | "suspended" | "pending_activation" | "revoked" | "disabled";
   createdAt: string;
   lastLoginAt?: string;
   loginCount?: number;
@@ -813,6 +813,721 @@ export async function hasSuperAdminPasswordConfigured(): Promise<boolean> {
   }
 }
 
+export type PdiAuthDenialReason =
+  | "profile_not_found"
+  | "pending_activation"
+  | "suspended"
+  | "revoked"
+  | "disabled"
+  | "inactive_status"
+  | "permission_denied"
+  | "network_error"
+  | "token_error"
+  | "invalid_claims"
+  | "unexpected_error"
+  | "signout_failed";
+
+export class PdiAuthAccessError extends Error {
+  readonly reason: PdiAuthDenialReason;
+  readonly code?: string;
+  readonly transient: boolean;
+  readonly sessionTerminated: boolean;
+  readonly pendingProfile?: PdiUserProfile;
+
+  constructor(options: {
+    message: string;
+    reason: PdiAuthDenialReason;
+    code?: string;
+    transient?: boolean;
+    sessionTerminated?: boolean;
+    pendingProfile?: PdiUserProfile;
+  }) {
+    super(options.message);
+    this.name = "PdiAuthAccessError";
+    this.reason = options.reason;
+    this.code = options.code;
+    this.transient = Boolean(options.transient);
+    this.sessionTerminated = Boolean(options.sessionTerminated);
+    this.pendingProfile = options.pendingProfile;
+    Object.setPrototypeOf(this, PdiAuthAccessError.prototype);
+  }
+}
+
+const LOCAL_IDENTITY_CACHE_KEYS = [
+  "pdi_user_profile",
+  "pdi.user.profile.v1",
+  "pdi.userProfile.v1",
+  "pdi.force.app.v1",
+  "pdi.activation.pendingToken.v1",
+  "pdi.auth.pendingUser.v1"
+] as const;
+
+const SESSION_IDENTITY_CACHE_KEYS = [
+  "pdi.stage.v4",
+  "pdi.drive.accessToken.v1"
+] as const;
+
+/**
+ * AUTH-ADMIN-05-FIX-11-R2 : Purge atomique des caches locaux d'identité et d'autorisation workspace.
+ */
+export function purgeLocalAuthCaches(options?: { preservePendingState?: boolean }): void {
+  const preservePending = Boolean(options?.preservePendingState);
+  try {
+    if (typeof localStorage !== "undefined") {
+      if (!preservePending) {
+        for (const key of LOCAL_IDENTITY_CACHE_KEYS) {
+          localStorage.removeItem(key);
+        }
+        localStorage.setItem("pdi.auth.mode.v1", "guest");
+      } else {
+        localStorage.removeItem("pdi.force.app.v1");
+        localStorage.setItem("pdi.auth.mode.v1", "pending_email");
+      }
+      localStorage.setItem("pdi.activeModule.v1", "home");
+    }
+  } catch {
+    // Ignore storage access errors
+  }
+
+  try {
+    if (typeof sessionStorage !== "undefined") {
+      for (const key of SESSION_IDENTITY_CACHE_KEYS) {
+        sessionStorage.removeItem(key);
+      }
+    }
+  } catch {
+    // Ignore sessionStorage access errors
+  }
+}
+
+/**
+ * AUTH-ADMIN-05-FIX-11-R2 (A3) : Classification stricte des erreurs Firestore lors de la lecture de profiles/{uid}.
+ * Ne confond jamais une erreur technique (permission-denied, réseau/indisponibilité, inattendue) avec un profil absent.
+ */
+export function classifyFirestoreProfileReadError(err: unknown): {
+  reason: "permission_denied" | "network_error" | "unexpected_error";
+  code?: string;
+  transient: boolean;
+  message: string;
+} {
+  const rawCode =
+    err && typeof err === "object" && "code" in err && typeof (err as any).code === "string"
+      ? String((err as any).code).trim().toLowerCase()
+      : undefined;
+  const rawMessage =
+    err instanceof Error
+      ? err.message
+      : typeof err === "string"
+      ? err
+      : String(err ?? "");
+  const lowerMsg = rawMessage.toLowerCase();
+
+  if (
+    rawCode === "permission-denied" ||
+    rawCode === "firestore/permission-denied" ||
+    rawCode === "unauthenticated" ||
+    rawCode === "firestore/unauthenticated" ||
+    lowerMsg.includes("permission-denied") ||
+    lowerMsg.includes("permission denied") ||
+    lowerMsg.includes("missing or insufficient permissions") ||
+    lowerMsg.includes("insufficient permissions")
+  ) {
+    return {
+      reason: "permission_denied",
+      code: rawCode || "permission-denied",
+      transient: false,
+      message:
+        "Connexion refusée : accès refusé par Firestore lors de la lecture du profil PD&I (permission-denied)."
+    };
+  }
+
+  if (
+    rawCode === "unavailable" ||
+    rawCode === "firestore/unavailable" ||
+    rawCode === "deadline-exceeded" ||
+    rawCode === "firestore/deadline-exceeded" ||
+    rawCode === "aborted" ||
+    rawCode === "resource-exhausted" ||
+    rawCode === "auth/network-request-failed" ||
+    lowerMsg.includes("unavailable") ||
+    lowerMsg.includes("network") ||
+    lowerMsg.includes("offline") ||
+    lowerMsg.includes("connection lost") ||
+    lowerMsg.includes("timeout") ||
+    lowerMsg.includes("failed to fetch") ||
+    lowerMsg.includes("deadline-exceeded")
+  ) {
+    return {
+      reason: "network_error",
+      code: rawCode || "unavailable",
+      transient: true,
+      message:
+        "Impossible de vérifier le profil PD&I : erreur réseau ou service Firestore temporairement indisponible. Veuillez réessayer."
+    };
+  }
+
+  return {
+    reason: "unexpected_error",
+    code: rawCode,
+    transient: false,
+    message:
+      "Connexion refusée : une erreur technique inattendue est survenue lors de la lecture du profil PD&I dans Firestore."
+  };
+}
+
+async function terminateAuthSessionOnDenial(
+  denialMessage: string,
+  reason: PdiAuthDenialReason,
+  code?: string
+): Promise<never> {
+  purgeLocalAuthCaches({ preservePendingState: false });
+  try {
+    await fbSignOut(auth);
+  } catch (signOutErr: unknown) {
+    purgeLocalAuthCaches({ preservePendingState: false });
+    const signOutDetail =
+      signOutErr instanceof Error ? signOutErr.message : String(signOutErr ?? "erreur inconnue");
+    throw new PdiAuthAccessError({
+      message: `${denialMessage} (Échec critique de fermeture de la session Firebase : ${signOutDetail})`,
+      reason,
+      code: code || "auth/signout-failed",
+      transient: false,
+      sessionTerminated: false
+    });
+  }
+
+  throw new PdiAuthAccessError({
+    message: denialMessage,
+    reason,
+    code,
+    transient: false,
+    sessionTerminated: true
+  });
+}
+
+function validateTokenAndClaimsOrThrow(
+  tokenResult: { claims?: Record<string, unknown> } | null | undefined,
+  fbUser: { uid: string; email?: string | null; emailVerified?: boolean }
+): { isSuperAdmin: boolean; claims: Record<string, unknown> } {
+  if (!tokenResult || !tokenResult.claims || typeof tokenResult.claims !== "object" || Array.isArray(tokenResult.claims)) {
+    throw new PdiAuthAccessError({
+      message: "Connexion refusée : les Custom Claims du jeton Firebase sont absents ou invalides.",
+      reason: "invalid_claims",
+      code: "auth/invalid-claims",
+      transient: false,
+      sessionTerminated: false
+    });
+  }
+
+  const claims = tokenResult.claims;
+
+  if (
+    typeof claims.email === "string" &&
+    claims.email.trim().length > 0 &&
+    typeof fbUser.email === "string" &&
+    fbUser.email.trim().length > 0 &&
+    claims.email.trim().toLowerCase() !== fbUser.email.trim().toLowerCase()
+  ) {
+    throw new PdiAuthAccessError({
+      message: "Connexion refusée : incohérence entre l'adresse email du compte et les claims du jeton Firebase.",
+      reason: "invalid_claims",
+      code: "auth/claims-email-mismatch",
+      transient: false,
+      sessionTerminated: false
+    });
+  }
+
+  const isSuperAdmin = isSuperAdminClaimAuthorized(claims, fbUser.emailVerified);
+
+  // Si le jeton contient un claim role explicite différent de 'client', il doit obligatoirement
+  // satisfaire isSuperAdminClaimAuthorized (role === 'super_admin' && email_verified === true).
+  if (claims.role !== undefined && claims.role !== "client" && !isSuperAdmin) {
+    throw new PdiAuthAccessError({
+      message:
+        "Connexion refusée : les Custom Claims d'autorisation privilégiée sont invalides ou l'email n'est pas vérifié.",
+      reason: "invalid_claims",
+      code: "auth/invalid-privileged-claims",
+      transient: false,
+      sessionTerminated: false
+    });
+  }
+
+  return { isSuperAdmin, claims };
+}
+
+async function verifyAuthenticatedUserProfileAndClaims(options: {
+  fbUser: {
+    uid: string;
+    email?: string | null;
+    emailVerified?: boolean;
+    getIdTokenResult: (forceRefresh?: boolean) => Promise<{ claims: Record<string, unknown> }>;
+  };
+  providerType: "email" | "google";
+  fallbackEmail: string;
+  clientInfo?: { userAgent?: string; device?: string };
+}): Promise<{ profile: PdiUserProfile; isSuperAdmin: boolean }> {
+  const { fbUser, providerType, fallbackEmail, clientInfo } = options;
+  const uid = fbUser?.uid;
+
+  if (!uid || typeof uid !== "string" || uid.trim().length === 0) {
+    await terminateAuthSessionOnDenial(
+      "Connexion refusée : identifiant utilisateur Firebase (UID) absent ou invalide.",
+      "token_error",
+      "auth/invalid-uid"
+    );
+  }
+
+  let tokenResult: { claims: Record<string, unknown> };
+  try {
+    tokenResult = await fbUser.getIdTokenResult(true);
+  } catch (tokenErr: unknown) {
+    const code =
+      tokenErr && typeof tokenErr === "object" && "code" in tokenErr && typeof (tokenErr as any).code === "string"
+        ? String((tokenErr as any).code)
+        : "auth/token-retrieval-failed";
+    await terminateAuthSessionOnDenial(
+      "Connexion refusée : impossible de récupérer ou vérifier le jeton d'authentification Firebase.",
+      "token_error",
+      code
+    );
+  }
+
+  let isSuperAdminUser = false;
+  try {
+    const validated = validateTokenAndClaimsOrThrow(tokenResult!, fbUser);
+    isSuperAdminUser = validated.isSuperAdmin;
+  } catch (claimErr: unknown) {
+    if (claimErr instanceof PdiAuthAccessError) {
+      await terminateAuthSessionOnDenial(claimErr.message, claimErr.reason, claimErr.code);
+    }
+    await terminateAuthSessionOnDenial(
+      "Connexion refusée : les Custom Claims du jeton Firebase sont invalides.",
+      "invalid_claims",
+      "auth/invalid-claims"
+    );
+  }
+
+  // SEC-01-FIX-04-R1 & FIX-11-R2 (A3) : Lecture directe et exclusive de profiles/{uid} dans Firestore,
+  // avec distinction stricte entre absence de document et erreurs techniques Firestore.
+  let userDoc: any;
+  try {
+    userDoc = await getDoc(doc(db, "profiles", uid));
+  } catch (readErr: unknown) {
+    const classified = classifyFirestoreProfileReadError(readErr);
+    if (classified.transient) {
+      // A3 : Une erreur réseau n'autorise jamais l'entrée dans le workspace, mais ne provoque pas
+      // une déconnexion aveugle afin de permettre une nouvelle tentative explicite.
+      purgeLocalAuthCaches({ preservePendingState: false });
+      throw new PdiAuthAccessError({
+        message: classified.message,
+        reason: classified.reason,
+        code: classified.code,
+        transient: true,
+        sessionTerminated: false
+      });
+    }
+    await terminateAuthSessionOnDenial(classified.message, classified.reason, classified.code);
+  }
+
+  if (!userDoc || typeof userDoc.exists !== "function" || !userDoc.exists()) {
+    const missingMsg =
+      providerType === "google"
+        ? `Connexion refusée : aucun profil PD&I autoritatif n'est enregistré dans Firestore pour ${fallbackEmail || "cet utilisateur"}.`
+        : "Connexion refusée : le profil PD&I autoritatif est absent dans Firestore pour ce compte.";
+    await terminateAuthSessionOnDenial(missingMsg, "profile_not_found", "profile/not-found");
+  }
+
+  const rawData = (userDoc.data() || {}) as Record<string, unknown>;
+
+  if (typeof rawData.uid === "string" && rawData.uid.trim().length > 0 && rawData.uid !== uid) {
+    await terminateAuthSessionOnDenial(
+      "Connexion refusée : l'UID du profil Firestore ne correspond pas à l'UID Firebase Authentication.",
+      "invalid_claims",
+      "profile/uid-mismatch"
+    );
+  }
+
+  // Section 7 (Tests Super Admin) : Un profil avec role: 'super_admin' (ou 'admin') mais sans claim Super Admin valide est refusé.
+  const profileClaimsPrivilegedRole =
+    rawData.role === "super_admin" ||
+    rawData.role === "admin" ||
+    rawData.isSuperAdmin === true ||
+    rawData.isAdmin === true;
+
+  if (profileClaimsPrivilegedRole && !isSuperAdminUser) {
+    await terminateAuthSessionOnDenial(
+      "Connexion refusée : le profil Firestore indique un rôle administratif mais aucun Custom Claim Super Admin valide n'est présent sur le jeton Firebase.",
+      "invalid_claims",
+      "auth/missing-super-admin-claim"
+    );
+  }
+
+  const userProfile: PdiUserProfile = {
+    ...(rawData as unknown as PdiUserProfile),
+    uid,
+    role: "client"
+  };
+
+  const rawStatus = String(rawData.status ?? "");
+
+  if (rawStatus === "suspended") {
+    if (providerType === "email") {
+      await logConnectionToFirebase({
+        userId: userProfile.uid,
+        userEmail: userProfile.email,
+        userName: userProfile.name,
+        userRole: userProfile.role,
+        status: "failed",
+        timestamp: new Date().toISOString(),
+        userAgent: clientInfo?.userAgent || (typeof navigator !== "undefined" ? navigator.userAgent : "")
+      });
+    }
+    const suspendedMsg =
+      providerType === "google"
+        ? "Ce compte a été suspendu par l'administrateur."
+        : "Ce compte a été suspendu par le Super Administrateur. Contactez le support.";
+    await terminateAuthSessionOnDenial(suspendedMsg, "suspended", "profile/suspended");
+  }
+
+  if (rawStatus === "revoked") {
+    await terminateAuthSessionOnDenial(
+      "Connexion refusée : ce compte a été révoqué par l'administrateur.",
+      "revoked",
+      "profile/revoked"
+    );
+  }
+
+  if (rawStatus === "disabled" || rawStatus === "banned") {
+    await terminateAuthSessionOnDenial(
+      "Connexion refusée : ce compte a été désactivé.",
+      "disabled",
+      "profile/disabled"
+    );
+  }
+
+  if (rawStatus === "pending_activation") {
+    // BLOC B : Conserver la session Firebase pour le parcours d'activation uniquement,
+    // sans jamais autoriser l'entrée dans le workspace normal ni accorder de rôle actif.
+    saveProfileToLocalCache(userProfile);
+    purgeLocalAuthCaches({ preservePendingState: true });
+    const pendingMsg =
+      providerType === "google"
+        ? "Ce compte est en attente d'activation par clé de licence."
+        : "Votre compte est en attente d'activation. Veuillez saisir votre clé d'activation PD&I.";
+    throw new PdiAuthAccessError({
+      message: pendingMsg,
+      reason: "pending_activation",
+      code: "profile/pending-activation",
+      transient: false,
+      sessionTerminated: false,
+      pendingProfile: userProfile
+    });
+  }
+
+  if (rawStatus !== "active") {
+    await terminateAuthSessionOnDenial(
+      "Connexion refusée : le statut du profil PD&I n'est pas actif.",
+      "inactive_status",
+      "profile/inactive-status"
+    );
+  }
+
+  // SEC-01-FIX-04 : Ne jamais modifier lastLoginAt ni loginCount dans Firestore depuis le client.
+  saveProfileToLocalCache(userProfile);
+
+  await logConnectionToFirebase({
+    userId: userProfile.uid,
+    userEmail: userProfile.email,
+    userName: userProfile.name,
+    userRole: userProfile.role,
+    accountType: userProfile.accountType,
+    status: "success",
+    timestamp: new Date().toISOString(),
+    ...(providerType === "email"
+      ? { userAgent: clientInfo?.userAgent || (typeof navigator !== "undefined" ? navigator.userAgent : "") }
+      : {})
+  });
+
+  return { profile: userProfile, isSuperAdmin: isSuperAdminUser };
+}
+
+export interface WorkspaceSessionResolution {
+  status: "unauthenticated" | "active" | "pending_activation" | "denied" | "error";
+  canAccessWorkspace: boolean;
+  canAccessActivation: boolean;
+  isSuperAdmin: boolean;
+  authMode: "guest" | "pending_email" | "client" | "super_admin";
+  profile: PdiUserProfile | null;
+  reason?: PdiAuthDenialReason;
+  transient?: boolean;
+  errorMessage?: string;
+}
+
+/**
+ * AUTH-ADMIN-05-FIX-11-R2 (BLOC B & BLOC C) :
+ * Résout de manière autoritative l'état de session Firebase + Custom Claims + profil Firestore profiles/{uid}
+ * pour le garde centralisé du workspace (PdiUnifiedApp).
+ */
+export async function resolveAuthoritativeWorkspaceSession(
+  candidateUser?: {
+    uid: string;
+    email?: string | null;
+    emailVerified?: boolean;
+    getIdTokenResult?: (forceRefresh?: boolean) => Promise<{ claims: Record<string, unknown> }>;
+  } | null,
+  options?: { forceRefreshToken?: boolean }
+): Promise<WorkspaceSessionResolution> {
+  const activeUser = candidateUser !== undefined ? candidateUser : (auth.currentUser as any);
+
+  if (!activeUser || typeof activeUser.uid !== "string" || activeUser.uid.trim().length === 0) {
+    purgeLocalAuthCaches({ preservePendingState: false });
+    return {
+      status: "unauthenticated",
+      canAccessWorkspace: false,
+      canAccessActivation: false,
+      isSuperAdmin: false,
+      authMode: "guest",
+      profile: null
+    };
+  }
+
+  if (auth.currentUser && auth.currentUser.uid !== activeUser.uid) {
+    purgeLocalAuthCaches({ preservePendingState: false });
+    return {
+      status: "denied",
+      canAccessWorkspace: false,
+      canAccessActivation: false,
+      isSuperAdmin: false,
+      authMode: "guest",
+      profile: null,
+      reason: "invalid_claims",
+      errorMessage: "Incohérence d'UID entre la session active et l'utilisateur vérifié."
+    };
+  }
+
+  if (typeof activeUser.getIdTokenResult !== "function") {
+    try {
+      await terminateAuthSessionOnDenial(
+        "Connexion refusée : impossible de vérifier le jeton de la session Firebase.",
+        "token_error",
+        "auth/missing-token-method"
+      );
+    } catch (e: any) {
+      return {
+        status: "denied",
+        canAccessWorkspace: false,
+        canAccessActivation: false,
+        isSuperAdmin: false,
+        authMode: "guest",
+        profile: null,
+        reason: "token_error",
+        errorMessage: e?.message
+      };
+    }
+  }
+
+  try {
+    const tokenResult = await activeUser.getIdTokenResult!(options?.forceRefreshToken ?? false);
+    const { isSuperAdmin } = validateTokenAndClaimsOrThrow(tokenResult, activeUser);
+
+    let snap: any;
+    try {
+      snap = await getDoc(doc(db, "profiles", activeUser.uid));
+    } catch (readErr: unknown) {
+      const classified = classifyFirestoreProfileReadError(readErr);
+      if (classified.transient) {
+        purgeLocalAuthCaches({ preservePendingState: false });
+        return {
+          status: "error",
+          canAccessWorkspace: false,
+          canAccessActivation: false,
+          isSuperAdmin: false,
+          authMode: "guest",
+          profile: null,
+          reason: classified.reason,
+          transient: true,
+          errorMessage: classified.message
+        };
+      }
+      try {
+        await terminateAuthSessionOnDenial(classified.message, classified.reason, classified.code);
+      } catch (denialErr: any) {
+        return {
+          status: "denied",
+          canAccessWorkspace: false,
+          canAccessActivation: false,
+          isSuperAdmin: false,
+          authMode: "guest",
+          profile: null,
+          reason: classified.reason,
+          transient: false,
+          errorMessage: denialErr?.message || classified.message
+        };
+      }
+    }
+
+    if (!snap || typeof snap.exists !== "function" || !snap.exists()) {
+      try {
+        await terminateAuthSessionOnDenial(
+          "Connexion refusée : le profil PD&I autoritatif est absent dans Firestore pour ce compte.",
+          "profile_not_found",
+          "profile/not-found"
+        );
+      } catch (denialErr: any) {
+        return {
+          status: "denied",
+          canAccessWorkspace: false,
+          canAccessActivation: false,
+          isSuperAdmin: false,
+          authMode: "guest",
+          profile: null,
+          reason: "profile_not_found",
+          errorMessage: denialErr?.message
+        };
+      }
+    }
+
+    const rawData = (snap.data() || {}) as Record<string, unknown>;
+
+    if (typeof rawData.uid === "string" && rawData.uid.trim().length > 0 && rawData.uid !== activeUser.uid) {
+      try {
+        await terminateAuthSessionOnDenial(
+          "Connexion refusée : incohérence d'UID sur le profil Firestore.",
+          "invalid_claims",
+          "profile/uid-mismatch"
+        );
+      } catch (denialErr: any) {
+        return {
+          status: "denied",
+          canAccessWorkspace: false,
+          canAccessActivation: false,
+          isSuperAdmin: false,
+          authMode: "guest",
+          profile: null,
+          reason: "invalid_claims",
+          errorMessage: denialErr?.message
+        };
+      }
+    }
+
+    const profileClaimsPrivilegedRole =
+      rawData.role === "super_admin" ||
+      rawData.role === "admin" ||
+      rawData.isSuperAdmin === true ||
+      rawData.isAdmin === true;
+
+    if (profileClaimsPrivilegedRole && !isSuperAdmin) {
+      try {
+        await terminateAuthSessionOnDenial(
+          "Connexion refusée : le profil Firestore indique un rôle administratif sans Custom Claim Super Admin vérifié.",
+          "invalid_claims",
+          "auth/missing-super-admin-claim"
+        );
+      } catch (denialErr: any) {
+        return {
+          status: "denied",
+          canAccessWorkspace: false,
+          canAccessActivation: false,
+          isSuperAdmin: false,
+          authMode: "guest",
+          profile: null,
+          reason: "invalid_claims",
+          errorMessage: denialErr?.message
+        };
+      }
+    }
+
+    const normalizedProfile: PdiUserProfile = {
+      ...(rawData as unknown as PdiUserProfile),
+      uid: activeUser.uid,
+      role: "client"
+    };
+
+    const rawStatus = String(rawData.status ?? "");
+
+    if (rawStatus === "pending_activation") {
+      saveProfileToLocalCache(normalizedProfile);
+      purgeLocalAuthCaches({ preservePendingState: true });
+      return {
+        status: "pending_activation",
+        canAccessWorkspace: false,
+        canAccessActivation: true,
+        isSuperAdmin: false,
+        authMode: "pending_email",
+        profile: normalizedProfile,
+        reason: "pending_activation"
+      };
+    }
+
+    if (rawStatus === "suspended" || rawStatus === "revoked" || rawStatus === "disabled" || rawStatus === "banned" || rawStatus !== "active") {
+      const reason: PdiAuthDenialReason =
+        rawStatus === "suspended"
+          ? "suspended"
+          : rawStatus === "revoked"
+          ? "revoked"
+          : rawStatus === "disabled" || rawStatus === "banned"
+          ? "disabled"
+          : "inactive_status";
+      try {
+        await terminateAuthSessionOnDenial(
+          `Connexion refusée : statut de profil non autorisé (${rawStatus || "inconnu"}).`,
+          reason,
+          `profile/${reason}`
+        );
+      } catch (denialErr: any) {
+        return {
+          status: "denied",
+          canAccessWorkspace: false,
+          canAccessActivation: false,
+          isSuperAdmin: false,
+          authMode: "guest",
+          profile: null,
+          reason,
+          errorMessage: denialErr?.message
+        };
+      }
+    }
+
+    saveProfileToLocalCache(normalizedProfile);
+    const resolvedMode = isSuperAdmin ? "super_admin" : "client";
+    try {
+      if (typeof localStorage !== "undefined") {
+        localStorage.setItem("pdi.auth.mode.v1", resolvedMode);
+        localStorage.setItem("pdi.user.profile.v1", JSON.stringify({ ...normalizedProfile, role: resolvedMode }));
+      }
+    } catch {}
+
+    return {
+      status: "active",
+      canAccessWorkspace: true,
+      canAccessActivation: false,
+      isSuperAdmin,
+      authMode: resolvedMode,
+      profile: normalizedProfile
+    };
+  } catch (err: any) {
+    const reason: PdiAuthDenialReason =
+      err instanceof PdiAuthAccessError ? err.reason : "token_error";
+    try {
+      await terminateAuthSessionOnDenial(
+        err?.message || "Connexion refusée : échec de vérification du jeton ou des claims.",
+        reason
+      );
+    } catch (denialErr: any) {
+      return {
+        status: "denied",
+        canAccessWorkspace: false,
+        canAccessActivation: false,
+        isSuperAdmin: false,
+        authMode: "guest",
+        profile: null,
+        reason,
+        errorMessage: denialErr?.message || err?.message
+      };
+    }
+  }
+}
+
 export async function loginWithEmailAndPasswordSecure(
   emailInput: string,
   passwordInput: string,
@@ -824,74 +1539,9 @@ export async function loginWithEmailAndPasswordSecure(
     throw new Error("Veuillez saisir votre adresse email et votre mot de passe.");
   }
 
+  let userCredential: any;
   try {
-    const userCredential = await signInWithEmailAndPassword(auth, email, passwordInput);
-    const fbUser = userCredential.user;
-    const uid = fbUser.uid;
-    const tokenResult = await fbUser.getIdTokenResult(true);
-    const isSuperAdminUser = isSuperAdminClaimAuthorized(tokenResult.claims, fbUser.emailVerified);
-
-    // SEC-01-FIX-04-R1 (Correction D) : Lecture directe et exclusive de profiles/{uid} dans Firestore.
-    // Aucune requête globale sur la collection profiles, aucun repli localStorage,
-    // et aucune fabrication artificielle d'un profil local avec status: "active".
-    let userProfile: PdiUserProfile | null = null;
-    try {
-      const userDoc = await getDoc(doc(db, "profiles", uid));
-      if (userDoc.exists()) {
-        const rawData = userDoc.data();
-        userProfile = {
-          ...(rawData as PdiUserProfile),
-          uid,
-          role: "client"
-        };
-      }
-    } catch (e) {
-      console.warn("Direct profile read by UID failed:", e);
-    }
-
-    if (!userProfile) {
-      throw new Error(
-        "Connexion refusée : le profil PD&I autoritatif est absent dans Firestore pour ce compte."
-      );
-    }
-
-    if (userProfile.status === "suspended") {
-      await logConnectionToFirebase({
-        userId: userProfile.uid,
-        userEmail: userProfile.email,
-        userName: userProfile.name,
-        userRole: userProfile.role,
-        status: "failed",
-        timestamp: new Date().toISOString(),
-        userAgent: clientInfo?.userAgent || navigator.userAgent
-      });
-      throw new Error("Ce compte a été suspendu par le Super Administrateur. Contactez le support.");
-    }
-
-    if (userProfile.status === "pending_activation") {
-      throw new Error("Votre compte est en attente d'activation. Veuillez saisir votre clé d'activation PD&I.");
-    }
-
-    if (userProfile.status !== "active") {
-      throw new Error("Connexion refusée : le statut du profil PD&I n'est pas actif.");
-    }
-
-    // SEC-01-FIX-04 : Ne jamais tenter de modifier lastLoginAt ni loginCount dans Firestore depuis le client.
-    // Seul le cache local de session est mis à jour côté client ; la trace de connexion est enregistrée dans connection_logs.
-    saveProfileToLocalCache(userProfile);
-
-    await logConnectionToFirebase({
-      userId: userProfile.uid,
-      userEmail: userProfile.email,
-      userName: userProfile.name,
-      userRole: userProfile.role,
-      accountType: userProfile.accountType,
-      status: "success",
-      timestamp: new Date().toISOString(),
-      userAgent: clientInfo?.userAgent || navigator.userAgent
-    });
-
-    return { profile: userProfile, isSuperAdmin: isSuperAdminUser };
+    userCredential = await signInWithEmailAndPassword(auth, email, passwordInput);
   } catch (err: any) {
     if (err.code === "auth/user-not-found" || err.code === "auth/invalid-credential" || err.code === "auth/wrong-password") {
       throw new Error("Identifiants incorrects ou compte inexistant dans Firebase Authentication.");
@@ -904,6 +1554,13 @@ export async function loginWithEmailAndPasswordSecure(
     }
     throw err;
   }
+
+  return verifyAuthenticatedUserProfileAndClaims({
+    fbUser: userCredential?.user,
+    providerType: "email",
+    fallbackEmail: email,
+    clientInfo
+  });
 }
 
 export async function registerWithEmailAndPasswordSecure(data: {
@@ -966,9 +1623,10 @@ export async function registerWithEmailAndPasswordSecure(data: {
 
     const canonicalEmail = fbUser.email || email;
 
-    // SEC-01-FIX-04-R1 (Correction A) :
+    // SEC-01-FIX-04-R1 (Correction A) & FIX-11-R2 (BLOC B) :
     // Cohérence stricte entre le profil retourné, le cache local et le document Firestore :
     // accountType est toujours "basic", subscriptionPlan est "monthly" et status est "pending_activation".
+    // La session Firebase est conservée uniquement pour l'écran d'activation, avec isolation stricte hors du workspace.
     const profile: PdiUserProfile = {
       uid,
       email: canonicalEmail,
@@ -987,6 +1645,7 @@ export async function registerWithEmailAndPasswordSecure(data: {
     };
 
     await saveFirebaseProfile(profile);
+    purgeLocalAuthCaches({ preservePendingState: true });
 
     return profile;
   } catch (err: any) {
@@ -1018,72 +1677,61 @@ export async function saveAuthCredentialsSecure(emailInput: string, passwordInpu
 }
 
 export async function loginWithGoogleSecure(): Promise<{ profile: PdiUserProfile; isSuperAdmin: boolean }> {
+  let result: any;
   try {
     const provider = new GoogleAuthProvider();
     provider.setCustomParameters({ prompt: "select_account" });
-    const result = await signInWithPopup(auth, provider);
-    const gUser = result.user;
-    const gEmail = gUser.email?.toLowerCase() || "";
-    const tokenResult = await gUser.getIdTokenResult(true);
-    const isSuper = isSuperAdminClaimAuthorized(tokenResult.claims, gUser.emailVerified);
-
-    // Direct profile retrieval by UID adhering to Firestore security rules
-    let profile: PdiUserProfile | null = null;
-    try {
-      const profileSnap = await getDoc(doc(db, "profiles", gUser.uid));
-      if (profileSnap.exists()) {
-        profile = {
-          ...(profileSnap.data() as PdiUserProfile),
-          uid: gUser.uid,
-          role: "client"
-        };
-      }
-    } catch (e) {
-      console.warn("Direct profile read fallback:", e);
-    }
-
-    if (!profile) {
-      throw new Error(`Connexion refusée : aucun profil PD&I autoritatif n'est enregistré dans Firestore pour ${gEmail}.`);
-    }
-
-    if (profile.status === "suspended") {
-      throw new Error("Ce compte a été suspendu par l'administrateur.");
-    }
-
-    if (profile.status === "pending_activation") {
-      throw new Error("Ce compte est en attente d'activation par clé de licence.");
-    }
-
-    if (profile.status !== "active") {
-      throw new Error("Connexion refusée : le statut du profil PD&I n'est pas actif.");
-    }
-
-    // SEC-01-FIX-04 : Ne pas écrire lastLoginAt ni loginCount dans Firestore depuis le client
-    saveProfileToLocalCache(profile);
-
-    await logConnectionToFirebase({
-      userId: profile.uid,
-      userEmail: profile.email,
-      userName: profile.name,
-      userRole: profile.role,
-      accountType: profile.accountType,
-      status: "success",
-      timestamp: new Date().toISOString()
-    });
-
-    return { profile, isSuperAdmin: isSuper };
+    result = await signInWithPopup(auth, provider);
   } catch (err: any) {
     if (err.code === "auth/popup-closed-by-user") {
       throw new Error("La fenêtre de connexion Google a été fermée.");
     }
     throw err;
   }
+
+  const gUser = result?.user;
+  const gEmail = gUser?.email?.toLowerCase() || "";
+
+  return verifyAuthenticatedUserProfileAndClaims({
+    fbUser: gUser,
+    providerType: "google",
+    fallbackEmail: gEmail
+  });
 }
 
+/**
+ * AUTH-ADMIN-05-FIX-11-R2 (A4) : Déconnexion stricte Firebase Authentication.
+ * - Purge immédiatement les caches locaux d'identité et d'autorisation pour maintenir le workspace bloqué.
+ * - Attend la fin réelle de fbSignOut(auth).
+ * - N'avale jamais silencieusement une erreur de fbSignOut(auth).
+ * - Refuse de confirmer la déconnexion si Firebase conserve une session active (auth.currentUser !== null).
+ */
 export async function logoutFirebase(): Promise<void> {
+  purgeLocalAuthCaches({ preservePendingState: false });
   try {
     await fbSignOut(auth);
-  } catch {}
+  } catch (err: unknown) {
+    purgeLocalAuthCaches({ preservePendingState: false });
+    const detail = err instanceof Error ? err.message : String(err ?? "erreur inconnue");
+    throw new PdiAuthAccessError({
+      message: `Échec de la déconnexion Firebase Authentication : ${detail}`,
+      reason: "signout_failed",
+      code: "auth/signout-failed",
+      transient: false,
+      sessionTerminated: false
+    });
+  }
+
+  if (auth.currentUser !== null) {
+    purgeLocalAuthCaches({ preservePendingState: false });
+    throw new PdiAuthAccessError({
+      message: "Échec de la déconnexion Firebase Authentication : une session active persiste après signOut.",
+      reason: "signout_failed",
+      code: "auth/session-still-active",
+      transient: false,
+      sessionTerminated: false
+    });
+  }
 }
 
 export async function activateAccountWithLicenseKey(email: string, licenseCode: string): Promise<PdiUserProfile> {

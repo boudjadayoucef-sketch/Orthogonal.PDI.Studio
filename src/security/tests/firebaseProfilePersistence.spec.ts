@@ -107,6 +107,11 @@ import {
   loginWithGoogleSecure,
   activateAccountWithLicenseKey,
   validateAndConsumeLicenseKey,
+  logoutFirebase,
+  purgeLocalAuthCaches,
+  classifyFirestoreProfileReadError,
+  resolveAuthoritativeWorkspaceSession,
+  PdiAuthAccessError,
   type PdiUserProfile
 } from "../../lib/firebase";
 
@@ -138,6 +143,7 @@ describe("SEC-01-FIX-04-R1 : Persistance des profils Firestore, cohérence d'ins
   beforeEach(() => {
     vi.clearAllMocks();
     vi.stubGlobal("localStorage", createMemoryStorage());
+    vi.stubGlobal("sessionStorage", createMemoryStorage());
     vi.stubGlobal("navigator", { userAgent: "Vitest-Agent/1.0" });
 
     authState.currentUser = {
@@ -149,6 +155,10 @@ describe("SEC-01-FIX-04-R1 : Persistance des profils Firestore, cohérence d'ins
         claims: { email: "ingenieur@orthogonal.dz", email_verified: true }
       })
     };
+
+    authMocks.signOut.mockImplementation(async () => {
+      authState.currentUser = null;
+    });
   });
 
   // =========================================================================
@@ -546,6 +556,7 @@ describe("SEC-01-FIX-04-R1 : Persistance des profils Firestore, cohérence d'ins
   // 8. Connexion sans profil Firestore : refus fail-closed (aucun statut actif artificiel)
   // =========================================================================
   it("08. Un compte Firebase Auth sans document profiles/{uid} dans Firestore ne peut pas obtenir automatiquement un statut actif", async () => {
+    const initialMockUser = authState.currentUser!;
     // Même si un profil actif résiduel existait dans localStorage, il ne doit pas contourner l'absence de document Firestore
     saveProfileToLocalCache({
       uid: "user_123",
@@ -558,8 +569,9 @@ describe("SEC-01-FIX-04-R1 : Persistance des profils Firestore, cohérence d'ins
       createdAt: "2026-04-12T10:00:00.000Z"
     });
 
-    authMocks.signInWithEmailAndPassword.mockResolvedValueOnce({
-      user: authState.currentUser
+    authMocks.signInWithEmailAndPassword.mockImplementationOnce(async () => {
+      authState.currentUser = initialMockUser;
+      return { user: initialMockUser };
     });
     firestoreMocks.getDoc.mockResolvedValueOnce({
       exists: () => false
@@ -569,12 +581,17 @@ describe("SEC-01-FIX-04-R1 : Persistance des profils Firestore, cohérence d'ins
       loginWithEmailAndPasswordSecure("ingenieur@orthogonal.dz", "Password123!")
     ).rejects.toThrow(/profil PD&I autoritatif est absent dans Firestore/);
 
+    expect(authMocks.signOut).toHaveBeenCalledTimes(1);
+    expect(authState.currentUser).toBeNull();
+    expect(getProfileFromLocalCache("user_123")).toBeNull();
+
     // Aucune requête globale getDocs sur la collection profiles ne doit être exécutée
     expect(firestoreMocks.getDocs).not.toHaveBeenCalled();
 
     // Même garantie fail-closed pour loginWithGoogleSecure
-    authMocks.signInWithPopup.mockResolvedValueOnce({
-      user: authState.currentUser
+    authMocks.signInWithPopup.mockImplementationOnce(async () => {
+      authState.currentUser = initialMockUser;
+      return { user: initialMockUser };
     });
     firestoreMocks.getDoc.mockResolvedValueOnce({
       exists: () => false
@@ -583,6 +600,8 @@ describe("SEC-01-FIX-04-R1 : Persistance des profils Firestore, cohérence d'ins
     await expect(loginWithGoogleSecure()).rejects.toThrow(
       /aucun profil PD&I autoritatif n'est enregistré dans Firestore/
     );
+    expect(authMocks.signOut).toHaveBeenCalledTimes(2);
+    expect(authState.currentUser).toBeNull();
   });
 
   // =========================================================================
@@ -1232,4 +1251,433 @@ describe("SEC-01-FIX-04-R1 : Persistance des profils Firestore, cohérence d'ins
     }
   });
 });
+
+// ===========================================================================
+// AUTH-ADMIN-05-FIX-11-R2 — BLOC A, BLOC B & BLOC E (8.1 / 8.2 / 8.4)
+// Hygiène de session Firebase, classification Firestore, déconnexion vérifiée
+// et isolation stricte de pending_activation
+// ===========================================================================
+describe("AUTH-ADMIN-05-FIX-11-R2 : Session Hygiene, Firestore Error Classification, Verified Logout & Pending Activation Isolation", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubGlobal("localStorage", createMemoryStorage());
+    vi.stubGlobal("sessionStorage", createMemoryStorage());
+    vi.stubGlobal("navigator", { userAgent: "Vitest-Agent/1.0" });
+
+    authState.currentUser = {
+      uid: "user_123",
+      email: "ingenieur@orthogonal.dz",
+      emailVerified: true,
+      displayName: "Ingénieur Test",
+      getIdTokenResult: vi.fn().mockResolvedValue({
+        claims: { email: "ingenieur@orthogonal.dz", email_verified: true, role: "client" }
+      })
+    };
+
+    authMocks.signOut.mockImplementation(async () => {
+      authState.currentUser = null;
+    });
+  });
+
+  it("FIX-11-R2 [8.1.1 & 8.1.2] : Connexion Google et Email/Password avec profil absent -> fbSignOut appelé, auth.currentUser === null et caches purgés", async () => {
+    const mockUser = authState.currentUser!;
+    localStorage.setItem("pdi.auth.mode.v1", "client");
+    localStorage.setItem("pdi.user.profile.v1", JSON.stringify({ uid: "user_123", status: "active" }));
+    localStorage.setItem("pdi_user_profile", JSON.stringify({ uid: "user_123", status: "active" }));
+    sessionStorage.setItem("pdi.stage.v4", "app");
+
+    // 1. Google avec profil absent
+    authMocks.signInWithPopup.mockImplementationOnce(async () => {
+      authState.currentUser = mockUser;
+      return { user: mockUser };
+    });
+    firestoreMocks.getDoc.mockResolvedValueOnce({ exists: () => false });
+
+    await expect(loginWithGoogleSecure()).rejects.toMatchObject({
+      name: "PdiAuthAccessError",
+      reason: "profile_not_found"
+    });
+    expect(authMocks.signOut).toHaveBeenCalledTimes(1);
+    expect(authState.currentUser).toBeNull();
+    expect(localStorage.getItem("pdi.auth.mode.v1")).toBe("guest");
+    expect(localStorage.getItem("pdi.user.profile.v1")).toBeNull();
+    expect(localStorage.getItem("pdi_user_profile")).toBeNull();
+    expect(sessionStorage.getItem("pdi.stage.v4")).toBeNull();
+
+    // 2. Email/Password avec profil absent
+    localStorage.setItem("pdi.auth.mode.v1", "client");
+    authMocks.signInWithEmailAndPassword.mockImplementationOnce(async () => {
+      authState.currentUser = mockUser;
+      return { user: mockUser };
+    });
+    firestoreMocks.getDoc.mockResolvedValueOnce({ exists: () => false });
+
+    await expect(
+      loginWithEmailAndPasswordSecure("ingenieur@orthogonal.dz", "Pass123!")
+    ).rejects.toMatchObject({
+      name: "PdiAuthAccessError",
+      reason: "profile_not_found"
+    });
+    expect(authMocks.signOut).toHaveBeenCalledTimes(2);
+    expect(authState.currentUser).toBeNull();
+    expect(localStorage.getItem("pdi.auth.mode.v1")).toBe("guest");
+  });
+
+  it("FIX-11-R2 [8.1.3] : Connexion Google et Email/Password avec profil active -> session conservée et profil retourné", async () => {
+    const mockUser = authState.currentUser!;
+    const activeDoc: PdiUserProfile = {
+      uid: "user_123",
+      email: "ingenieur@orthogonal.dz",
+      name: "Youcef Ingénieur",
+      role: "client",
+      accountType: "pro",
+      subscriptionPlan: "yearly",
+      status: "active",
+      createdAt: "2026-04-12T10:00:00.000Z"
+    };
+
+    authMocks.signInWithPopup.mockImplementationOnce(async () => {
+      authState.currentUser = mockUser;
+      return { user: mockUser };
+    });
+    firestoreMocks.getDoc.mockResolvedValueOnce({
+      exists: () => true,
+      data: () => ({ ...activeDoc })
+    });
+    firestoreMocks.addDoc.mockResolvedValueOnce({ id: "log_g1" });
+
+    const googleRes = await loginWithGoogleSecure();
+    expect(googleRes.profile.status).toBe("active");
+    expect(googleRes.isSuperAdmin).toBe(false);
+    expect(authMocks.signOut).not.toHaveBeenCalled();
+    expect(authState.currentUser?.uid).toBe("user_123");
+  });
+
+  it("FIX-11-R2 [8.1.4, 8.1.5, 8.1.6] : Profils suspended, revoked et disabled -> refus explicite, fbSignOut appelé, auth.currentUser === null et caches purgés", async () => {
+    const mockUser = authState.currentUser!;
+    const forbiddenStatuses: Array<"suspended" | "revoked" | "disabled"> = [
+      "suspended",
+      "revoked",
+      "disabled"
+    ];
+
+    for (const badStatus of forbiddenStatuses) {
+      vi.clearAllMocks();
+      localStorage.setItem("pdi.auth.mode.v1", "client");
+      localStorage.setItem("pdi_user_profile", JSON.stringify({ uid: "user_123", status: "active" }));
+
+      authMocks.signInWithEmailAndPassword.mockImplementationOnce(async () => {
+        authState.currentUser = mockUser;
+        return { user: mockUser };
+      });
+      firestoreMocks.getDoc.mockResolvedValueOnce({
+        exists: () => true,
+        data: () => ({
+          uid: "user_123",
+          email: "ingenieur@orthogonal.dz",
+          name: "Compte Bloqué",
+          role: "client",
+          accountType: "basic",
+          subscriptionPlan: "monthly",
+          status: badStatus,
+          createdAt: "2026-04-12T10:00:00.000Z"
+        })
+      });
+
+      await expect(
+        loginWithEmailAndPasswordSecure("ingenieur@orthogonal.dz", "Pass123!")
+      ).rejects.toMatchObject({
+        name: "PdiAuthAccessError",
+        reason: badStatus
+      });
+
+      expect(authMocks.signOut).toHaveBeenCalledTimes(1);
+      expect(authState.currentUser).toBeNull();
+      expect(localStorage.getItem("pdi.auth.mode.v1")).toBe("guest");
+      expect(localStorage.getItem("pdi_user_profile")).toBeNull();
+    }
+  });
+
+  it("FIX-11-R2 [8.1.7 & 8.1.8] : Classification stricte des erreurs Firestore (permission_denied vs network_error vs unexpected_error)", async () => {
+    const mockUser = authState.currentUser!;
+
+    // 1. permission-denied -> refus définitif, jamais assimilé à profil absent, fbSignOut exécuté
+    const permError = Object.assign(new Error("Missing or insufficient permissions."), {
+      code: "permission-denied"
+    });
+    expect(classifyFirestoreProfileReadError(permError)).toEqual({
+      reason: "permission_denied",
+      code: "permission-denied",
+      transient: false,
+      message: expect.stringMatching(/accès refusé par Firestore lors de la lecture du profil PD&I/i)
+    });
+
+    authMocks.signInWithPopup.mockImplementationOnce(async () => {
+      authState.currentUser = mockUser;
+      return { user: mockUser };
+    });
+    firestoreMocks.getDoc.mockRejectedValueOnce(permError);
+
+    let caughtPerm: unknown = null;
+    try {
+      await loginWithGoogleSecure();
+    } catch (e) {
+      caughtPerm = e;
+    }
+    expect(caughtPerm).toBeInstanceOf(PdiAuthAccessError);
+    expect((caughtPerm as PdiAuthAccessError).reason).toBe("permission_denied");
+    expect((caughtPerm as PdiAuthAccessError).message).not.toMatch(/aucun profil PD&I autoritatif/i);
+    expect(authMocks.signOut).toHaveBeenCalledTimes(1);
+    expect(authState.currentUser).toBeNull();
+
+    // 2. network_error (unavailable) -> refus d'accès au workspace, message de réessai explicite, PAS de signOut aveugle
+    vi.clearAllMocks();
+    const netError = Object.assign(new Error("Failed to get document because the client is offline."), {
+      code: "unavailable"
+    });
+    expect(classifyFirestoreProfileReadError(netError)).toEqual({
+      reason: "network_error",
+      code: "unavailable",
+      transient: true,
+      message: expect.stringMatching(/erreur réseau ou service Firestore temporairement indisponible/i)
+    });
+
+    authMocks.signInWithPopup.mockImplementationOnce(async () => {
+      authState.currentUser = mockUser;
+      return { user: mockUser };
+    });
+    firestoreMocks.getDoc.mockRejectedValueOnce(netError);
+
+    let caughtNet: unknown = null;
+    try {
+      await loginWithGoogleSecure();
+    } catch (e) {
+      caughtNet = e;
+    }
+    expect(caughtNet).toBeInstanceOf(PdiAuthAccessError);
+    expect((caughtNet as PdiAuthAccessError).reason).toBe("network_error");
+    expect((caughtNet as PdiAuthAccessError).transient).toBe(true);
+    expect((caughtNet as PdiAuthAccessError).message).toMatch(/Veuillez réessayer/i);
+    expect(authMocks.signOut).not.toHaveBeenCalled();
+    expect(localStorage.getItem("pdi.auth.mode.v1")).toBe("guest");
+
+    // Et resolveAuthoritativeWorkspaceSession refuse l'accès au workspace en cas d'erreur réseau sans signOut aveugle
+    firestoreMocks.getDoc.mockRejectedValueOnce(netError);
+    const sessionRes = await resolveAuthoritativeWorkspaceSession(mockUser);
+    expect(sessionRes.status).toBe("error");
+    expect(sessionRes.reason).toBe("network_error");
+    expect(sessionRes.canAccessWorkspace).toBe(false);
+    expect(authMocks.signOut).not.toHaveBeenCalled();
+  });
+
+  it("FIX-11-R2 [8.1.9 & 8.1.10 & 8.4] : Erreur de récupération du token et claims Super Admin invalides -> refus, fbSignOut et auth.currentUser === null", async () => {
+    // 1. Erreur de récupération du token (getIdTokenResult rejette)
+    const tokenFailUser = {
+      uid: "user_token_fail",
+      email: "ingenieur@orthogonal.dz",
+      emailVerified: true,
+      getIdTokenResult: vi.fn().mockRejectedValue(new Error("Token refresh failed"))
+    };
+    authMocks.signInWithEmailAndPassword.mockImplementationOnce(async () => {
+      authState.currentUser = tokenFailUser;
+      return { user: tokenFailUser };
+    });
+
+    await expect(
+      loginWithEmailAndPasswordSecure("ingenieur@orthogonal.dz", "Pass123!")
+    ).rejects.toMatchObject({
+      name: "PdiAuthAccessError",
+      reason: "token_error"
+    });
+    expect(authMocks.signOut).toHaveBeenCalledTimes(1);
+    expect(authState.currentUser).toBeNull();
+
+    // 2. Claim role="super_admin" mais email_verified=false -> refus invalid_claims + signOut
+    vi.clearAllMocks();
+    const unverifiedSuperUser = {
+      uid: "uid_super",
+      email: "boudjada.youcef@gmail.com",
+      emailVerified: false,
+      getIdTokenResult: vi.fn().mockResolvedValue({
+        claims: { role: "super_admin", email_verified: false, email: "boudjada.youcef@gmail.com" }
+      })
+    };
+    authMocks.signInWithPopup.mockImplementationOnce(async () => {
+      authState.currentUser = unverifiedSuperUser;
+      return { user: unverifiedSuperUser };
+    });
+
+    await expect(loginWithGoogleSecure()).rejects.toMatchObject({
+      name: "PdiAuthAccessError",
+      reason: "invalid_claims"
+    });
+    expect(authMocks.signOut).toHaveBeenCalledTimes(1);
+    expect(authState.currentUser).toBeNull();
+
+    // 3. Profil Firestore role="super_admin" mais sans Custom Claim Super Admin valide -> refus invalid_claims + signOut
+    vi.clearAllMocks();
+    const clientClaimUser = {
+      uid: "uid_fake_super",
+      email: "boudjada.youcef@gmail.com",
+      emailVerified: true,
+      getIdTokenResult: vi.fn().mockResolvedValue({
+        claims: { role: "client", email_verified: true, email: "boudjada.youcef@gmail.com" }
+      })
+    };
+    authMocks.signInWithPopup.mockImplementationOnce(async () => {
+      authState.currentUser = clientClaimUser;
+      return { user: clientClaimUser };
+    });
+    firestoreMocks.getDoc.mockResolvedValueOnce({
+      exists: () => true,
+      data: () => ({
+        uid: "uid_fake_super",
+        email: "boudjada.youcef@gmail.com",
+        name: "Youcef",
+        role: "super_admin",
+        accountType: "enterprise",
+        subscriptionPlan: "lifetime",
+        status: "active",
+        createdAt: "2026-04-12T10:00:00.000Z"
+      })
+    });
+
+    await expect(loginWithGoogleSecure()).rejects.toMatchObject({
+      name: "PdiAuthAccessError",
+      reason: "invalid_claims"
+    });
+    expect(authMocks.signOut).toHaveBeenCalledTimes(1);
+    expect(authState.currentUser).toBeNull();
+  });
+
+  it("FIX-11-R2 [8.1.11, 8.1.12, 8.1.13] : logoutFirebase() vérifie auth.currentUser === null, purge les caches et lève une erreur explicite si fbSignOut échoue", async () => {
+    localStorage.setItem("pdi.auth.mode.v1", "super_admin");
+    localStorage.setItem("pdi.user.profile.v1", JSON.stringify({ uid: "user_123" }));
+    localStorage.setItem("pdi_user_profile", JSON.stringify({ uid: "user_123" }));
+    sessionStorage.setItem("pdi.stage.v4", "app");
+
+    // 1. Succès de logoutFirebase()
+    await expect(logoutFirebase()).resolves.toBeUndefined();
+    expect(authMocks.signOut).toHaveBeenCalledTimes(1);
+    expect(authState.currentUser).toBeNull();
+    expect(localStorage.getItem("pdi.auth.mode.v1")).toBe("guest");
+    expect(localStorage.getItem("pdi.user.profile.v1")).toBeNull();
+    expect(localStorage.getItem("pdi_user_profile")).toBeNull();
+    expect(sessionStorage.getItem("pdi.stage.v4")).toBeNull();
+
+    // 2. Échec de fbSignOut (promesse rejetée) -> purge quand même les caches locaux et propage une erreur explicite
+    localStorage.setItem("pdi.auth.mode.v1", "client");
+    sessionStorage.setItem("pdi.stage.v4", "app");
+    authMocks.signOut.mockRejectedValueOnce(new Error("SignOut internal failure"));
+
+    await expect(logoutFirebase()).rejects.toThrow(/Échec de la déconnexion Firebase Authentication/);
+    expect(localStorage.getItem("pdi.auth.mode.v1")).toBe("guest");
+    expect(sessionStorage.getItem("pdi.stage.v4")).toBeNull();
+
+    // 3. fbSignOut résout mais auth.currentUser reste non nul -> lève une erreur explicite
+    authState.currentUser = {
+      uid: "stuck_user",
+      email: "stuck@orthogonal.dz",
+      emailVerified: true,
+      getIdTokenResult: vi.fn()
+    };
+    authMocks.signOut.mockImplementationOnce(async () => {
+      // Ne nettoie pas currentUser
+    });
+
+    await expect(logoutFirebase()).rejects.toThrow(/une session active persiste après signOut/);
+    expect(localStorage.getItem("pdi.auth.mode.v1")).toBe("guest");
+  });
+
+  it("FIX-11-R2 [8.2] : Isolation stricte de pending_activation (inscription, connexion, conservation de session pour activation uniquement, puis passage à active)", async () => {
+    // 1. Inscription crée un profil pending_activation et conserve la session uniquement pour l'écran d'activation
+    firestoreMocks.getDoc
+      .mockResolvedValueOnce({ exists: () => false }) // restrictions pays
+      .mockResolvedValueOnce({ exists: () => false }); // saveFirebaseProfile
+    firestoreMocks.setDoc.mockResolvedValueOnce(undefined);
+
+    const pendingUser = {
+      uid: "user_pending_1",
+      email: "pending@orthogonal.dz",
+      emailVerified: false,
+      getIdTokenResult: vi.fn().mockResolvedValue({
+        claims: { email: "pending@orthogonal.dz", role: "client" }
+      })
+    };
+
+    authMocks.createUserWithEmailAndPassword.mockImplementationOnce(async () => {
+      authState.currentUser = pendingUser;
+      return { user: pendingUser };
+    });
+
+    const regProfile = await registerWithEmailAndPasswordSecure({
+      email: "pending@orthogonal.dz",
+      password: "Password123!",
+      name: "Utilisateur En Attente",
+      company: "Bureau Piping",
+      country: "Algérie",
+      countryCode: "DZ",
+      city: "Alger",
+      requestedPlan: "pro"
+    });
+
+    expect(regProfile.status).toBe("pending_activation");
+    expect(authMocks.signOut).not.toHaveBeenCalled();
+    expect(authState.currentUser?.uid).toBe("user_pending_1");
+    expect(localStorage.getItem("pdi.auth.mode.v1")).toBe("pending_email");
+    expect(sessionStorage.getItem("pdi.stage.v4")).toBeNull();
+
+    // 2. Tentative de connexion avec un profil pending_activation -> lève PdiAuthAccessError(reason="pending_activation") SANS déconnecter l'utilisateur pour lui permettre d'activer sa licence
+    authMocks.signInWithEmailAndPassword.mockImplementationOnce(async () => {
+      authState.currentUser = pendingUser;
+      return { user: pendingUser };
+    });
+    firestoreMocks.getDoc.mockResolvedValueOnce({
+      exists: () => true,
+      data: () => ({ ...regProfile })
+    });
+
+    let pendingLoginErr: unknown = null;
+    try {
+      await loginWithEmailAndPasswordSecure("pending@orthogonal.dz", "Password123!");
+    } catch (err) {
+      pendingLoginErr = err;
+    }
+    expect(pendingLoginErr).toBeInstanceOf(PdiAuthAccessError);
+    expect((pendingLoginErr as PdiAuthAccessError).reason).toBe("pending_activation");
+    expect((pendingLoginErr as PdiAuthAccessError).pendingProfile?.uid).toBe("user_pending_1");
+    expect(authMocks.signOut).not.toHaveBeenCalled();
+    expect(authState.currentUser?.uid).toBe("user_pending_1");
+    expect(localStorage.getItem("pdi.auth.mode.v1")).toBe("pending_email");
+
+    // 3. Résolution de session autoritaire pour pending_activation -> canAccessActivation=true, canAccessWorkspace=false, isSuperAdmin=false
+    firestoreMocks.getDoc.mockResolvedValueOnce({
+      exists: () => true,
+      data: () => ({ ...regProfile })
+    });
+    const pendingResolution = await resolveAuthoritativeWorkspaceSession(pendingUser);
+    expect(pendingResolution).toEqual({
+      status: "pending_activation",
+      reason: "pending_activation",
+      profile: expect.objectContaining({ uid: "user_pending_1", status: "pending_activation" }),
+      isSuperAdmin: false,
+      authMode: "pending_email",
+      canAccessWorkspace: false,
+      canAccessActivation: true
+    });
+
+    // 4. Après validation serveur du profil (passage à status="active"), une nouvelle résolution autorise le workspace
+    firestoreMocks.getDoc.mockResolvedValueOnce({
+      exists: () => true,
+      data: () => ({ ...regProfile, status: "active", accountType: "pro" })
+    });
+    const activeResolution = await resolveAuthoritativeWorkspaceSession(pendingUser);
+    expect(activeResolution.status).toBe("active");
+    expect(activeResolution.canAccessWorkspace).toBe(true);
+    expect(activeResolution.canAccessActivation).toBe(false);
+    expect(activeResolution.authMode).toBe("client");
+    expect(activeResolution.profile?.status).toBe("active");
+  });
+});
+
 

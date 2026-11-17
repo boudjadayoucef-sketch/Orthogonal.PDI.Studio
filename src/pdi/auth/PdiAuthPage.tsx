@@ -1,17 +1,30 @@
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
 import PdiBrandMark from "../app/PdiBrandMark";
 import { PdiLoginLoadingOverlay } from "./PdiLoginLoadingOverlay";
 import {
+  auth,
   loginWithEmailAndPasswordSecure,
   registerWithEmailAndPasswordSecure,
   loginWithGoogleSecure,
   activateAccountWithLicenseKey,
   sendResetPasswordEmail,
   getCountryRestrictionsFromFirebase,
+  PdiAuthAccessError,
   PdiUserProfile
 } from "../../lib/firebase";
 import { PdiCountryConfig, PDI_DEFAULT_COUNTRIES } from "../data/pdiGeoData";
 import PdiInfoModals, { ModalType } from "../modals/PdiInfoModals";
+
+export function isCoherentAuthorizedLoginResult(
+  res: { profile: PdiUserProfile; isSuperAdmin: boolean } | null | undefined,
+  currentAuthUser: { uid: string; emailVerified?: boolean; email?: string | null } | null | undefined
+): boolean {
+  if (!res || !res.profile || !res.profile.uid) return false;
+  if (res.profile.status !== "active") return false;
+  if (!currentAuthUser || currentAuthUser.uid !== res.profile.uid) return false;
+  if (res.isSuperAdmin === true && currentAuthUser.emailVerified !== true) return false;
+  return true;
+}
 
 export const PDI_OFFERS = [
   {
@@ -115,6 +128,28 @@ export default function PdiAuthPage({
   initialTab = "login"
 }: PdiAuthPageProps) {
   const [tab, setTab] = useState<"login" | "register" | "activation">(initialTab);
+  const isSubmittingRef = useRef(false);
+  const isMountedRef = useRef(true);
+  const transitionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clearTransitionTimer = () => {
+    if (transitionTimerRef.current !== null) {
+      clearTimeout(transitionTimerRef.current);
+      transitionTimerRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      clearTransitionTimer();
+    };
+  }, []);
+
+  useEffect(() => {
+    setTab(initialTab);
+  }, [initialTab]);
   
   // Countries list loaded from Firebase / local default
   const [allCountries, setAllCountries] = useState<PdiCountryConfig[]>(PDI_DEFAULT_COUNTRIES);
@@ -175,7 +210,7 @@ export default function PdiAuthPage({
 
   useEffect(() => {
     void getCountryRestrictionsFromFirebase().then(res => {
-      if (res && res.length > 0) {
+      if (isMountedRef.current && res && res.length > 0) {
         setAllCountries(res);
       }
     });
@@ -195,43 +230,90 @@ export default function PdiAuthPage({
 
   const handleLoginSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmittingRef.current) return;
+    isSubmittingRef.current = true;
+    clearTransitionTimer();
     setErrorMsg(null);
     setSuccessMsg(null);
     setLoading(true);
 
     try {
       const res = await loginWithEmailAndPasswordSecure(loginEmail, loginPassword);
+      if (!isMountedRef.current) return;
+      if (!isCoherentAuthorizedLoginResult(res, auth.currentUser)) {
+        throw new Error(
+          "Incohérence de session détectée : le profil actif ou l'utilisateur authentifié n'est pas valide."
+        );
+      }
       setSuccessMsg(`Connexion réussie ! Bienvenue ${res.profile.name}.`);
-      setTimeout(() => {
+      transitionTimerRef.current = setTimeout(() => {
+        transitionTimerRef.current = null;
+        if (!isMountedRef.current) return;
+        if (!isCoherentAuthorizedLoginResult(res, auth.currentUser)) {
+          setErrorMsg("Session interrompue ou non autorisée avant l'ouverture de l'espace de travail.");
+          return;
+        }
         onSuccess(res.profile, res.isSuperAdmin);
-        setLoading(false);
       }, 1500);
     } catch (err: any) {
+      if (!isMountedRef.current) return;
+      if (err instanceof PdiAuthAccessError && err.reason === "pending_activation") {
+        setActEmail(err.pendingProfile?.email || loginEmail || auth.currentUser?.email || "");
+        setTab("activation");
+      }
       setErrorMsg(err.message || "Erreur de connexion. Vérifiez vos identifiants.");
-      setLoading(false);
+    } finally {
+      isSubmittingRef.current = false;
+      if (isMountedRef.current) {
+        setLoading(false);
+      }
     }
   };
 
   const handleGoogleLogin = async () => {
+    if (isSubmittingRef.current) return;
+    isSubmittingRef.current = true;
+    clearTransitionTimer();
     setErrorMsg(null);
     setSuccessMsg(null);
     setLoading(true);
 
     try {
       const res = await loginWithGoogleSecure();
+      if (!isMountedRef.current) return;
+      if (!isCoherentAuthorizedLoginResult(res, auth.currentUser)) {
+        throw new Error(
+          "Incohérence de session détectée : le profil actif ou l'utilisateur Google authentifié n'est pas valide."
+        );
+      }
       setSuccessMsg(`Authentifié avec succès via Google (${res.profile.email}) !`);
-      setTimeout(() => {
+      transitionTimerRef.current = setTimeout(() => {
+        transitionTimerRef.current = null;
+        if (!isMountedRef.current) return;
+        if (!isCoherentAuthorizedLoginResult(res, auth.currentUser)) {
+          setErrorMsg("Session interrompue ou non autorisée avant l'ouverture de l'espace de travail.");
+          return;
+        }
         onSuccess(res.profile, res.isSuperAdmin);
-        setLoading(false);
       }, 1500);
     } catch (err: any) {
+      if (!isMountedRef.current) return;
+      if (err instanceof PdiAuthAccessError && err.reason === "pending_activation") {
+        setActEmail(err.pendingProfile?.email || auth.currentUser?.email || "");
+        setTab("activation");
+      }
       setErrorMsg(err.message || "Impossible de se connecter avec Google.");
-      setLoading(false);
+    } finally {
+      isSubmittingRef.current = false;
+      if (isMountedRef.current) {
+        setLoading(false);
+      }
     }
   };
 
   const handleRegisterSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmittingRef.current) return;
     setErrorMsg(null);
     setSuccessMsg(null);
 
@@ -300,6 +382,8 @@ export default function PdiAuthPage({
 
     const finalCity = (regCity === "Autre ville..." || !regCity) ? (customCity.trim() || "Non spécifiée") : regCity;
 
+    isSubmittingRef.current = true;
+    clearTransitionTimer();
     setLoading(true);
 
     try {
@@ -315,44 +399,76 @@ export default function PdiAuthPage({
         activationKey: regActivationKey
       });
 
-      if (profile.status === "active") {
+      if (!isMountedRef.current) return;
+
+      if (profile.status === "active" && isCoherentAuthorizedLoginResult({ profile, isSuperAdmin: false }, auth.currentUser)) {
         setSuccessMsg(`Compte créé et activé avec succès ! Bienvenue ${profile.name}. Formule : ${regPlan.toUpperCase()}.`);
-        setTimeout(() => {
+        transitionTimerRef.current = setTimeout(() => {
+          transitionTimerRef.current = null;
+          if (!isMountedRef.current) return;
+          if (!isCoherentAuthorizedLoginResult({ profile, isSuperAdmin: false }, auth.currentUser)) {
+            setErrorMsg("Session interrompue avant l'ouverture de l'espace de travail.");
+            return;
+          }
           onSuccess(profile, false);
         }, 600);
       } else {
         setSuccessMsg(`Compte enregistré pour ${profile.name} (${selectedCountry.name}) ! Empreinte bancaire pré-autorisée avec succès. En attente de validation finale.`);
-        setActEmail(regEmail);
+        setActEmail(profile.email || regEmail);
         setTab("activation");
       }
     } catch (err: any) {
+      if (!isMountedRef.current) return;
       setErrorMsg(err.message || "Erreur lors de la création du compte.");
     } finally {
-      setLoading(false);
+      isSubmittingRef.current = false;
+      if (isMountedRef.current) {
+        setLoading(false);
+      }
     }
   };
 
   const handleActivationSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmittingRef.current) return;
+    isSubmittingRef.current = true;
+    clearTransitionTimer();
     setErrorMsg(null);
     setSuccessMsg(null);
     setLoading(true);
 
     try {
       const profile = await activateAccountWithLicenseKey(actEmail, actKey);
+      if (!isMountedRef.current) return;
+      if (!isCoherentAuthorizedLoginResult({ profile, isSuperAdmin: false }, auth.currentUser)) {
+        throw new Error(
+          "Activation non confirmée : le profil n'est pas en statut actif ou la session ne correspond pas."
+        );
+      }
       setSuccessMsg(`Félicitations ! Votre compte a été activé avec la formule ${profile.accountType.toUpperCase()}.`);
-      setTimeout(() => {
+      transitionTimerRef.current = setTimeout(() => {
+        transitionTimerRef.current = null;
+        if (!isMountedRef.current) return;
+        if (!isCoherentAuthorizedLoginResult({ profile, isSuperAdmin: false }, auth.currentUser)) {
+          setErrorMsg("Session interrompue avant l'ouverture de l'espace de travail.");
+          return;
+        }
         onSuccess(profile, false);
       }, 700);
     } catch (err: any) {
+      if (!isMountedRef.current) return;
       setErrorMsg(err.message || "Erreur d'activation de la licence.");
     } finally {
-      setLoading(false);
+      isSubmittingRef.current = false;
+      if (isMountedRef.current) {
+        setLoading(false);
+      }
     }
   };
 
   const handleResetPasswordSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmittingRef.current) return;
     setErrorMsg(null);
     setSuccessMsg(null);
 
@@ -361,15 +477,21 @@ export default function PdiAuthPage({
       return;
     }
 
+    isSubmittingRef.current = true;
     setLoading(true);
     try {
       await sendResetPasswordEmail(resetEmail);
+      if (!isMountedRef.current) return;
       setSuccessMsg(`Un email de réinitialisation sécurisé a été envoyé à ${resetEmail}. Vérifiez votre boîte de réception.`);
       setShowResetForm(false);
     } catch (err: any) {
+      if (!isMountedRef.current) return;
       setErrorMsg(err.message || "Erreur lors de l'envoi de l'email de réinitialisation.");
     } finally {
-      setLoading(false);
+      isSubmittingRef.current = false;
+      if (isMountedRef.current) {
+        setLoading(false);
+      }
     }
   };
 

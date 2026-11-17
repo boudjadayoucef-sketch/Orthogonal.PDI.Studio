@@ -68,6 +68,7 @@ const SketchToIsoModule = React.lazy(() =>
 import HomePdi from "../home/HomePdi";
 import PdiIllustratorHome from "../home/PdiIllustratorHome";
 import PdiAuthPage from "../auth/PdiAuthPage";
+import { PdiLoginLoadingOverlay } from "../auth/PdiLoginLoadingOverlay";
 import { GoogleDriveWorkspace } from "../../components/GoogleDriveWorkspace";
 import isoPiping3D from "../../assets/images/pdi_iso_piping_3d_1787006532562.jpg";
 import valve3D from "../../assets/images/pdi_valve_3d_1787006543831.jpg";
@@ -83,11 +84,20 @@ import { PdiSuperAdminConsole } from "../superadmin/PdiSuperAdminConsole";
 import { PdiFeedbackModal } from "../feedback/PdiFeedbackModal";
 import { PdiNewProjectModal } from "../modals/PdiNewProjectModal";
 import { onIdTokenChanged } from "firebase/auth";
-import { recordSubscriberUsage, changeUserProfilePassword, auth } from "../../lib/firebase";
+import {
+  recordSubscriberUsage,
+  changeUserProfilePassword,
+  auth,
+  logoutFirebase,
+  resolveAuthoritativeWorkspaceSession,
+  purgeLocalAuthCaches,
+  type WorkspaceSessionResolution,
+  type PdiUserProfile
+} from "../../lib/firebase";
 import { attachSuperAdminTokenMonitor, isRestrictedAdminView, getAuthorizedView } from "../../security/clientAuthorization";
 import { projectsApi } from "../../lib/pdiApiClient";
 
-type PdiModule = "home" | "isometric" | "drive" | "vision" | "sketch" | "cad" | "json" | "pdf" | "projects" | "assistant" | "profile" | "subscription" | "super_admin_console" | "license_keys";
+export type PdiModule = "home" | "isometric" | "drive" | "vision" | "sketch" | "cad" | "json" | "pdf" | "projects" | "assistant" | "profile" | "subscription" | "super_admin_console" | "license_keys";
 type PdiWorkspaceTab = { id: string; title: string; module: PdiModule; projectId: string; dirty?: boolean; createdAt: string };
 
 // PATCH 004c : cle de session de l'etape publique.
@@ -225,6 +235,207 @@ const pdiSafeModule = (value: unknown, fallback: PdiModule): PdiModule => {
   return PDI_RENDERABLE_MODULES.includes(value as PdiModule) ? (value as PdiModule) : fallback;
 };
 
+export type WorkspaceAccessDecision = {
+  allowed: boolean;
+  targetStage: "landing" | "auth" | "app";
+  authPageTab: "login" | "register" | "activation";
+  resolvedAuthMode: "guest" | "pending_email" | "client" | "super_admin";
+  authorizedModule: PdiModule;
+  reason?: string;
+};
+
+/**
+ * BLOC C1 & BLOC B — Garde central unique d'accès au workspace PD&I.
+ * Vérifie simultanément les 5 invariants :
+ * 1. session Firebase valide (currentAuthUser.uid présent et cohérent)
+ * 2. token et claims vérifiés (session.status === "active", session.canAccessWorkspace === true)
+ * 3. profil profiles/{uid} existant
+ * 4. profile.status === "active"
+ * 5. module autorisé selon clientAuthorization.ts
+ * Isole strictement les comptes en "pending_activation" vers l'écran d'activation uniquement.
+ */
+export function evaluateWorkspaceAccessGuard(
+  session: WorkspaceSessionResolution | null | undefined,
+  requestedModule: string = "home",
+  currentAuthUser?: { uid: string; emailVerified?: boolean; email?: string | null } | null
+): WorkspaceAccessDecision {
+  if (!currentAuthUser || !currentAuthUser.uid) {
+    return {
+      allowed: false,
+      targetStage: "auth",
+      authPageTab: "login",
+      resolvedAuthMode: "guest",
+      authorizedModule: "home",
+      reason: "unauthenticated",
+    };
+  }
+
+  if (
+    session &&
+    session.status === "pending_activation" &&
+    session.canAccessActivation === true &&
+    session.profile &&
+    session.profile.uid === currentAuthUser.uid &&
+    session.profile.status === "pending_activation"
+  ) {
+    return {
+      allowed: false,
+      targetStage: "auth",
+      authPageTab: "activation",
+      resolvedAuthMode: "pending_email",
+      authorizedModule: "home",
+      reason: "pending_activation",
+    };
+  }
+
+  if (
+    !session ||
+    session.status !== "active" ||
+    session.canAccessWorkspace !== true ||
+    !session.profile ||
+    session.profile.uid !== currentAuthUser.uid ||
+    session.profile.status !== "active"
+  ) {
+    return {
+      allowed: false,
+      targetStage: "auth",
+      authPageTab: "login",
+      resolvedAuthMode: "guest",
+      authorizedModule: "home",
+      reason: session?.reason || "unauthorized_session",
+    };
+  }
+
+  // Un profil revendiquant super_admin sans claim Super Admin vérifié (et emailVerified) est refusé
+  if (
+    session.profile.role === "super_admin" &&
+    (session.isSuperAdmin !== true || currentAuthUser.emailVerified !== true)
+  ) {
+    return {
+      allowed: false,
+      targetStage: "auth",
+      authPageTab: "login",
+      resolvedAuthMode: "guest",
+      authorizedModule: "home",
+      reason: "invalid_claims",
+    };
+  }
+
+  const verifiedSuperAdmin =
+    session.isSuperAdmin === true &&
+    session.authMode === "super_admin" &&
+    currentAuthUser.emailVerified === true;
+
+  const candidateModule = pdiSafeModule(requestedModule, "home");
+  const authorizedModule = getAuthorizedView(
+    candidateModule,
+    verifiedSuperAdmin,
+    "isometric"
+  ) as PdiModule;
+
+  return {
+    allowed: true,
+    targetStage: "app",
+    authPageTab: "login",
+    resolvedAuthMode: verifiedSuperAdmin ? "super_admin" : "client",
+    authorizedModule,
+  };
+}
+
+/**
+ * BLOC C1 / C2 — Résolveur déterministe des transitions de navigation (#app, ?app, hashchange, pdi:navigate, reload).
+ */
+export function resolveStageTransition(params: {
+  intent: "initial_load" | "hashchange" | "pdi_navigate" | "enter_app" | "open_module" | "logout";
+  requestedStage?: "landing" | "auth" | "app";
+  requestedModule?: string;
+  authReady: boolean;
+  session: WorkspaceSessionResolution | null | undefined;
+  currentAuthUser?: { uid: string; emailVerified?: boolean; email?: string | null } | null;
+}): {
+  stage: "landing" | "auth" | "app";
+  loadingWorkspace: boolean;
+  authPageTab: "login" | "register" | "activation";
+  authMode: "guest" | "pending_email" | "client" | "super_admin";
+  activeModule: PdiModule;
+} {
+  const { intent, requestedStage = "landing", requestedModule = "home", authReady, session, currentAuthUser } = params;
+
+  if (intent === "logout") {
+    return {
+      stage: "auth",
+      loadingWorkspace: false,
+      authPageTab: "login",
+      authMode: "guest",
+      activeModule: "home",
+    };
+  }
+
+  const wantsApp =
+    requestedStage === "app" ||
+    intent === "enter_app" ||
+    intent === "open_module";
+
+  if (wantsApp) {
+    if (!authReady) {
+      return {
+        stage: "app",
+        loadingWorkspace: true,
+        authPageTab: "login",
+        authMode: "guest",
+        activeModule: "home",
+      };
+    }
+
+    const guard = evaluateWorkspaceAccessGuard(session, requestedModule, currentAuthUser);
+    return {
+      stage: guard.targetStage,
+      loadingWorkspace: false,
+      authPageTab: guard.authPageTab,
+      authMode: guard.resolvedAuthMode,
+      activeModule: guard.authorizedModule,
+    };
+  }
+
+  const isPending =
+    Boolean(currentAuthUser?.uid) &&
+    session?.status === "pending_activation" &&
+    session?.profile?.uid === currentAuthUser?.uid;
+
+  const isActive =
+    Boolean(currentAuthUser?.uid) &&
+    session?.status === "active" &&
+    session?.canAccessWorkspace === true &&
+    session?.profile?.uid === currentAuthUser?.uid &&
+    session?.profile?.status === "active";
+
+  const activeMode: "guest" | "pending_email" | "client" | "super_admin" = isActive
+    ? session?.isSuperAdmin && currentAuthUser?.emailVerified
+      ? "super_admin"
+      : "client"
+    : isPending
+    ? "pending_email"
+    : "guest";
+
+  if (requestedStage === "auth") {
+    return {
+      stage: "auth",
+      loadingWorkspace: false,
+      authPageTab: isPending ? "activation" : "login",
+      authMode: activeMode,
+      activeModule: "home",
+    };
+  }
+
+  return {
+    stage: "landing",
+    loadingWorkspace: false,
+    authPageTab: isPending ? "activation" : "login",
+    authMode: activeMode,
+    activeModule: "home",
+  };
+}
+
 type LaunchCard = {
   id: PdiModule;
   title: string;
@@ -327,15 +538,19 @@ function ComingSoonPanel({ title, children }: { title: string; children: React.R
 export default function PdiUnifiedApp() {
   const [feedbackModalOpen, setFeedbackModalOpen] = useState(false);
 
+  // BLOC C2 : État de résolution initiale de l'authentification et du profil Firestore
+  const [authReady, setAuthReady] = useState<boolean>(false);
+  const authReadyRef = React.useRef<boolean>(false);
+  const [verifiedSession, setVerifiedSession] = useState<WorkspaceSessionResolution | null>(null);
+  const verifiedSessionRef = React.useRef<WorkspaceSessionResolution | null>(null);
+
+  // BLOC C1 : Ne jamais accorder un mode actif ("client", "demo", "admin", "super_admin") depuis localStorage
+  // avant que Firebase Auth et le profil Firestore n'aient été vérifiés.
   const [authMode, setAuthMode] = useState<"guest" | "demo" | "pending_email" | "client" | "admin" | "super_admin">(() => {
     try {
       const saved = window.localStorage.getItem(PDI_AUTH_KEY);
-      // Règle SEC-01-FIX-03 : Ne JAMAIS restaurer de rôle administratif depuis localStorage
-      if (saved === "super_admin" || saved === "admin") {
-        return "client";
-      }
-      if (saved === "client" || saved === "demo" || saved === "pending_email") {
-        return saved;
+      if (saved === "pending_email") {
+        return "pending_email";
       }
       return "guest";
     } catch {
@@ -350,31 +565,20 @@ export default function PdiUnifiedApp() {
       if (isRestrictedAdminView(saved)) {
         return "isometric";
       }
-      const authVal = window.localStorage.getItem(PDI_AUTH_KEY) || "demo";
-      const isConnected = authVal !== "guest" && authVal !== "pending_email";
-      if (isConnected) {
-        // PATCH 017B : on ne restaure qu'un module reellement affichable.
-        return (saved && saved !== "home") ? pdiSafeModule(saved, "isometric") : "isometric";
-      }
       return pdiSafeModule(saved, "home");
     } catch {
-      return "isometric";
+      return "home";
     }
   });
+  const activeModuleRef = React.useRef<PdiModule>(activeModule);
+  useEffect(() => {
+    activeModuleRef.current = activeModule;
+  }, [activeModule]);
+
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [authPanelMode, setAuthPanelMode] = useState<"login" | "register" | "activation">("login");
   const [authDraft, setAuthDraft] = useState({ name: "", email: "", company: "", password: "", plan: "demo" });
   const [activationToken, setActivationToken] = useState<string | null>(() => { try { return window.localStorage.getItem("pdi.activation.pendingToken.v1"); } catch { return null; } });
-  const startDemoSession = () => { setAuthMode("demo"); try { window.localStorage.setItem(PDI_AUTH_KEY,"demo"); window.sessionStorage.setItem(PDI_STAGE_KEY,"app"); window.localStorage.setItem("pdi.force.app.v1","1"); window.localStorage.setItem("pdi.activeModule.v1","isometric"); } catch {} setStage("app"); setActiveModule("isometric"); };
-  const submitRegisterSimulated = () => {
-    if (!authDraft.email || !authDraft.name || authDraft.password.length < 6) { setAuthPanelMode("register"); return; }
-    const token = `pdi-act-${Date.now().toString(36)}`;
-    setActivationToken(token);
-    setAuthMode("pending_email");
-    try { window.localStorage.setItem("pdi.activation.pendingToken.v1", token); window.localStorage.setItem("pdi.auth.pendingUser.v1", JSON.stringify({ ...authDraft, password: undefined, status:"pending_email" })); } catch {}
-    setAuthPanelMode("activation");
-  };
-  const activateSimulatedAccount = () => { setAuthMode("client"); try { window.localStorage.removeItem("pdi.activation.pendingToken.v1"); window.localStorage.setItem(PDI_AUTH_KEY,"client"); window.sessionStorage.setItem(PDI_STAGE_KEY,"app"); window.localStorage.setItem("pdi.force.app.v1","1"); window.localStorage.setItem("pdi.activeModule.v1","isometric"); } catch {} setStage("app"); setActiveModule("isometric"); };
 
   const [savedUserProfile, setSavedUserProfile] = useState(() => {
     try {
@@ -526,19 +730,109 @@ export default function PdiUnifiedApp() {
     if (!next) setActiveModule("projects");
     else if (renamingTabId && !tabs.some((t) => t.id === renamingTabId)) setRenamingTabId(null);
   };
+
+  // Rechargement : conserve dans le module ISO ou Accueil dans l'application uniquement si session résolue
+  const [stage, setStage] = useState<"landing" | "auth" | "app">((): "landing" | "auth" | "app" => {
+    try {
+      const hash = window.location.hash.toLowerCase();
+      const search = window.location.search.toLowerCase();
+      if (hash.includes("landing") || search.includes("landing") || search.includes("commercial")) {
+        return "landing";
+      }
+      if (hash.includes("auth") || hash.includes("login") || search.includes("auth") || search.includes("login")) {
+        return "auth";
+      }
+      if (hash.includes("app") || search.includes("app") || window.sessionStorage.getItem(PDI_STAGE_KEY) === "app") {
+        return "app";
+      }
+    } catch {}
+    return "landing";
+  });
+  const stageRef = React.useRef<"landing" | "auth" | "app">(stage);
+  useEffect(() => {
+    stageRef.current = stage;
+  }, [stage]);
+
+  const [authPageTab, setAuthPageTab] = useState<"login" | "register" | "activation">("login");
+
+  // BLOC C1 : Fonction centrale unique d'entrée et de navigation dans le workspace
+  const tryEnterWorkspace = React.useCallback(
+    (targetModule?: string, explicitSession?: WorkspaceSessionResolution | null): boolean => {
+      const currentSession = explicitSession !== undefined ? explicitSession : verifiedSessionRef.current;
+
+      // Tant que l'état initial n'est pas résolu, on place stage="app" (qui affiche l'overlay de chargement)
+      if (!authReadyRef.current && explicitSession === undefined) {
+        setStage("app");
+        if (targetModule) {
+          setActiveModule(pdiSafeModule(targetModule, "home"));
+        }
+        return false;
+      }
+
+      const decision = evaluateWorkspaceAccessGuard(
+        currentSession,
+        targetModule || activeModuleRef.current || "home",
+        auth.currentUser
+      );
+
+      if (!decision.allowed) {
+        setAuthMode(decision.resolvedAuthMode);
+        setAuthPageTab(decision.authPageTab);
+        setStage(decision.targetStage);
+        setActiveModule("home");
+        try {
+          window.sessionStorage.removeItem(PDI_STAGE_KEY);
+          window.localStorage.removeItem("pdi.force.app.v1");
+          window.location.hash = decision.targetStage;
+        } catch {}
+        return false;
+      }
+
+      setAuthMode(decision.resolvedAuthMode);
+      setStage("app");
+      setActiveModule(decision.authorizedModule);
+      try {
+        window.sessionStorage.setItem(PDI_STAGE_KEY, "app");
+        window.localStorage.setItem("pdi.force.app.v1", "1");
+        window.localStorage.setItem(PDI_AUTH_KEY, decision.resolvedAuthMode);
+        window.localStorage.setItem("pdi.activeModule.v1", decision.authorizedModule);
+        window.location.hash = "app";
+      } catch {}
+      return true;
+    },
+    []
+  );
+
+  // BLOC C1 : Aucune ouverture de session simulée sans authentification Firebase et profil actif
+  const startDemoSession = () => {
+    tryEnterWorkspace("isometric");
+  };
+  const submitRegisterSimulated = () => {
+    if (!authDraft.email || !authDraft.name || authDraft.password.length < 6) { setAuthPanelMode("register"); return; }
+    const token = `pdi-act-${Date.now().toString(36)}`;
+    setActivationToken(token);
+    setAuthMode("pending_email");
+    try { window.localStorage.setItem("pdi.activation.pendingToken.v1", token); window.localStorage.setItem("pdi.auth.pendingUser.v1", JSON.stringify({ ...authDraft, password: undefined, status:"pending_email" })); } catch {}
+    setAuthPanelMode("activation");
+  };
+  const activateSimulatedAccount = () => {
+    tryEnterWorkspace("isometric");
+  };
+
   const openProjectInTab = (entry: { projectId: string; title: string; module: PdiModule }) => {
     const existing = workspaceTabs.find((t) => t.projectId === entry.projectId);
     if (existing) { switchTab(existing.id); return; }
     openModuleInTab(entry.module || "isometric", entry.title, entry.projectId);
   };
   const persistTabs = (tabs: PdiWorkspaceTab[], id: string | null) => { try { window.localStorage.setItem(PDI_TABS_KEY, JSON.stringify(tabs)); if(id) window.localStorage.setItem(PDI_ACTIVE_TAB_KEY,id); } catch {} };
-  const canOpenWorkspaceModule = authMode === "demo" || authMode === "client" || authMode === "admin" || authMode === "super_admin";
+
   const openModuleInTab = (module: PdiModule, title?: string, projectId?: string) => {
-    if (!canOpenWorkspaceModule && module !== "home") {
-      setAuthMode("demo");
-      try { window.localStorage.setItem(PDI_AUTH_KEY, "demo"); } catch {}
+    if (!tryEnterWorkspace(module)) {
+      return;
     }
-    const safeModule = getAuthorizedView(module, authMode === "super_admin", "isometric") as PdiModule;
+    const decision = evaluateWorkspaceAccessGuard(verifiedSessionRef.current, module, auth.currentUser);
+    if (!decision.allowed) return;
+    const safeModule = decision.authorizedModule;
     if (safeModule === "home") { setActiveModule("home"); return; }
     const id = `tab-${Date.now().toString(36)}`;
     // PATCH 017F1 : un onglet = un projet identifie, reutilisable et renommable.
@@ -549,7 +843,15 @@ export default function PdiUnifiedApp() {
     pdiUpsertProject({ projectId: resolvedProjectId, title: resolvedTitle, module: safeModule });
     setProjectsRefresh((v) => v + 1);
   };
-  const switchTab = (id: string) => { const tab = workspaceTabs.find(t=>t.id===id); if(!tab) return; const safeModule = getAuthorizedView(tab.module, authMode === "super_admin", "isometric") as PdiModule; setActiveTabId(id); setActiveModule(safeModule); persistTabs(workspaceTabs,id); };
+  const switchTab = (id: string) => {
+    const tab = workspaceTabs.find(t=>t.id===id);
+    if(!tab) return;
+    if (!tryEnterWorkspace(tab.module)) return;
+    const safeModule = getAuthorizedView(tab.module, authMode === "super_admin", "isometric") as PdiModule;
+    setActiveTabId(id);
+    setActiveModule(safeModule);
+    persistTabs(workspaceTabs,id);
+  };
   const closeTab = (id: string) => { const tabs = workspaceTabs.filter(t=>t.id!==id); const next = tabs[tabs.length-1] || null; const safeModule = getAuthorizedView(next?.module || "home", authMode === "super_admin", "isometric") as PdiModule; setWorkspaceTabs(tabs); setActiveTabId(next?.id || null); setActiveModule(safeModule); persistTabs(tabs,next?.id || null); };
 
   // ÉTAPE 5 : Modal Nouveau Projet & Raccordement ISO
@@ -580,25 +882,6 @@ export default function PdiUnifiedApp() {
     }
   };
 
-  // Rechargement : conserve dans le module ISO ou Accueil dans l'application
-  const [stage, setStage] = useState<"landing" | "auth" | "app">((): "landing" | "auth" | "app" => {
-    try {
-      const hash = window.location.hash.toLowerCase();
-      const search = window.location.search.toLowerCase();
-      if (hash.includes("landing") || search.includes("landing") || search.includes("commercial")) {
-        return "landing";
-      }
-      if (hash.includes("auth") || hash.includes("login") || search.includes("auth") || search.includes("login")) {
-        return "auth";
-      }
-      if (hash.includes("app") || search.includes("app")) {
-        return "app";
-      }
-    } catch {}
-    return "landing";
-  });
-  const [authPageTab, setAuthPageTab] = useState<"login" | "register" | "activation">("login");
-
   // Synchronisation dynamique du stage avec les changements d'ancres URL (#landing, #auth, #app)
   useEffect(() => {
     const handleHashChange = () => {
@@ -607,125 +890,174 @@ export default function PdiUnifiedApp() {
         if (hash === "#landing" || hash === "#commercial") {
           setStage("landing");
         } else if (hash === "#auth" || hash === "#login" || hash === "#connexion") {
+          const isPending =
+            verifiedSessionRef.current?.status === "pending_activation" &&
+            verifiedSessionRef.current?.profile?.uid === auth.currentUser?.uid;
+          setAuthPageTab(isPending ? "activation" : "login");
           setStage("auth");
         } else if (hash === "#app") {
-          setStage("app");
+          tryEnterWorkspace(activeModuleRef.current);
         }
       } catch {}
     };
     window.addEventListener("hashchange", handleHashChange);
     return () => window.removeEventListener("hashchange", handleHashChange);
-  }, []);
+  }, [tryEnterWorkspace]);
 
   const enterApp = React.useCallback((target?: string) => {
-    try {
-      const auth = window.localStorage.getItem(PDI_AUTH_KEY);
-      if (!auth || auth === "guest" || auth === "pending_email") {
-        setAuthPageTab("login");
-        setStage("auth");
-        try { window.location.hash = "auth"; } catch {}
-        return;
-      }
-      window.sessionStorage.setItem(PDI_STAGE_KEY, "app");
-      window.localStorage.setItem("pdi.force.app.v1", "1");
-    } catch {
-      /* stockage indisponible */
+    if (tryEnterWorkspace(target)) {
+      window.scrollTo(0, 0);
     }
-    setStage("app");
-    try { window.location.hash = "app"; } catch {}
+  }, [tryEnterWorkspace]);
 
-    const allowed: PdiModule[] = [
-      "home",
-      "isometric",
-      "drive",
-      "vision",
-      "sketch",
-      "cad",
-      "json",
-      "pdf",
-      "projects",
-      "assistant",
-      "profile",
-      "subscription",
-      "super_admin_console",
-      "license_keys"
-    ];
-
-    let dest = (target && allowed.includes(target as PdiModule) ? (target as PdiModule) : "home");
-    // Règle SEC-01-FIX-03 : Interdire l'accès aux vues administratives sans autorité Super Admin vérifiée
-    if (isRestrictedAdminView(dest) && authMode !== "super_admin") {
-      dest = "isometric";
-    }
-    setActiveModule(dest);
-    try { window.localStorage.setItem("pdi.activeModule.v1", dest); } catch {}
-    window.scrollTo(0, 0);
-  }, [authMode]);
-
-  const handleLogoutToHome = React.useCallback(() => {
-    try {
-      window.sessionStorage.removeItem(PDI_STAGE_KEY);
-      window.localStorage.removeItem("pdi.force.app.v1");
-      window.localStorage.setItem(PDI_AUTH_KEY, "guest");
-      window.localStorage.setItem("pdi.activeModule.v1", "home");
-    } catch {}
+  // BLOC A4 : Déconnexion vérifiée ne masquant jamais les erreurs de signOut tout en bloquant immédiatement le workspace
+  const handleLogoutToHome = React.useCallback(async () => {
+    verifiedSessionRef.current = null;
+    setVerifiedSession(null);
+    purgeLocalAuthCaches();
     setAuthMode("guest");
     setAuthPageTab("login");
     setStage("auth");
     try { window.location.hash = "auth"; } catch {}
     setActiveModule("home");
     setAccountMenuOpen(false);
+
+    try {
+      await logoutFirebase();
+    } catch (err: any) {
+      console.error("Erreur lors de la déconnexion Firebase :", err);
+      void pdiAlert(
+        err?.message ||
+          "La déconnexion Firebase a rencontré une erreur. L'accès à l'espace de travail a été verrouillé localement."
+      );
+    }
   }, []);
 
   useEffect(() => {
     const onNavigate = (event: Event) => {
       const detail = (event as CustomEvent<PdiModule | "landing" | "launcher" | "logout" | "landing_home" | string>).detail;
-      // PATCH 005 : navigation ciblee stabilisee.
-      const allowed: PdiModule[] = [
-        "home",
-        "isometric",
-        "drive",
-        "vision",
-        "sketch",
-        "cad",
-        "json",
-        "pdf",
-        "projects",
-        "assistant",
-        "profile",
-        "subscription",
-      ];
       if (detail === "landing" || detail === "portal" || detail === "commercial" || detail === "landing_home") {
         setStage("landing");
         try { window.location.hash = "landing"; } catch {}
         return;
       }
       if (detail === "auth" || detail === "login") {
+        const isPending =
+          verifiedSessionRef.current?.status === "pending_activation" &&
+          verifiedSessionRef.current?.profile?.uid === auth.currentUser?.uid;
+        setAuthPageTab(isPending ? "activation" : "login");
         setStage("auth");
         try { window.location.hash = "auth"; } catch {}
         return;
       }
       if (detail === "logout") {
-        handleLogoutToHome();
+        void handleLogoutToHome();
         return;
       }
-      setStage("app");
-      try {
-        window.sessionStorage.setItem(PDI_STAGE_KEY, "app");
-        window.location.hash = "app";
-      } catch {}
-      setActiveModule(allowed.includes(detail as PdiModule) ? (detail as PdiModule) : "home");
+      tryEnterWorkspace(typeof detail === "string" ? detail : "home");
     };
     window.addEventListener("pdi:navigate", onNavigate as EventListener);
     return () => window.removeEventListener("pdi:navigate", onNavigate as EventListener);
-  }, [handleLogoutToHome]);
+  }, [handleLogoutToHome, tryEnterWorkspace]);
 
-  // Règle SEC-01-FIX-03-R2 (B1 / B2 / B3) : Surveillance dynamique et réactive des droits Super Admin via onIdTokenChanged
-  // avec fail-closed immédiat au changement de compte, protection anti-course asynchrone et cohérence stricte de l'UID.
+  // BLOC C1 / C2 & SEC-01-FIX-03-R2 : Surveillance réactive combinant attachSuperAdminTokenMonitor et resolveAuthoritativeWorkspaceSession
   useEffect(() => {
+    let resolutionSeq = 0;
+
     return attachSuperAdminTokenMonitor({
       auth,
-      subscribeIdTokenChanged: (cb) => onIdTokenChanged(auth, cb),
-      setAuthMode: (updater) => setAuthMode((prev) => updater(prev) as typeof authMode),
+      subscribeIdTokenChanged: (monitorCallback) =>
+        onIdTokenChanged(auth, (fbUser) => {
+          const seq = ++resolutionSeq;
+
+          if (!fbUser) {
+            verifiedSessionRef.current = null;
+            setVerifiedSession(null);
+            authReadyRef.current = true;
+            setAuthReady(true);
+            monitorCallback(null);
+            if (stageRef.current === "app") {
+              setAuthPageTab("login");
+              setStage("auth");
+              setActiveModule("home");
+              try {
+                window.sessionStorage.removeItem(PDI_STAGE_KEY);
+                window.location.hash = "auth";
+              } catch {}
+            }
+            return;
+          }
+
+          // Si changement de compte ou chargement initial, verrouiller authReady jusqu'à vérification complète du profil
+          if (verifiedSessionRef.current?.profile?.uid !== fbUser.uid) {
+            verifiedSessionRef.current = null;
+            setVerifiedSession(null);
+            authReadyRef.current = false;
+            setAuthReady(false);
+          }
+
+          monitorCallback(fbUser);
+
+          void resolveAuthoritativeWorkspaceSession(fbUser, { forceRefreshToken: false }).then((res) => {
+            if (seq !== resolutionSeq) return;
+            if (auth.currentUser && auth.currentUser.uid !== fbUser.uid) return;
+
+            verifiedSessionRef.current = res;
+            setVerifiedSession(res);
+            authReadyRef.current = true;
+            setAuthReady(true);
+
+            if (res.status === "active" && res.canAccessWorkspace && res.profile) {
+              setAuthMode(res.authMode);
+              setSavedUserProfile({ ...res.profile, role: res.authMode });
+              try {
+                window.localStorage.setItem(PDI_AUTH_KEY, res.authMode);
+                window.localStorage.setItem("pdi.user.profile.v1", JSON.stringify({ ...res.profile, role: res.authMode }));
+              } catch {}
+              setActiveModule((prev) => getAuthorizedView(prev, res.isSuperAdmin, "isometric") as PdiModule);
+            } else if (res.status === "pending_activation") {
+              setAuthMode("pending_email");
+              setAuthPageTab("activation");
+              if (stageRef.current === "app") {
+                setStage("auth");
+                setActiveModule("home");
+                try {
+                  window.sessionStorage.removeItem(PDI_STAGE_KEY);
+                  window.location.hash = "auth";
+                } catch {}
+              }
+            } else {
+              setAuthMode("guest");
+              setAuthPageTab("login");
+              if (stageRef.current === "app") {
+                setStage("auth");
+                setActiveModule("home");
+                try {
+                  window.sessionStorage.removeItem(PDI_STAGE_KEY);
+                  window.location.hash = "auth";
+                } catch {}
+              }
+            }
+          });
+        }),
+      setAuthMode: (updater) =>
+        setAuthMode((prev) => {
+          const next = updater(prev);
+          const session = verifiedSessionRef.current;
+          const isActiveSession =
+            session?.status === "active" &&
+            session?.canAccessWorkspace === true &&
+            session?.profile?.uid === auth.currentUser?.uid &&
+            session?.profile?.status === "active";
+
+          if (next === "super_admin") {
+            return isActiveSession && session?.isSuperAdmin ? "super_admin" : isActiveSession ? "client" : "guest";
+          }
+          if (next === "client") {
+            return isActiveSession ? "client" : session?.status === "pending_activation" ? "pending_email" : "guest";
+          }
+          return next as typeof authMode;
+        }),
       onAdminRevoked: () => {
         setActiveModule((prev) => {
           if (isRestrictedAdminView(prev)) {
@@ -775,7 +1107,7 @@ export default function PdiUnifiedApp() {
       const timeSinceLastActivity = Date.now() - lastActivityTime;
       if (timeSinceLastActivity >= INACTIVITY_LIMIT_MS) {
         console.warn("Session inactivity timeout reached.");
-        handleLogoutToHome();
+        void handleLogoutToHome();
         void pdiAlert("Votre session a expiré en raison de votre inactivité (30 minutes). Veuillez vous reconnecter pour sécuriser vos données.");
       }
     }, 15000); // Check every 15 seconds
@@ -796,7 +1128,7 @@ export default function PdiUnifiedApp() {
           detail: { activeModule },
         })
       );
-      if (activeModule && authMode !== "guest") {
+      if (activeModule && (authMode === "client" || authMode === "super_admin")) {
         void recordSubscriberUsage({
           userId: pdiUserProfile.email,
           userEmail: pdiUserProfile.email,
@@ -819,32 +1151,62 @@ export default function PdiUnifiedApp() {
   };
   const moduleTitle = useMemo(() => navItems.find((x) => x.id === activeModule)?.title || "PD&I", [activeModule]);
 
+  const handleAuthSuccess = React.useCallback((profile: PdiUserProfile, isSuper: boolean) => {
+    if (!profile || profile.status !== "active" || !auth.currentUser || auth.currentUser.uid !== profile.uid) {
+      setAuthMode("guest");
+      setAuthPageTab("login");
+      setStage("auth");
+      return;
+    }
+
+    // Règle SEC-01-FIX-03 : L'autorité Super Admin vient UNIQUEMENT du claim vérifié (isSuper) + emailVerified
+    const verifiedSuper = isSuper === true && auth.currentUser.emailVerified === true;
+    const role: "super_admin" | "client" = verifiedSuper ? "super_admin" : "client";
+    const resolvedSession: WorkspaceSessionResolution = {
+      status: "active",
+      profile,
+      isSuperAdmin: verifiedSuper,
+      authMode: role,
+      canAccessWorkspace: true,
+      canAccessActivation: false,
+    };
+
+    verifiedSessionRef.current = resolvedSession;
+    setVerifiedSession(resolvedSession);
+    authReadyRef.current = true;
+    setAuthReady(true);
+    setSavedUserProfile({ ...profile, role });
+    try {
+      window.localStorage.setItem("pdi.user.profile.v1", JSON.stringify({ ...profile, role }));
+    } catch {}
+
+    // Asynchronously sync user to PostgreSQL Cloud SQL in the background
+    void projectsApi.syncUser(profile.name, (profile as any).photoUrl || (profile as any).photoURL).catch((err) => {
+      console.warn("Background user sync to Cloud SQL non-blocking error:", err);
+    });
+
+    tryEnterWorkspace(verifiedSuper ? "super_admin_console" : "home", resolvedSession);
+  }, [tryEnterWorkspace]);
+
   // STAGE 1 : PAGE COMMERCIALE (HOME PDI / LANDING)
   if (stage === "landing") {
     return (
       <HomePdi
         onEnterModule={(mod) => {
-          setStage("app");
-          setAuthMode("demo");
-          try { window.location.hash = "app"; } catch {}
-          if (mod && mod !== "home") {
-            openModuleInTab(mod as PdiModule);
+          const target = (mod && mod !== "home") ? (mod as PdiModule) : "home";
+          if (target !== "home") {
+            openModuleInTab(target);
           } else {
-            setActiveModule("home");
+            tryEnterWorkspace("home");
           }
         }}
         onNewProject={() => {
-          setStage("app");
-          setAuthMode("demo");
-          setActiveModule("home");
-          setNewProjectModalOpen(true);
-          try { window.location.hash = "app"; } catch {}
+          if (tryEnterWorkspace("home")) {
+            setNewProjectModalOpen(true);
+          }
         }}
         onOpenProject={() => {
-          setStage("app");
-          setAuthMode("demo");
           openModuleInTab("projects", "Mes Projets");
-          try { window.location.hash = "app"; } catch {}
         }}
         onLoginRequest={(req) => {
           if (req === "register") {
@@ -856,7 +1218,7 @@ export default function PdiUnifiedApp() {
           try { window.location.hash = "auth"; } catch {}
         }}
         userEmail={pdiUserProfile.email}
-        isLoggedIn={authMode !== "guest"}
+        isLoggedIn={authMode === "client" || authMode === "super_admin"}
       />
     );
   }
@@ -870,27 +1232,27 @@ export default function PdiUnifiedApp() {
           setStage("landing");
           try { window.location.hash = "landing"; } catch {}
         }}
-        onSuccess={(profile, isSuper) => {
-          // Règle SEC-01-FIX-03 : L'autorité Super Admin vient UNIQUEMENT du claim vérifié (isSuper)
-          const role = isSuper ? "super_admin" : "client";
-          setAuthMode(role);
-          setSavedUserProfile({ ...profile, role });
-          try {
-            window.localStorage.setItem(PDI_AUTH_KEY, role);
-            window.localStorage.setItem("pdi.user.profile.v1", JSON.stringify({ ...profile, role }));
-            window.sessionStorage.setItem(PDI_STAGE_KEY, "app");
-            window.localStorage.setItem("pdi.force.app.v1", "1");
-            window.location.hash = "app";
-          } catch {}
+        onSuccess={handleAuthSuccess}
+      />
+    );
+  }
 
-          // Asynchronously sync user to PostgreSQL Cloud SQL in the background
-          void projectsApi.syncUser(profile.name, (profile as any).photoUrl || (profile as any).photoURL).catch((err) => {
-            console.warn("Background user sync to Cloud SQL non-blocking error:", err);
-          });
+  // BLOC C2 : Tant que Firebase Auth et le profil Firestore ne sont pas résolus, afficher l'écran de chargement
+  if (!authReady) {
+    return <PdiLoginLoadingOverlay message="Vérification de la session et du profil PD&I..." />;
+  }
 
-          setStage("app");
-          setActiveModule(isSuper ? "super_admin_console" : "home");
+  // BLOC C1 : Garde de rendu final (aucun rendu du workspace sans les 5 invariants validés)
+  const renderGuard = evaluateWorkspaceAccessGuard(verifiedSession, activeModule, auth.currentUser);
+  if (!renderGuard.allowed) {
+    return (
+      <PdiAuthPage
+        initialTab={renderGuard.authPageTab}
+        onBackToLanding={() => {
+          setStage("landing");
+          try { window.location.hash = "landing"; } catch {}
         }}
+        onSuccess={handleAuthSuccess}
       />
     );
   }
