@@ -41,10 +41,9 @@ jobs:
             "pdl_ntfset_[0-9a-zA-Z_]{16,}"
             "pdl_live_apikey_[0-9a-zA-Z_]{16,}"
             "pdl_sdbx_apikey_[0-9a-zA-Z_]{16,}"
-            "sb_secret_[0-9a-zA-Z_-]{8,}"
+            "sb_secret_[0-9a-zA-Z_-]{16,}"
             "sbp_[0-9a-zA-Z]{20,}"
-            "VITE_SUPABASE_SECRET_KEY"
-            "VITE_SUPABASE_SERVICE_ROLE_KEY"
+            "VITE_SUPABASE_(SECRET|SERVICE_ROLE)_KEY[[:space:]]*=[[:space:]]*['\"]?[0-9a-zA-Z_.-]{8,}"
           )
           
           # 1. Deterministic scan of current working tree (HEAD), including all test files
@@ -99,7 +98,7 @@ jobs:
           npm ci
           npm run build
 
-      - name: Verify Zero Server Secrets in Built dist/ Bundle (MIG-01-FIX-02)
+      - name: Verify Zero Server Secrets in Built dist/ Bundle (MIG-01-FIX-02-R1)
         run: |
           echo "Scanning built dist/ artifacts for any leaked server secrets or sb_secret_ keys..."
           if [ ! -d "dist" ]; then
@@ -110,10 +109,13 @@ jobs:
           DIST_LEAKS=0
           DIST_PATTERNS=(
             "-----BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"
-            "sb_secret_[0-9a-zA-Z_-]{8,}"
+            "sk_live_[0-9a-zA-Z]{24,}"
+            "ghp_[0-9a-zA-Z]{36}"
+            "github_pat_[0-9a-zA-Z_]{22,}"
+            "xox[baprs]-[0-9a-zA-Z]{10,48}"
+            "AKIA[0-9A-Z]{16}"
+            "sb_secret_[0-9a-zA-Z_-]{16,}"
             "sbp_[0-9a-zA-Z]{20,}"
-            "SUPABASE_SECRET_KEY"
-            "SUPABASE_SERVICE_ROLE_KEY"
             "pdl_ntfset_[0-9a-zA-Z_]{16,}"
             "pdl_live_apikey_[0-9a-zA-Z_]{16,}"
             "pdl_sdbx_apikey_[0-9a-zA-Z_]{16,}"

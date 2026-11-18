@@ -835,6 +835,25 @@ export interface ConfigValidationResult {
   errorMessage?: string;
 }
 
+export const SUPABASE_SECRET_CREDENTIAL_PATTERN = /sb_secret_[0-9a-zA-Z_-]{16,}/;
+export const SUPABASE_PAT_CREDENTIAL_PATTERN = /sbp_[0-9a-zA-Z]{20,}/;
+
+/**
+ * Detects whether a raw text or environment value contains an exposed Supabase secret credential
+ * (`sb_secret_...` key or `sbp_...` personal access token) without treating bare variable names as credentials.
+ */
+export function containsExposedSupabaseSecretCredential(value: unknown): boolean {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return false;
+  }
+  const trimmed = value.trim();
+  return (
+    /^sb_secret_/i.test(trimmed) ||
+    SUPABASE_SECRET_CREDENTIAL_PATTERN.test(trimmed) ||
+    SUPABASE_PAT_CREDENTIAL_PATTERN.test(trimmed)
+  );
+}
+
 /**
  * Validates server configuration upon startup.
  * Enforces:
@@ -878,12 +897,11 @@ export function verifyProductionConfig(
     }
   }
 
-  // MIG-01-FIX-02: Also block any VITE_ variable whose value contains a Supabase secret key (sb_secret_)
+  // MIG-01-FIX-02-R1: Also block any VITE_ variable whose value contains a Supabase secret credential (sb_secret_ or sbp_)
   for (const [envKey, envVal] of Object.entries(env)) {
     if (
       envKey.startsWith("VITE_") &&
-      typeof envVal === "string" &&
-      /^sb_secret_/i.test(envVal.trim()) &&
+      containsExposedSupabaseSecretCredential(envVal) &&
       !forbiddenViteSecretKeys.includes(envKey)
     ) {
       forbiddenViteSecretKeys.push(envKey);
