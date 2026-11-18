@@ -41,11 +41,15 @@ jobs:
             "pdl_ntfset_[0-9a-zA-Z_]{16,}"
             "pdl_live_apikey_[0-9a-zA-Z_]{16,}"
             "pdl_sdbx_apikey_[0-9a-zA-Z_]{16,}"
+            "sb_secret_[0-9a-zA-Z_-]{8,}"
+            "sbp_[0-9a-zA-Z]{20,}"
+            "VITE_SUPABASE_SECRET_KEY"
+            "VITE_SUPABASE_SERVICE_ROLE_KEY"
           )
           
           # 1. Deterministic scan of current working tree (HEAD), including all test files
           for PATTERN in "${PATTERNS[@]}"; do
-            MATCHES=$(git grep -E -I -n -e "$PATTERN" -- ':!*.example' ':!dist/**' || true)
+            MATCHES=$(git grep -E -I -n -e "$PATTERN" -- ':!*.example' ':!dist/**' ':!.github/workflows/security.yml' || true)
             if [ -n "$MATCHES" ]; then
               echo "::error::Potential secret leak detected in working tree matching pattern: $PATTERN"
               echo "$MATCHES"
@@ -65,7 +69,7 @@ jobs:
           
           if [ -n "$DIFF_RANGE" ]; then
             echo "Scanning commit diff range: $DIFF_RANGE"
-            ADDED_LINES=$(git diff "$DIFF_RANGE" -- ':!*.example' ':!dist/**' | grep -E -- '^\+[^+]' || true)
+            ADDED_LINES=$(git diff "$DIFF_RANGE" -- ':!*.example' ':!dist/**' ':!.github/workflows/security.yml' | grep -E -- '^\+[^+]' || true)
             if [ -n "$ADDED_LINES" ]; then
               for PATTERN in "${PATTERNS[@]}"; do
                 DIFF_MATCHES=$(printf "%s\n" "$ADDED_LINES" | grep -E -- "$PATTERN" || true)
@@ -83,3 +87,49 @@ jobs:
           fi
           
           echo "Security scan PASSED: No exposed private secrets detected."
+
+      - name: Setup Node.js for Build Output Secret Verification
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install Dependencies & Build Frontend Bundle
+        run: |
+          npm ci
+          npm run build
+
+      - name: Verify Zero Server Secrets in Built dist/ Bundle (MIG-01-FIX-02)
+        run: |
+          echo "Scanning built dist/ artifacts for any leaked server secrets or sb_secret_ keys..."
+          if [ ! -d "dist" ]; then
+            echo "::error::dist/ directory missing after npm run build"
+            exit 1
+          fi
+
+          DIST_LEAKS=0
+          DIST_PATTERNS=(
+            "-----BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"
+            "sb_secret_[0-9a-zA-Z_-]{8,}"
+            "sbp_[0-9a-zA-Z]{20,}"
+            "SUPABASE_SECRET_KEY"
+            "SUPABASE_SERVICE_ROLE_KEY"
+            "pdl_ntfset_[0-9a-zA-Z_]{16,}"
+            "pdl_live_apikey_[0-9a-zA-Z_]{16,}"
+            "pdl_sdbx_apikey_[0-9a-zA-Z_]{16,}"
+          )
+
+          for PATTERN in "${DIST_PATTERNS[@]}"; do
+            MATCHES=$(grep -rnE -- "$PATTERN" dist/ || true)
+            if [ -n "$MATCHES" ]; then
+              echo "::error::Secret pattern leaked into dist/ bundle: $PATTERN"
+              DIST_LEAKS=1
+            fi
+          done
+
+          if [ $DIST_LEAKS -ne 0 ]; then
+            echo "dist/ bundle security verification FAILED!"
+            exit 1
+          fi
+
+          echo "dist/ bundle security verification PASSED: Zero secrets in build output."

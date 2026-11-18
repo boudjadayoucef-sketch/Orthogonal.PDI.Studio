@@ -17,6 +17,7 @@
     "@google/genai": "^2.4.0",
     "@microsoft/clarity": "^1.0.2",
     "@sanity/client": "^8.6.1",
+    "@supabase/supabase-js": "^2.119.0",
     "@tailwindcss/vite": "^4.1.14",
     "@techstark/opencv-js": "^5.0.0-release.1",
     "@types/pg": "^8.23.1",

@@ -861,12 +861,32 @@ export function verifyProductionConfig(
     "SMTP_PASSWORD",
     "BREVO_API_KEY",
     "RESEND_API_KEY",
-    "SENDER_API_KEY"
+    "SENDER_API_KEY",
+    "SUPABASE_SECRET_KEY",
+    "SUPABASE_SERVICE_ROLE_KEY",
+    "SB_SECRET",
+    "SB_SECRET_KEY",
+    "DATABASE_URL",
+    "DIRECT_URL",
+    "SQL_PASSWORD",
+    "SQL_ADMIN_PASSWORD"
   ];
 
   for (const name of sensitiveSecretNames) {
     if (env[`VITE_${name}`] !== undefined) {
       forbiddenViteSecretKeys.push(`VITE_${name}`);
+    }
+  }
+
+  // MIG-01-FIX-02: Also block any VITE_ variable whose value contains a Supabase secret key (sb_secret_)
+  for (const [envKey, envVal] of Object.entries(env)) {
+    if (
+      envKey.startsWith("VITE_") &&
+      typeof envVal === "string" &&
+      /^sb_secret_/i.test(envVal.trim()) &&
+      !forbiddenViteSecretKeys.includes(envKey)
+    ) {
+      forbiddenViteSecretKeys.push(envKey);
     }
   }
 
