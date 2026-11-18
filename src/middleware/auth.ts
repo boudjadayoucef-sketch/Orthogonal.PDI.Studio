@@ -1,16 +1,47 @@
 import { Request, Response, NextFunction } from 'express';
 import { adminAuth } from '../lib/firebase-admin.ts';
 import { DecodedIdToken } from 'firebase-admin/auth';
+import {
+  isStagingSandboxMode,
+  isSyntheticSandboxToken,
+  isSyntheticSandboxUid,
+} from '../lib/stagingSandbox.ts';
 
 export interface AuthRequest extends Request {
   user?: DecodedIdToken;
 }
+
+/**
+ * Protection C2 (STAGING-00-B3):
+ * Refuses administrative, payment, webhook, and server database routes when Sandbox mode is active.
+ */
+export const rejectInStagingSandboxMode = (
+  _req: Request,
+  res: Response,
+  next: NextFunction
+) => {
+  if (isStagingSandboxMode(process.env)) {
+    return res.status(403).json({
+      error:
+        'Forbidden: Server-side administrative, payment, webhook, and database persistence routes are disabled in Sandbox mode.',
+      code: 'sandbox/server-mutation-forbidden',
+    });
+  }
+  next();
+};
 
 export const requireAuth = async (
   req: AuthRequest,
   res: Response,
   next: NextFunction
 ) => {
+  if (req.headers['x-pdi-sandbox-identity']) {
+    return res.status(401).json({
+      error: 'Unauthorized: Synthetic Sandbox identity is strictly forbidden on server',
+      code: 'auth/synthetic-identity-forbidden',
+    });
+  }
+
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return res.status(401).json({ 
@@ -27,8 +58,25 @@ export const requireAuth = async (
     });
   }
 
+  // Protection C2 (STAGING-00-B3): Never accept a synthetic local Sandbox token on the server
+  if (isSyntheticSandboxToken(token)) {
+    return res.status(401).json({
+      error: 'Unauthorized: Synthetic Sandbox identity is strictly forbidden on server',
+      code: 'auth/synthetic-identity-forbidden',
+    });
+  }
+
   try {
     const decodedToken = await adminAuth.verifyIdToken(token);
+    if (
+      isSyntheticSandboxUid(decodedToken?.uid) ||
+      (decodedToken as Record<string, unknown>)?.sandbox_synthetic === true
+    ) {
+      return res.status(401).json({
+        error: 'Unauthorized: Synthetic Sandbox identity is strictly forbidden on server',
+        code: 'auth/synthetic-identity-forbidden',
+      });
+    }
     req.user = decodedToken;
     next();
   } catch (error: any) {

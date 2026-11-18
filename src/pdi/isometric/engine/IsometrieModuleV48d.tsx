@@ -15,6 +15,11 @@
 // PD&I PATCH 003 — V4.8d restored
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { onAuthStateChanged } from "firebase/auth";
+import {
+  isStagingSandboxMode,
+  resolveScopedStorageKey,
+  getSandboxSyntheticProfile,
+} from "../../../lib/stagingSandbox";
 // PATCH 017J : identite de cartouche parametrable (R15).
 import { pdiCompanyName } from "../../branding/pdiBranding";
 // PATCH 017P : precision geometrique (accroche a priorites, axes ISO, QA).
@@ -412,8 +417,11 @@ function IsometrieModule(props: { projectId?: string }) {
   // V4.7.4f_PLATFORM_PROFILE_FALLBACK : Firebase Auth reste prioritaire,
   // puis le profil applicatif validé par App.tsx est utilisé en mode fallback.
   const readPlatformProfileUid=()=>{
+    if (isStagingSandboxMode()) {
+      return getSandboxSyntheticProfile().uid;
+    }
     try{
-      const raw=localStorage.getItem("pdi.userProfile.v1")||localStorage.getItem("pdi_user_profile");
+      const raw=localStorage.getItem(resolveScopedStorageKey("pdi.userProfile.v1"))||localStorage.getItem(resolveScopedStorageKey("pdi_user_profile"));
       if(!raw)return null;
       const profile=JSON.parse(raw);
       return typeof profile?.uid==="string"&&profile.uid.trim()?profile.uid.trim():null;
@@ -424,14 +432,18 @@ function IsometrieModule(props: { projectId?: string }) {
   // TOUTE sauvegarde locale etait desactivee : le dessin disparaissait a F5.
   const readLocalFallbackUid=()=>{
     try{
-      const existing=localStorage.getItem("pdi.localUid.v1");
+      const key = resolveScopedStorageKey("pdi.localUid.v1");
+      const existing=localStorage.getItem(key);
       if(existing&&existing.trim())return existing.trim();
       const generated="local-"+Math.random().toString(36).slice(2,10)+Date.now().toString(36);
-      localStorage.setItem("pdi.localUid.v1",generated);
+      localStorage.setItem(key,generated);
       return generated;
     }catch{return "local-session";}
   };
-  const resolveStableUid=()=>auth.currentUser?.uid||readPlatformProfileUid()||readLocalFallbackUid();
+  const resolveStableUid=()=>
+    isStagingSandboxMode()
+      ? getSandboxSyntheticProfile().uid
+      : auth.currentUser?.uid||readPlatformProfileUid()||readLocalFallbackUid();
   const initialAuthUidRef=useRef<string|null>(resolveStableUid());
   const authSeenRef=useRef(false);
   const [authReady,setAuthReady]=useState(false);
@@ -449,16 +461,20 @@ function IsometrieModule(props: { projectId?: string }) {
       setUserUid(nextUid);
       setAuthReady(true);
     };
-    const unsubscribe=onAuthStateChanged(auth,syncIdentity);
+    const unsubscribe = isStagingSandboxMode()
+      ? (() => {
+          syncIdentity();
+          return () => {};
+        })()
+      : onAuthStateChanged(auth,syncIdentity);
     const timer=window.setInterval(syncIdentity,1000);
     window.addEventListener("focus",syncIdentity);
     return()=>{unsubscribe();window.clearInterval(timer);window.removeEventListener("focus",syncIdentity);};
   },[]);
-  // PATCH 017F1 : isolation par projet. Chaque onglet ISO ecrit dans sa propre
-  // cle locale, donc un nouvel onglet demarre sur un plan vierge et deux
-  // projets ne se recouvrent plus jamais.
+  // PATCH 017F1 & Protection C3 (STAGING-00-B3) : isolation par projet et par namespace Sandbox.
   const activeProjectKey=(projectId&&projectId.trim())?projectId.trim():"default";
-  const autosavePrefix=userUid?`isometrie.autosave.v474.user.${userUid}.project.${activeProjectKey}`:"";
+  const rawAutosavePrefix=userUid?`isometrie.autosave.v474.user.${userUid}.project.${activeProjectKey}`:"";
+  const autosavePrefix=rawAutosavePrefix?resolveScopedStorageKey(rawAutosavePrefix):"";
   const AUTOSAVE_CURRENT_KEY=autosavePrefix?`${autosavePrefix}.current`:"";
   const AUTOSAVE_PREVIOUS_KEY=autosavePrefix?`${autosavePrefix}.previous`:"";
   const AUTOSAVE_LEGACY_KEY=autosavePrefix?`${autosavePrefix}.legacy`:"";

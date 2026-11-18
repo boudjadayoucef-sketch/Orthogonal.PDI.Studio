@@ -30,6 +30,12 @@ import {
   signOut as fbSignOut
 } from "firebase/auth";
 import { isSuperAdminClaimAuthorized } from "../security/clientAuthorization";
+import {
+  isStagingSandboxMode,
+  getSandboxSyntheticProfile,
+  seedSandboxDefaultProjectIfEmpty,
+  resolveScopedStorageKey,
+} from "./stagingSandbox";
 
 // ==========================================
 // FIRESTORE ERROR HANDLING & CONNECTION TEST
@@ -81,7 +87,11 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
   throw new Error(JSON.stringify(errInfo));
 }
 
-export async function testConnection() {
+export async function testConnection(explicitEnv?: Record<string, unknown>) {
+  // Protection C1 (STAGING-00-B3): Never call getDocFromServer or touch Firestore in Sandbox mode
+  if (isStagingSandboxMode(explicitEnv)) {
+    return;
+  }
   try {
     await getDocFromServer(doc(db, 'test', 'connection'));
   } catch {
@@ -140,10 +150,27 @@ export interface ClientFirebaseConfig {
   firestoreDatabaseId: string;
 }
 
+export const SANDBOX_DISABLED_FIREBASE_CONFIG: ClientFirebaseConfig = Object.freeze({
+  apiKey: "",
+  authDomain: "",
+  projectId: "sandbox-disabled-no-firebase",
+  storageBucket: "",
+  messagingSenderId: "",
+  appId: "",
+  firestoreDatabaseId: "sandbox-disabled-no-firestore",
+});
+
 export function resolveClientFirebaseConfig(
   env?: Record<string, unknown>,
   options?: { requireExplicitEnv?: boolean }
 ): ClientFirebaseConfig {
+  // Protection C1 (STAGING-00-B3): Do not resolve or fallback to production Firebase config in Sandbox mode
+  if (isStagingSandboxMode(env)) {
+    throw new Error(
+      "Coupe-circuit Sandbox (C1) : la résolution des valeurs Firebase Production est strictement interdite en mode Sandbox."
+    );
+  }
+
   const sourceEnv = env && typeof env === "object" ? env : {};
   const requireExplicit = Boolean(options?.requireExplicitEnv);
 
@@ -238,6 +265,12 @@ export function getOrInitializeClientFirebaseApp(
     initializeApp?: typeof initializeApp;
   }
 ): ReturnType<typeof initializeApp> {
+  if (isStagingSandboxMode()) {
+    throw new Error(
+      "Coupe-circuit Sandbox (C1) : l'initialisation Firebase (initializeApp) est strictement interdite en mode Sandbox."
+    );
+  }
+
   const validatedProjectId = validateClientFirebaseProjectId(config?.projectId);
   validateClientFirestoreDatabaseId(config?.firestoreDatabaseId);
 
@@ -288,6 +321,12 @@ export function getOrInitializeClientFirestore(
   appInstance: any,
   config: { projectId?: unknown; firestoreDatabaseId?: unknown }
 ): ReturnType<typeof initializeFirestore> {
+  if (isStagingSandboxMode()) {
+    throw new Error(
+      "Coupe-circuit Sandbox (C1) : l'initialisation Firestore (initializeFirestore) est strictement interdite en mode Sandbox."
+    );
+  }
+
   if (!appInstance || typeof appInstance !== "object") {
     throw new Error("Initialisation Firestore refusée : instance FirebaseApp absente ou invalide.");
   }
@@ -334,18 +373,87 @@ export function getOrInitializeClientFirestore(
   return instance;
 }
 
-const metaEnv = (typeof import.meta !== "undefined" && (import.meta as any)?.env) || {};
+const SANDBOX_DISABLED_APP = Object.freeze({
+  name: "[SANDBOX_DISABLED]",
+  options: Object.freeze({ projectId: "sandbox-disabled-no-firebase" }),
+  __sandboxDisabled: true,
+}) as unknown as ReturnType<typeof initializeApp>;
 
-const activeConfig = resolveClientFirebaseConfig(metaEnv);
+const SANDBOX_DISABLED_DB = Object.freeze({
+  type: "sandbox-firestore-disabled",
+  __sandboxDisabled: true,
+}) as unknown as ReturnType<typeof initializeFirestore>;
 
-// Initialize or select [DEFAULT] Firebase App with strict projectId verification (FIX-02-A)
-const app = getOrInitializeClientFirebaseApp(activeConfig);
-validateClientFirebaseAppProjectId(app, activeConfig.projectId);
+const SANDBOX_DISABLED_AUTH = Object.freeze({
+  currentUser: null,
+  __sandboxDisabled: true,
+  onAuthStateChanged: () => () => {},
+  onIdTokenChanged: () => () => {},
+}) as unknown as ReturnType<typeof getAuth>;
 
-// Initialize Firestore with robust local offline persistence (IndexedDB) and explicit named database ID
-const db = getOrInitializeClientFirestore(app, activeConfig);
+/**
+ * Protection C1 (STAGING-00-B3):
+ * Initializes client Firebase runtime ONLY when not in Sandbox mode.
+ * When `isStagingSandboxMode(env)` is true:
+ * - Zero calls to `resolveClientFirebaseConfig` (no production defaults used)
+ * - Zero calls to `initializeApp`
+ * - Zero calls to `initializeFirestore`
+ * - Zero calls to `getAuth`
+ */
+export function initializeClientFirebaseRuntime(
+  env?: Record<string, unknown>,
+  sdk?: {
+    getApps?: typeof getApps;
+    getApp?: typeof getApp;
+    initializeApp?: typeof initializeApp;
+    initializeFirestore?: typeof initializeFirestore;
+    getAuth?: typeof getAuth;
+  }
+): {
+  sandboxDisabled: boolean;
+  activeConfig: ClientFirebaseConfig;
+  app: ReturnType<typeof initializeApp>;
+  db: ReturnType<typeof initializeFirestore>;
+  auth: ReturnType<typeof getAuth>;
+} {
+  if (isStagingSandboxMode(env)) {
+    return {
+      sandboxDisabled: true,
+      activeConfig: SANDBOX_DISABLED_FIREBASE_CONFIG,
+      app: SANDBOX_DISABLED_APP,
+      db: SANDBOX_DISABLED_DB,
+      auth: SANDBOX_DISABLED_AUTH,
+    };
+  }
 
-const auth = getAuth(app);
+  const resolvedConfig = resolveClientFirebaseConfig(env);
+  const resolvedApp = getOrInitializeClientFirebaseApp(resolvedConfig, sdk);
+  validateClientFirebaseAppProjectId(resolvedApp, resolvedConfig.projectId);
+  const resolvedDb = sdk?.initializeFirestore
+    ? sdk.initializeFirestore(
+        resolvedApp,
+        {
+          localCache: persistentLocalCache({
+            tabManager: persistentMultipleTabManager(),
+          }),
+        },
+        resolvedConfig.firestoreDatabaseId
+      )
+    : getOrInitializeClientFirestore(resolvedApp, resolvedConfig);
+  const resolvedAuth = (sdk?.getAuth ?? getAuth)(resolvedApp);
+
+  return {
+    sandboxDisabled: false,
+    activeConfig: resolvedConfig,
+    app: resolvedApp,
+    db: resolvedDb,
+    auth: resolvedAuth,
+  };
+}
+
+const metaEnv = (typeof import.meta !== "undefined" && (import.meta as any)?.env) || undefined;
+const clientFirebaseRuntime = initializeClientFirebaseRuntime(metaEnv);
+const { app, db, auth, activeConfig } = clientFirebaseRuntime;
 
 export { app, db, auth, activeConfig };
 
@@ -1507,6 +1615,21 @@ export async function resolveAuthoritativeWorkspaceSession(
   } | null,
   options?: { forceRefreshToken?: boolean }
 ): Promise<WorkspaceSessionResolution> {
+  // Protection C1 (STAGING-00-B3): In Sandbox mode, resolve synthetic local session without touching Firebase Auth or Firestore
+  if (isStagingSandboxMode()) {
+    seedSandboxDefaultProjectIfEmpty();
+    const syntheticProfile = getSandboxSyntheticProfile();
+    const isSuper = syntheticProfile.role === "super_admin";
+    return {
+      status: "active",
+      canAccessWorkspace: true,
+      canAccessActivation: false,
+      isSuperAdmin: isSuper,
+      authMode: isSuper ? "super_admin" : "client",
+      profile: syntheticProfile as unknown as PdiUserProfile,
+    };
+  }
+
   const activeUser = candidateUser !== undefined ? candidateUser : (auth.currentUser as any);
 
   if (!activeUser || typeof activeUser.uid !== "string" || activeUser.uid.trim().length === 0) {
@@ -1722,8 +1845,11 @@ export async function resolveAuthoritativeWorkspaceSession(
     const resolvedMode = isSuperAdmin ? "super_admin" : "client";
     try {
       if (typeof localStorage !== "undefined") {
-        localStorage.setItem("pdi.auth.mode.v1", resolvedMode);
-        localStorage.setItem("pdi.user.profile.v1", JSON.stringify({ ...normalizedProfile, role: resolvedMode }));
+        localStorage.setItem(resolveScopedStorageKey("pdi.auth.mode.v1"), resolvedMode);
+        localStorage.setItem(
+          resolveScopedStorageKey("pdi.user.profile.v1"),
+          JSON.stringify({ ...normalizedProfile, role: resolvedMode })
+        );
       }
     } catch {}
 
@@ -1763,6 +1889,9 @@ export async function loginWithEmailAndPasswordSecure(
   passwordInput: string,
   clientInfo?: { userAgent?: string; device?: string }
 ): Promise<{ profile: PdiUserProfile; isSuperAdmin: boolean }> {
+  if (isStagingSandboxMode()) {
+    throw new Error("Coupe-circuit Sandbox (C1) : l'authentification Firebase Production est désactivée en mode Sandbox.");
+  }
   const email = emailInput.trim().toLowerCase();
 
   if (!email || !passwordInput) {
@@ -1804,6 +1933,9 @@ export async function registerWithEmailAndPasswordSecure(data: {
   requestedPlan?: string;
   activationKey?: string;
 }): Promise<PdiUserProfile> {
+  if (isStagingSandboxMode()) {
+    throw new Error("Coupe-circuit Sandbox (C1) : la création de compte Firebase Production est désactivée en mode Sandbox.");
+  }
   const email = typeof data.email === "string" ? data.email.trim().toLowerCase() : "";
 
   if (!email || !data.password || typeof data.name !== "string" || !data.name.trim()) {
@@ -1890,6 +2022,7 @@ export async function registerWithEmailAndPasswordSecure(data: {
 }
 
 export async function saveAuthCredentialsSecure(emailInput: string, passwordInput: string, role: PdiUserRole = "client"): Promise<void> {
+  if (isStagingSandboxMode()) return;
   const email = emailInput.trim().toLowerCase();
   if (!email || !passwordInput) return;
   const salt = generateCryptoSalt();
@@ -1907,6 +2040,9 @@ export async function saveAuthCredentialsSecure(emailInput: string, passwordInpu
 }
 
 export async function loginWithGoogleSecure(): Promise<{ profile: PdiUserProfile; isSuperAdmin: boolean }> {
+  if (isStagingSandboxMode()) {
+    throw new Error("Coupe-circuit Sandbox (C1) : l'authentification Google Firebase Production est désactivée en mode Sandbox.");
+  }
   let result: any;
   try {
     const provider = new GoogleAuthProvider();
@@ -1937,6 +2073,9 @@ export async function loginWithGoogleSecure(): Promise<{ profile: PdiUserProfile
  * - Refuse de confirmer la déconnexion si Firebase conserve une session active (auth.currentUser !== null).
  */
 export async function logoutFirebase(): Promise<void> {
+  if (isStagingSandboxMode()) {
+    return;
+  }
   purgeLocalAuthCaches({ preservePendingState: false });
   try {
     await fbSignOut(auth);
@@ -1982,6 +2121,9 @@ export async function activateAccountWithLicenseKey(email: string, licenseCode: 
 }
 
 export async function recordSubscriberUsage(usage: Omit<PdiSubscriberUsage, "id" | "timestamp"> & { timestamp?: string }): Promise<void> {
+  if (isStagingSandboxMode()) {
+    return;
+  }
   try {
     await addDoc(collection(db, "subscriber_usage"), {
       ...usage,

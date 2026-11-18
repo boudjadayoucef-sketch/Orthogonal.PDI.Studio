@@ -18,6 +18,7 @@ import {
   saveLocalLearningProfile,
   SketchLearningProfile
 } from "./sketchStorage";
+import { resolveScopedStorageKey } from "../../lib/stagingSandbox";
 import {
   generateDemoSketchImageDataUrl,
   DEMO_INITIAL_NODES,
@@ -294,11 +295,14 @@ export const SketchToIsoModule: React.FC<SketchToIsoModuleProps> = ({
         open3d: true,
         updatedAt: new Date().toISOString()
       };
-      // 1. Écrire le payload dans localStorage ET sessionStorage avant tout changement de vue
-      window.localStorage.setItem(autosaveKey, JSON.stringify(payload));
-      window.localStorage.setItem("pdi.pending_iso_injection", JSON.stringify(payload));
-      window.sessionStorage.setItem("pdi.pending_iso_injection", JSON.stringify(payload));
-      window.localStorage.setItem("pdi.activeModule.v1", "isometric");
+      // 1. Écrire le payload dans localStorage ET sessionStorage avant tout changement de vue (Protection C3 Sandbox namespace)
+      const scopedAutosaveKey = resolveScopedStorageKey(autosaveKey);
+      const scopedPendingKey = resolveScopedStorageKey("pdi.pending_iso_injection");
+      const scopedActiveModuleKey = resolveScopedStorageKey("pdi.activeModule.v1");
+      window.localStorage.setItem(scopedAutosaveKey, JSON.stringify(payload));
+      window.localStorage.setItem(scopedPendingKey, JSON.stringify(payload));
+      window.sessionStorage.setItem(scopedPendingKey, JSON.stringify(payload));
+      window.localStorage.setItem(scopedActiveModuleKey, "isometric");
 
       // 2. Émettre "pdi:active-module-changed" pour alerter tout composant ISO déjà monté
       window.dispatchEvent(

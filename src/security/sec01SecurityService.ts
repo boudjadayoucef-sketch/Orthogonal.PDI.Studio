@@ -16,6 +16,7 @@
 import crypto from "node:crypto";
 import express from "express";
 import type { Request, Response, NextFunction, ErrorRequestHandler } from "express";
+import { resolvePdiEnvironmentMode } from "../lib/stagingSandbox.ts";
 
 // =========================================================================
 // 1. BOUNDED IN-MEMORY RATE LIMITER
@@ -832,6 +833,7 @@ export interface ConfigValidationResult {
   missingCriticalKeys: string[];
   forbiddenViteSecretKeys: string[];
   invalidConfigKeys?: string[];
+  hasFatalSandboxConfigError?: boolean;
   errorMessage?: string;
 }
 
@@ -860,6 +862,7 @@ export function containsExposedSupabaseSecretCredential(value: unknown): boolean
  * - No server secrets prefixed with VITE_ (must be server-only)
  * - Required production environment variables present
  * - Strict validation of APP_URL, ALLOWED_ORIGINS, and CSP_FRAME_ANCESTORS (SEC-01-FIX-07-R1 D1)
+ * - Protection C5 (STAGING-00-B3): Forbids Sandbox mode in production, rejects frontend/server PDI_ENV mismatches, and rejects ambiguous PDI_ENV values
  * - Safe errors that never print secret values
  */
 export function verifyProductionConfig(
@@ -869,6 +872,7 @@ export function verifyProductionConfig(
   const missingCriticalKeys: string[] = [];
   const forbiddenViteSecretKeys: string[] = [];
   const invalidConfigKeys: string[] = [];
+  let hasFatalSandboxConfigError = false;
 
   // Check for accidentally leaked server secrets using VITE_ prefix
   const sensitiveSecretNames = [
@@ -922,6 +926,17 @@ export function verifyProductionConfig(
     }
   }
 
+  // Protection C5 (STAGING-00-B3): Validate PDI_ENV & VITE_PDI_ENV coherence, ambiguity, and production prohibition
+  const pdiEnvCheck = resolvePdiEnvironmentMode(env, {
+    requireServerClientCoherence: true,
+  });
+  if (!pdiEnvCheck.isValid) {
+    hasFatalSandboxConfigError = true;
+    invalidConfigKeys.push(
+      `PDI_ENV/VITE_PDI_ENV (${pdiEnvCheck.errorCode}: ${pdiEnvCheck.errorMessage})`
+    );
+  }
+
   // SEC-01-FIX-07-R1 (D1.1 & D1.2): Validate APP_URL, ALLOWED_ORIGINS, and CSP_FRAME_ANCESTORS
   if (env.APP_URL !== undefined && env.APP_URL.trim() !== "") {
     const appUrlCheck = validateAppUrl(env.APP_URL);
@@ -972,6 +987,7 @@ export function verifyProductionConfig(
     missingCriticalKeys,
     forbiddenViteSecretKeys,
     invalidConfigKeys,
+    hasFatalSandboxConfigError,
     errorMessage
   };
 }

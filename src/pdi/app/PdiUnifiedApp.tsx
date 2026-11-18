@@ -96,6 +96,18 @@ import {
 } from "../../lib/firebase";
 import { attachSuperAdminTokenMonitor, isRestrictedAdminView, getAuthorizedView } from "../../security/clientAuthorization";
 import { projectsApi } from "../../lib/pdiApiClient";
+import {
+  SANDBOX_BANNER_LINES,
+  SANDBOX_STORAGE_PREFIX,
+  isStagingSandboxMode,
+  resolveScopedStorageKey,
+  resetSandboxLocalStorageOnly,
+  seedSandboxDefaultProjectIfEmpty,
+  getSandboxSyntheticProfile,
+  getSandboxSyntheticAuthUser,
+  setSandboxSyntheticRole,
+  type SandboxSyntheticRole,
+} from "../../lib/stagingSandbox";
 
 export type PdiModule = "home" | "isometric" | "drive" | "vision" | "sketch" | "cad" | "json" | "pdf" | "projects" | "assistant" | "profile" | "subscription" | "super_admin_console" | "license_keys";
 type PdiWorkspaceTab = { id: string; title: string; module: PdiModule; projectId: string; dirty?: boolean; createdAt: string };
@@ -105,6 +117,14 @@ const PDI_STAGE_KEY = "pdi.stage.v4";
 const PDI_TABS_KEY = "pdi.tabs.v1";
 const PDI_ACTIVE_TAB_KEY = "pdi.activeTabId.v1";
 const PDI_AUTH_KEY = "pdi.auth.mode.v1";
+
+export function getStagingSandboxBannerSpec(explicitEnv?: Record<string, unknown>) {
+  return {
+    visible: isStagingSandboxMode(explicitEnv),
+    dismissible: false as const,
+    lines: SANDBOX_BANNER_LINES,
+  };
+}
 
 // PATCH 017B : modules reellement rendus par la coquille.
 // Un module absent de cette liste (ex: "projects" ou une valeur heritee)
@@ -122,35 +142,49 @@ const PDI_PROJECT_INDEX_KEY = "pdi.projects.index.v1";
 
 type PdiProjectIndexEntry = { projectId: string; title: string; module: PdiModule; updatedAt: string };
 
-function pdiReadProjectIndex(): PdiProjectIndexEntry[] {
+export function pdiReadProjectIndex(explicitEnv?: Record<string, unknown>): PdiProjectIndexEntry[] {
   try {
-    const raw = window.localStorage.getItem(PDI_PROJECT_INDEX_KEY);
+    const scopedKey = resolveScopedStorageKey(PDI_PROJECT_INDEX_KEY, explicitEnv);
+    const raw = window.localStorage.getItem(scopedKey);
     const parsed = raw ? JSON.parse(raw) : [];
     if (!Array.isArray(parsed)) return [];
     return parsed.filter((entry) => entry && typeof entry.projectId === "string");
   } catch { return []; }
 }
 
-function pdiWriteProjectIndex(entries: PdiProjectIndexEntry[]) {
-  try { window.localStorage.setItem(PDI_PROJECT_INDEX_KEY, JSON.stringify(entries)); } catch {}
+export function pdiWriteProjectIndex(entries: PdiProjectIndexEntry[], explicitEnv?: Record<string, unknown>) {
+  try {
+    const scopedKey = resolveScopedStorageKey(PDI_PROJECT_INDEX_KEY, explicitEnv);
+    window.localStorage.setItem(scopedKey, JSON.stringify(entries));
+  } catch {}
 }
 
-function pdiUpsertProject(entry: { projectId: string; title: string; module: PdiModule }) {
-  const list = pdiReadProjectIndex();
+export function pdiUpsertProject(
+  entry: { projectId: string; title: string; module: PdiModule },
+  explicitEnv?: Record<string, unknown>
+) {
+  const list = pdiReadProjectIndex(explicitEnv);
   const now = new Date().toISOString();
   const found = list.find((item) => item.projectId === entry.projectId);
   if (found) { found.title = entry.title; found.module = entry.module; found.updatedAt = now; }
   else list.push({ projectId: entry.projectId, title: entry.title, module: entry.module, updatedAt: now });
-  pdiWriteProjectIndex(list);
+  pdiWriteProjectIndex(list, explicitEnv);
 }
 
-function pdiRemoveProject(projectId: string) {
-  pdiWriteProjectIndex(pdiReadProjectIndex().filter((item) => item.projectId !== projectId));
+export function pdiRemoveProject(projectId: string, explicitEnv?: Record<string, unknown>) {
+  const inSandbox = isStagingSandboxMode(explicitEnv);
+  pdiWriteProjectIndex(
+    pdiReadProjectIndex(explicitEnv).filter((item) => item.projectId !== projectId),
+    explicitEnv
+  );
   try {
     const doomed: string[] = [];
     for (let i = 0; i < window.localStorage.length; i++) {
       const key = window.localStorage.key(i);
-      if (key && key.indexOf(".project." + projectId + ".") !== -1) doomed.push(key);
+      if (!key) continue;
+      if (inSandbox && !key.startsWith(SANDBOX_STORAGE_PREFIX)) continue;
+      if (!inSandbox && key.startsWith(SANDBOX_STORAGE_PREFIX)) continue;
+      if (key.indexOf(".project." + projectId + ".") !== -1) doomed.push(key);
     }
     doomed.forEach((key) => window.localStorage.removeItem(key));
   } catch {}
@@ -169,12 +203,15 @@ type PdiLocalSession = {
   archive: boolean;
 };
 
-function pdiListLocalSessions(): PdiLocalSession[] {
+export function pdiListLocalSessions(explicitEnv?: Record<string, unknown>): PdiLocalSession[] {
   const out: PdiLocalSession[] = [];
+  const inSandbox = isStagingSandboxMode(explicitEnv);
+  const expectedPrefix = resolveScopedStorageKey("isometrie.autosave.", explicitEnv);
   try {
     for (let i = 0; i < window.localStorage.length; i++) {
       const key = window.localStorage.key(i);
-      if (!key || key.indexOf("isometrie.autosave.") !== 0) continue;
+      if (!key || key.indexOf(expectedPrefix) !== 0) continue;
+      if (!inSandbox && key.startsWith(SANDBOX_STORAGE_PREFIX)) continue;
       // PATCH 017F2 : les archives ".previous" ne sont plus listees. Elles
       // dupliquaient chaque projet et rendaient l ouverture ambigue.
       const isCurrent = key.slice(-8) === ".current";
@@ -537,18 +574,36 @@ function ComingSoonPanel({ title, children }: { title: string; children: React.R
 
 export default function PdiUnifiedApp() {
   const [feedbackModalOpen, setFeedbackModalOpen] = useState(false);
+  const sandboxActive = isStagingSandboxMode();
 
   // BLOC C2 : État de résolution initiale de l'authentification et du profil Firestore
-  const [authReady, setAuthReady] = useState<boolean>(false);
-  const authReadyRef = React.useRef<boolean>(false);
-  const [verifiedSession, setVerifiedSession] = useState<WorkspaceSessionResolution | null>(null);
-  const verifiedSessionRef = React.useRef<WorkspaceSessionResolution | null>(null);
+  const [authReady, setAuthReady] = useState<boolean>(() => sandboxActive);
+  const authReadyRef = React.useRef<boolean>(sandboxActive);
+  const [verifiedSession, setVerifiedSession] = useState<WorkspaceSessionResolution | null>(() => {
+    if (!sandboxActive) return null;
+    seedSandboxDefaultProjectIfEmpty();
+    const prof = getSandboxSyntheticProfile();
+    const isSuper = prof.role === "super_admin";
+    return {
+      status: "active",
+      canAccessWorkspace: true,
+      canAccessActivation: false,
+      isSuperAdmin: isSuper,
+      authMode: isSuper ? "super_admin" : "client",
+      profile: prof as unknown as PdiUserProfile,
+    };
+  });
+  const verifiedSessionRef = React.useRef<WorkspaceSessionResolution | null>(verifiedSession);
 
   // BLOC C1 : Ne jamais accorder un mode actif ("client", "demo", "admin", "super_admin") depuis localStorage
-  // avant que Firebase Auth et le profil Firestore n'aient été vérifiés.
+  // avant que Firebase Auth et le profil Firestore n'aient été vérifiés (hors Sandbox locale isolée C1/C3).
   const [authMode, setAuthMode] = useState<"guest" | "demo" | "pending_email" | "client" | "admin" | "super_admin">(() => {
+    if (sandboxActive) {
+      const prof = getSandboxSyntheticProfile();
+      return prof.role === "super_admin" ? "super_admin" : "client";
+    }
     try {
-      const saved = window.localStorage.getItem(PDI_AUTH_KEY);
+      const saved = window.localStorage.getItem(resolveScopedStorageKey(PDI_AUTH_KEY));
       if (saved === "pending_email") {
         return "pending_email";
       }
@@ -560,7 +615,7 @@ export default function PdiUnifiedApp() {
 
   const [activeModule, setActiveModule] = useState<PdiModule>(() => {
     try {
-      const saved = window.localStorage.getItem("pdi.activeModule.v1") as PdiModule;
+      const saved = window.localStorage.getItem(resolveScopedStorageKey("pdi.activeModule.v1")) as PdiModule;
       // Règle SEC-01-FIX-03 : Ne jamais restaurer de vue administrative au démarrage sans vérification
       if (isRestrictedAdminView(saved)) {
         return "isometric";
@@ -578,11 +633,24 @@ export default function PdiUnifiedApp() {
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [authPanelMode, setAuthPanelMode] = useState<"login" | "register" | "activation">("login");
   const [authDraft, setAuthDraft] = useState({ name: "", email: "", company: "", password: "", plan: "demo" });
-  const [activationToken, setActivationToken] = useState<string | null>(() => { try { return window.localStorage.getItem("pdi.activation.pendingToken.v1"); } catch { return null; } });
+  const [activationToken, setActivationToken] = useState<string | null>(() => { try { return window.localStorage.getItem(resolveScopedStorageKey("pdi.activation.pendingToken.v1")); } catch { return null; } });
 
   const [savedUserProfile, setSavedUserProfile] = useState(() => {
+    if (sandboxActive) {
+      const prof = getSandboxSyntheticProfile();
+      return {
+        name: prof.name,
+        email: prof.email,
+        role: prof.role,
+        company: prof.company,
+        country: prof.country,
+        plan: prof.accountType.toUpperCase(),
+        emailStatus: "vérifié (sandbox locale)",
+        createdAt: prof.createdAt,
+      };
+    }
     try {
-      const raw = window.localStorage.getItem("pdi.user.profile.v1");
+      const raw = window.localStorage.getItem(resolveScopedStorageKey("pdi.user.profile.v1"));
       if (raw) {
         const parsed = JSON.parse(raw);
         if (parsed && typeof parsed === "object") {
@@ -659,10 +727,10 @@ export default function PdiUnifiedApp() {
   };
 
   const [licenseKeys, setLicenseKeys] = useState<Array<{ id:string; code:string; type:string; plan:string; status:string; email:string; createdAt:string; expiresAt:string }>>(() => {
-    try { return JSON.parse(window.localStorage.getItem("pdi.license.keys.v1") || "[]"); } catch { return []; }
+    try { return JSON.parse(window.localStorage.getItem(resolveScopedStorageKey("pdi.license.keys.v1")) || "[]"); } catch { return []; }
   });
   const [licenseDraft, setLicenseDraft] = useState({ type:"TRIAL_30", plan:"PRO", email:"" });
-  const persistLicenseKeys = (keys: typeof licenseKeys) => { setLicenseKeys(keys); try { window.localStorage.setItem("pdi.license.keys.v1", JSON.stringify(keys)); } catch {} };
+  const persistLicenseKeys = (keys: typeof licenseKeys) => { setLicenseKeys(keys); try { window.localStorage.setItem(resolveScopedStorageKey("pdi.license.keys.v1"), JSON.stringify(keys)); } catch {} };
   const generateLicenseKey = () => {
     const id = `lic-${Date.now().toString(36)}`;
     const code = `PDI-${licenseDraft.type}-${Math.random().toString(36).slice(2,6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`;
@@ -672,13 +740,13 @@ export default function PdiUnifiedApp() {
   };
   const revokeLicenseKey = (id:string) => persistLicenseKeys(licenseKeys.map(k=>k.id===id?{...k,status:"revoked"}:k));
 
-  const [workspaceTabs, setWorkspaceTabs] = useState<PdiWorkspaceTab[]>(() => { try { return JSON.parse(window.localStorage.getItem(PDI_TABS_KEY) || "[]"); } catch { return []; } });
-  const [activeTabId, setActiveTabId] = useState<string | null>(() => { try { return window.localStorage.getItem(PDI_ACTIVE_TAB_KEY); } catch { return null; } });
+  const [workspaceTabs, setWorkspaceTabs] = useState<PdiWorkspaceTab[]>(() => { try { return JSON.parse(window.localStorage.getItem(resolveScopedStorageKey(PDI_TABS_KEY)) || "[]"); } catch { return []; } });
+  const [activeTabId, setActiveTabId] = useState<string | null>(() => { try { return window.localStorage.getItem(resolveScopedStorageKey(PDI_ACTIVE_TAB_KEY)); } catch { return null; } });
   // PATCH 017E : dock d onglets de l editeur ISO.
   const [isoTabDockOpen, setIsoTabDockOpen] = useState(true);
   // Synchronisation de l'état du rail latéral gauche avec l'éditeur ISO
   const [railCollapsed, setRailCollapsed] = useState<boolean>(() => {
-    try { return window.localStorage.getItem("pdi.rail.collapsed.v1") === "1"; }
+    try { return window.localStorage.getItem(resolveScopedStorageKey("pdi.rail.collapsed.v1")) === "1"; }
     catch { return false; }
   });
   useEffect(() => {
@@ -687,7 +755,7 @@ export default function PdiUnifiedApp() {
       if (detail && typeof detail.collapsed === "boolean") {
         setRailCollapsed(detail.collapsed);
       } else {
-        try { setRailCollapsed(window.localStorage.getItem("pdi.rail.collapsed.v1") === "1"); } catch {}
+        try { setRailCollapsed(window.localStorage.getItem(resolveScopedStorageKey("pdi.rail.collapsed.v1")) === "1"); } catch {}
       }
     };
     window.addEventListener("pdi:rail-toggle", handleRailToggle);
@@ -733,6 +801,9 @@ export default function PdiUnifiedApp() {
 
   // Rechargement : conserve dans le module ISO ou Accueil dans l'application uniquement si session résolue
   const [stage, setStage] = useState<"landing" | "auth" | "app">((): "landing" | "auth" | "app" => {
+    if (sandboxActive) {
+      return "app";
+    }
     try {
       const hash = window.location.hash.toLowerCase();
       const search = window.location.search.toLowerCase();
@@ -742,7 +813,7 @@ export default function PdiUnifiedApp() {
       if (hash.includes("auth") || hash.includes("login") || search.includes("auth") || search.includes("login")) {
         return "auth";
       }
-      if (hash.includes("app") || search.includes("app") || window.sessionStorage.getItem(PDI_STAGE_KEY) === "app") {
+      if (hash.includes("app") || search.includes("app") || window.sessionStorage.getItem(resolveScopedStorageKey(PDI_STAGE_KEY)) === "app") {
         return "app";
       }
     } catch {}
@@ -754,6 +825,13 @@ export default function PdiUnifiedApp() {
   }, [stage]);
 
   const [authPageTab, setAuthPageTab] = useState<"login" | "register" | "activation">("login");
+
+  const getEffectiveAuthUser = React.useCallback(() => {
+    if (isStagingSandboxMode()) {
+      return getSandboxSyntheticAuthUser();
+    }
+    return auth.currentUser;
+  }, []);
 
   // BLOC C1 : Fonction centrale unique d'entrée et de navigation dans le workspace
   const tryEnterWorkspace = React.useCallback(
@@ -772,7 +850,7 @@ export default function PdiUnifiedApp() {
       const decision = evaluateWorkspaceAccessGuard(
         currentSession,
         targetModule || activeModuleRef.current || "home",
-        auth.currentUser
+        getEffectiveAuthUser()
       );
 
       if (!decision.allowed) {
@@ -781,8 +859,8 @@ export default function PdiUnifiedApp() {
         setStage(decision.targetStage);
         setActiveModule("home");
         try {
-          window.sessionStorage.removeItem(PDI_STAGE_KEY);
-          window.localStorage.removeItem("pdi.force.app.v1");
+          window.sessionStorage.removeItem(resolveScopedStorageKey(PDI_STAGE_KEY));
+          window.localStorage.removeItem(resolveScopedStorageKey("pdi.force.app.v1"));
           window.location.hash = decision.targetStage;
         } catch {}
         return false;
@@ -792,15 +870,15 @@ export default function PdiUnifiedApp() {
       setStage("app");
       setActiveModule(decision.authorizedModule);
       try {
-        window.sessionStorage.setItem(PDI_STAGE_KEY, "app");
-        window.localStorage.setItem("pdi.force.app.v1", "1");
-        window.localStorage.setItem(PDI_AUTH_KEY, decision.resolvedAuthMode);
-        window.localStorage.setItem("pdi.activeModule.v1", decision.authorizedModule);
+        window.sessionStorage.setItem(resolveScopedStorageKey(PDI_STAGE_KEY), "app");
+        window.localStorage.setItem(resolveScopedStorageKey("pdi.force.app.v1"), "1");
+        window.localStorage.setItem(resolveScopedStorageKey(PDI_AUTH_KEY), decision.resolvedAuthMode);
+        window.localStorage.setItem(resolveScopedStorageKey("pdi.activeModule.v1"), decision.authorizedModule);
         window.location.hash = "app";
       } catch {}
       return true;
     },
-    []
+    [getEffectiveAuthUser]
   );
 
   // BLOC C1 : Aucune ouverture de session simulée sans authentification Firebase et profil actif
@@ -812,7 +890,7 @@ export default function PdiUnifiedApp() {
     const token = `pdi-act-${Date.now().toString(36)}`;
     setActivationToken(token);
     setAuthMode("pending_email");
-    try { window.localStorage.setItem("pdi.activation.pendingToken.v1", token); window.localStorage.setItem("pdi.auth.pendingUser.v1", JSON.stringify({ ...authDraft, password: undefined, status:"pending_email" })); } catch {}
+    try { window.localStorage.setItem(resolveScopedStorageKey("pdi.activation.pendingToken.v1"), token); window.localStorage.setItem(resolveScopedStorageKey("pdi.auth.pendingUser.v1"), JSON.stringify({ ...authDraft, password: undefined, status:"pending_email" })); } catch {}
     setAuthPanelMode("activation");
   };
   const activateSimulatedAccount = () => {
@@ -824,13 +902,13 @@ export default function PdiUnifiedApp() {
     if (existing) { switchTab(existing.id); return; }
     openModuleInTab(entry.module || "isometric", entry.title, entry.projectId);
   };
-  const persistTabs = (tabs: PdiWorkspaceTab[], id: string | null) => { try { window.localStorage.setItem(PDI_TABS_KEY, JSON.stringify(tabs)); if(id) window.localStorage.setItem(PDI_ACTIVE_TAB_KEY,id); } catch {} };
+  const persistTabs = (tabs: PdiWorkspaceTab[], id: string | null) => { try { window.localStorage.setItem(resolveScopedStorageKey(PDI_TABS_KEY), JSON.stringify(tabs)); if(id) window.localStorage.setItem(resolveScopedStorageKey(PDI_ACTIVE_TAB_KEY),id); } catch {} };
 
   const openModuleInTab = (module: PdiModule, title?: string, projectId?: string) => {
     if (!tryEnterWorkspace(module)) {
       return;
     }
-    const decision = evaluateWorkspaceAccessGuard(verifiedSessionRef.current, module, auth.currentUser);
+    const decision = evaluateWorkspaceAccessGuard(verifiedSessionRef.current, module, getEffectiveAuthUser());
     if (!decision.allowed) return;
     const safeModule = decision.authorizedModule;
     if (safeModule === "home") { setActiveModule("home"); return; }
@@ -868,11 +946,11 @@ export default function PdiUnifiedApp() {
     const projId = `project-${Date.now().toString(36)}`;
     if (params.mode === "sketch") {
       try {
-        window.localStorage.setItem("pdi.sketch.projectName", params.name);
-        window.localStorage.setItem("pdi.sketch.service", params.service);
-        window.localStorage.setItem("pdi.sketch.dn", String(params.dn));
-        window.localStorage.setItem("pdi.sketch.pressureClass", params.pressureClass);
-        window.localStorage.setItem("pdi.sketch.material", params.material);
+        window.localStorage.setItem(resolveScopedStorageKey("pdi.sketch.projectName"), params.name);
+        window.localStorage.setItem(resolveScopedStorageKey("pdi.sketch.service"), params.service);
+        window.localStorage.setItem(resolveScopedStorageKey("pdi.sketch.dn"), String(params.dn));
+        window.localStorage.setItem(resolveScopedStorageKey("pdi.sketch.pressureClass"), params.pressureClass);
+        window.localStorage.setItem(resolveScopedStorageKey("pdi.sketch.material"), params.material);
       } catch {}
       openModuleInTab("sketch", `Croquis · ${params.name}`, projId);
     } else if (params.mode === "blank") {
@@ -960,8 +1038,39 @@ export default function PdiUnifiedApp() {
     return () => window.removeEventListener("pdi:navigate", onNavigate as EventListener);
   }, [handleLogoutToHome, tryEnterWorkspace]);
 
-  // BLOC C1 / C2 & SEC-01-FIX-03-R2 : Surveillance réactive combinant attachSuperAdminTokenMonitor et resolveAuthoritativeWorkspaceSession
+  // BLOC C1 / C2 & SEC-01-FIX-03-R2 & Protection C1 (STAGING-00-B3) :
+  // En mode Sandbox, ne jamais appeler onIdTokenChanged(auth) ni contacter Firebase Production.
   useEffect(() => {
+    if (isStagingSandboxMode()) {
+      seedSandboxDefaultProjectIfEmpty();
+      const prof = getSandboxSyntheticProfile();
+      const isSuper = prof.role === "super_admin";
+      const sandboxRes: WorkspaceSessionResolution = {
+        status: "active",
+        canAccessWorkspace: true,
+        canAccessActivation: false,
+        isSuperAdmin: isSuper,
+        authMode: isSuper ? "super_admin" : "client",
+        profile: prof as unknown as PdiUserProfile,
+      };
+      verifiedSessionRef.current = sandboxRes;
+      setVerifiedSession(sandboxRes);
+      authReadyRef.current = true;
+      setAuthReady(true);
+      setAuthMode(sandboxRes.authMode);
+      setSavedUserProfile({
+        name: prof.name,
+        email: prof.email,
+        role: sandboxRes.authMode,
+        company: prof.company,
+        country: prof.country,
+        plan: prof.accountType.toUpperCase(),
+        emailStatus: "vérifié (sandbox locale)",
+        createdAt: prof.createdAt,
+      });
+      return () => {};
+    }
+
     let resolutionSeq = 0;
 
     return attachSuperAdminTokenMonitor({
@@ -981,7 +1090,7 @@ export default function PdiUnifiedApp() {
               setStage("auth");
               setActiveModule("home");
               try {
-                window.sessionStorage.removeItem(PDI_STAGE_KEY);
+                window.sessionStorage.removeItem(resolveScopedStorageKey(PDI_STAGE_KEY));
                 window.location.hash = "auth";
               } catch {}
             }
@@ -1011,8 +1120,8 @@ export default function PdiUnifiedApp() {
               setAuthMode(res.authMode);
               setSavedUserProfile({ ...res.profile, role: res.authMode });
               try {
-                window.localStorage.setItem(PDI_AUTH_KEY, res.authMode);
-                window.localStorage.setItem("pdi.user.profile.v1", JSON.stringify({ ...res.profile, role: res.authMode }));
+                window.localStorage.setItem(resolveScopedStorageKey(PDI_AUTH_KEY), res.authMode);
+                window.localStorage.setItem(resolveScopedStorageKey("pdi.user.profile.v1"), JSON.stringify({ ...res.profile, role: res.authMode }));
               } catch {}
               setActiveModule((prev) => getAuthorizedView(prev, res.isSuperAdmin, "isometric") as PdiModule);
             } else if (res.status === "pending_activation") {
@@ -1022,7 +1131,7 @@ export default function PdiUnifiedApp() {
                 setStage("auth");
                 setActiveModule("home");
                 try {
-                  window.sessionStorage.removeItem(PDI_STAGE_KEY);
+                  window.sessionStorage.removeItem(resolveScopedStorageKey(PDI_STAGE_KEY));
                   window.location.hash = "auth";
                 } catch {}
               }
@@ -1033,7 +1142,7 @@ export default function PdiUnifiedApp() {
                 setStage("auth");
                 setActiveModule("home");
                 try {
-                  window.sessionStorage.removeItem(PDI_STAGE_KEY);
+                  window.sessionStorage.removeItem(resolveScopedStorageKey(PDI_STAGE_KEY));
                   window.location.hash = "auth";
                 } catch {}
               }
@@ -1062,7 +1171,7 @@ export default function PdiUnifiedApp() {
         setActiveModule((prev) => {
           if (isRestrictedAdminView(prev)) {
             try {
-              window.localStorage.setItem("pdi.activeModule.v1", "isometric");
+              window.localStorage.setItem(resolveScopedStorageKey("pdi.activeModule.v1"), "isometric");
             } catch {}
             return "isometric";
           }
@@ -1077,12 +1186,12 @@ export default function PdiUnifiedApp() {
     if (isRestrictedAdminView(activeModule) && authMode !== "super_admin") {
       setActiveModule("isometric");
       try {
-        window.localStorage.setItem("pdi.activeModule.v1", "isometric");
+        window.localStorage.setItem(resolveScopedStorageKey("pdi.activeModule.v1"), "isometric");
       } catch {}
     }
   }, [activeModule, authMode]);
 
-  useEffect(() => { try { window.localStorage.setItem(PDI_AUTH_KEY, authMode); } catch {} }, [authMode]);
+  useEffect(() => { try { window.localStorage.setItem(resolveScopedStorageKey(PDI_AUTH_KEY), authMode); } catch {} }, [authMode]);
 
   // -------------------------------------------------------------
   // PD&I 018S : Inactivity Session Timeout and Verification Logic
@@ -1122,13 +1231,13 @@ export default function PdiUnifiedApp() {
   }, [stage, handleLogoutToHome]);
   useEffect(() => { 
     try { 
-      window.localStorage.setItem("pdi.activeModule.v1", activeModule);
+      window.localStorage.setItem(resolveScopedStorageKey("pdi.activeModule.v1"), activeModule);
       window.dispatchEvent(
         new CustomEvent("pdi:active-module-changed", {
           detail: { activeModule },
         })
       );
-      if (activeModule && (authMode === "client" || authMode === "super_admin")) {
+      if (!isStagingSandboxMode() && activeModule && (authMode === "client" || authMode === "super_admin")) {
         void recordSubscriberUsage({
           userId: pdiUserProfile.email,
           userEmail: pdiUserProfile.email,
@@ -1152,7 +1261,8 @@ export default function PdiUnifiedApp() {
   const moduleTitle = useMemo(() => navItems.find((x) => x.id === activeModule)?.title || "PD&I", [activeModule]);
 
   const handleAuthSuccess = React.useCallback((profile: PdiUserProfile, isSuper: boolean) => {
-    if (!profile || profile.status !== "active" || !auth.currentUser || auth.currentUser.uid !== profile.uid) {
+    const currentAuth = getEffectiveAuthUser();
+    if (!profile || profile.status !== "active" || !currentAuth || currentAuth.uid !== profile.uid) {
       setAuthMode("guest");
       setAuthPageTab("login");
       setStage("auth");
@@ -1160,7 +1270,7 @@ export default function PdiUnifiedApp() {
     }
 
     // Règle SEC-01-FIX-03 : L'autorité Super Admin vient UNIQUEMENT du claim vérifié (isSuper) + emailVerified
-    const verifiedSuper = isSuper === true && auth.currentUser.emailVerified === true;
+    const verifiedSuper = isSuper === true && currentAuth.emailVerified === true;
     const role: "super_admin" | "client" = verifiedSuper ? "super_admin" : "client";
     const resolvedSession: WorkspaceSessionResolution = {
       status: "active",
@@ -1177,89 +1287,220 @@ export default function PdiUnifiedApp() {
     setAuthReady(true);
     setSavedUserProfile({ ...profile, role });
     try {
-      window.localStorage.setItem("pdi.user.profile.v1", JSON.stringify({ ...profile, role }));
+      window.localStorage.setItem(resolveScopedStorageKey("pdi.user.profile.v1"), JSON.stringify({ ...profile, role }));
     } catch {}
 
-    // Asynchronously sync user to PostgreSQL Cloud SQL in the background
-    void projectsApi.syncUser(profile.name, (profile as any).photoUrl || (profile as any).photoURL).catch((err) => {
-      console.warn("Background user sync to Cloud SQL non-blocking error:", err);
-    });
+    if (!isStagingSandboxMode()) {
+      // Asynchronously sync user to PostgreSQL Cloud SQL in the background
+      void projectsApi.syncUser(profile.name, (profile as any).photoUrl || (profile as any).photoURL).catch((err) => {
+        console.warn("Background user sync to Cloud SQL non-blocking error:", err);
+      });
+    }
 
     tryEnterWorkspace(verifiedSuper ? "super_admin_console" : "home", resolvedSession);
-  }, [tryEnterWorkspace]);
+  }, [getEffectiveAuthUser, tryEnterWorkspace]);
+
+  const handleResetSandboxTestData = React.useCallback(() => {
+    const removedKeys = resetSandboxLocalStorageOnly();
+    seedSandboxDefaultProjectIfEmpty();
+    setWorkspaceTabs([]);
+    setActiveTabId(null);
+    setProjectsRefresh((v) => v + 1);
+    void pdiAlert(
+      `Données de test Sandbox réinitialisées (${removedKeys.length} clé(s) '${SANDBOX_STORAGE_PREFIX}*' purgée(s)). Les clés historiques hors Sandbox sont intégralement préservées.`
+    );
+  }, []);
+
+  const handleSwitchSandboxSyntheticRole = React.useCallback((nextRole: SandboxSyntheticRole) => {
+    if (!isStagingSandboxMode()) return;
+    setSandboxSyntheticRole(nextRole);
+    const prof = getSandboxSyntheticProfile(nextRole);
+    const isSuper = prof.role === "super_admin";
+    const nextSession: WorkspaceSessionResolution = {
+      status: "active",
+      canAccessWorkspace: true,
+      canAccessActivation: false,
+      isSuperAdmin: isSuper,
+      authMode: isSuper ? "super_admin" : "client",
+      profile: prof as unknown as PdiUserProfile,
+    };
+    verifiedSessionRef.current = nextSession;
+    setVerifiedSession(nextSession);
+    setAuthMode(nextSession.authMode);
+    setSavedUserProfile({
+      name: prof.name,
+      email: prof.email,
+      role: nextSession.authMode,
+      company: prof.company,
+      country: prof.country,
+      plan: prof.accountType.toUpperCase(),
+      emailStatus: "vérifié (sandbox locale)",
+      createdAt: prof.createdAt,
+    });
+  }, []);
+
+  // Protection C4 (STAGING-00-B3) : Bandeau permanent non masquable en mode Sandbox
+  const sandboxBannerNode = sandboxActive ? (
+    <div
+      data-testid="pdi-staging-sandbox-banner"
+      role="region"
+      aria-label="Bandeau permanent environnement Sandbox"
+      style={{
+        position: "fixed",
+        top: 0,
+        left: 0,
+        right: 0,
+        zIndex: 99999,
+        background: "linear-gradient(90deg, #451a03 0%, #78350f 50%, #451a03 100%)",
+        borderBottom: "2px solid #f59e0b",
+        color: "#fef3c7",
+        padding: "4px 14px",
+        display: "flex",
+        flexWrap: "wrap",
+        alignItems: "center",
+        justifyContent: "space-between",
+        gap: 10,
+        fontSize: 11,
+        fontFamily: "Inter, ui-sans-serif, system-ui, sans-serif",
+        boxShadow: "0 4px 20px rgba(0,0,0,0.65)",
+      }}
+    >
+      <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 10, fontWeight: 900, letterSpacing: "0.03em" }}>
+        <span style={{ background: "#f59e0b", color: "#09090b", padding: "2px 8px", borderRadius: 4, fontWeight: 900 }}>
+          {SANDBOX_BANNER_LINES[0]}
+        </span>
+        <span style={{ color: "#fde68a" }}>•</span>
+        <span>{SANDBOX_BANNER_LINES[1]}</span>
+        <span style={{ color: "#fde68a" }}>•</span>
+        <span style={{ color: "#fca5a5" }}>{SANDBOX_BANNER_LINES[2]}</span>
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <button
+          type="button"
+          onClick={() => handleSwitchSandboxSyntheticRole(authMode === "super_admin" ? "client" : "super_admin")}
+          style={{
+            background: "rgba(0,0,0,0.45)",
+            border: "1px solid rgba(253, 230, 138, 0.45)",
+            color: "#fef3c7",
+            borderRadius: 6,
+            padding: "2px 8px",
+            fontSize: 10,
+            fontWeight: 800,
+            cursor: "pointer",
+          }}
+          title="Basculer le profil synthétique local (aucun privilège serveur)"
+        >
+          Profil local : {authMode === "super_admin" ? "Simulation UI Admin" : "Client Ingénieur"}
+        </button>
+        <button
+          type="button"
+          data-testid="pdi-sandbox-reset-button"
+          onClick={handleResetSandboxTestData}
+          style={{
+            background: "#991b1b",
+            border: "1px solid #f87171",
+            color: "#ffffff",
+            borderRadius: 6,
+            padding: "2px 10px",
+            fontSize: 10,
+            fontWeight: 900,
+            cursor: "pointer",
+          }}
+          title="Supprimer exclusivement les clés localStorage pdi.sandbox.staging.v1.*"
+        >
+          Réinitialiser données Sandbox
+        </button>
+      </div>
+    </div>
+  ) : null;
 
   // STAGE 1 : PAGE COMMERCIALE (HOME PDI / LANDING)
   if (stage === "landing") {
     return (
-      <HomePdi
-        onEnterModule={(mod) => {
-          const target = (mod && mod !== "home") ? (mod as PdiModule) : "home";
-          if (target !== "home") {
-            openModuleInTab(target);
-          } else {
-            tryEnterWorkspace("home");
-          }
-        }}
-        onNewProject={() => {
-          if (tryEnterWorkspace("home")) {
-            setNewProjectModalOpen(true);
-          }
-        }}
-        onOpenProject={() => {
-          openModuleInTab("projects", "Mes Projets");
-        }}
-        onLoginRequest={(req) => {
-          if (req === "register") {
-            setAuthPageTab("register");
-          } else {
-            setAuthPageTab("login");
-          }
-          setStage("auth");
-          try { window.location.hash = "auth"; } catch {}
-        }}
-        userEmail={pdiUserProfile.email}
-        isLoggedIn={authMode === "client" || authMode === "super_admin"}
-      />
+      <>
+        {sandboxBannerNode}
+        <HomePdi
+          onEnterModule={(mod) => {
+            const target = (mod && mod !== "home") ? (mod as PdiModule) : "home";
+            if (target !== "home") {
+              openModuleInTab(target);
+            } else {
+              tryEnterWorkspace("home");
+            }
+          }}
+          onNewProject={() => {
+            if (tryEnterWorkspace("home")) {
+              setNewProjectModalOpen(true);
+            }
+          }}
+          onOpenProject={() => {
+            openModuleInTab("projects", "Mes Projets");
+          }}
+          onLoginRequest={(req) => {
+            if (req === "register") {
+              setAuthPageTab("register");
+            } else {
+              setAuthPageTab("login");
+            }
+            setStage("auth");
+            try { window.location.hash = "auth"; } catch {}
+          }}
+          userEmail={pdiUserProfile.email}
+          isLoggedIn={authMode === "client" || authMode === "super_admin"}
+        />
+      </>
     );
   }
 
   // STAGE 2 : PAGE CONNEXION / AUTHENTIFICATION
   if (stage === "auth") {
     return (
-      <PdiAuthPage
-        initialTab={authPageTab}
-        onBackToLanding={() => {
-          setStage("landing");
-          try { window.location.hash = "landing"; } catch {}
-        }}
-        onSuccess={handleAuthSuccess}
-      />
+      <>
+        {sandboxBannerNode}
+        <PdiAuthPage
+          initialTab={authPageTab}
+          onBackToLanding={() => {
+            setStage("landing");
+            try { window.location.hash = "landing"; } catch {}
+          }}
+          onSuccess={handleAuthSuccess}
+        />
+      </>
     );
   }
 
   // BLOC C2 : Tant que Firebase Auth et le profil Firestore ne sont pas résolus, afficher l'écran de chargement
   if (!authReady) {
-    return <PdiLoginLoadingOverlay message="Vérification de la session et du profil PD&I..." />;
+    return (
+      <>
+        {sandboxBannerNode}
+        <PdiLoginLoadingOverlay message="Vérification de la session et du profil PD&I..." />
+      </>
+    );
   }
 
   // BLOC C1 : Garde de rendu final (aucun rendu du workspace sans les 5 invariants validés)
-  const renderGuard = evaluateWorkspaceAccessGuard(verifiedSession, activeModule, auth.currentUser);
+  const renderGuard = evaluateWorkspaceAccessGuard(verifiedSession, activeModule, getEffectiveAuthUser());
   if (!renderGuard.allowed) {
     return (
-      <PdiAuthPage
-        initialTab={renderGuard.authPageTab}
-        onBackToLanding={() => {
-          setStage("landing");
-          try { window.location.hash = "landing"; } catch {}
-        }}
-        onSuccess={handleAuthSuccess}
-      />
+      <>
+        {sandboxBannerNode}
+        <PdiAuthPage
+          initialTab={renderGuard.authPageTab}
+          onBackToLanding={() => {
+            setStage("landing");
+            try { window.location.hash = "landing"; } catch {}
+          }}
+          onSuccess={handleAuthSuccess}
+        />
+      </>
     );
   }
 
   // PATCH 017B : editeur ISO protege par un filet de securite.
   if (activeModule === "isometric") return (
     <PdiModuleErrorBoundary>
+      {sandboxBannerNode}
       {/* Vertical Dropup List exactly like the first photo but in dark PDI theme */}
       {isoTabDockOpen && (
         <div
@@ -1591,7 +1832,8 @@ export default function PdiUnifiedApp() {
   );
 
   return (
-    <div className={`pdi-unified-root ${activeModule === "home" ? "is-home-module" : ""} ${sidebarHidden ? "is-sidebar-hidden" : ""}`}>
+    <div className={`pdi-unified-root ${activeModule === "home" ? "is-home-module" : ""} ${sidebarHidden ? "is-sidebar-hidden" : ""}`} style={sandboxActive ? { paddingTop: 32 } : undefined}>
+      {sandboxBannerNode}
       <style>{`
         body:has(.pdi-modal-backdrop) .pdi-tab-dock-iso { display: none !important; }
         .pdi-unified-root{height:100vh;width:100vw;overflow:hidden;background:#000000;color:#F4F4F5;font-family:Inter,ui-sans-serif,system-ui,sans-serif;display:grid;grid-template-columns:96px 1fr;grid-template-rows:72px 40px 1fr}

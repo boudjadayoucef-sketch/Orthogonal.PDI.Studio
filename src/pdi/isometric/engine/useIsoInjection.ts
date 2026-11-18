@@ -20,6 +20,7 @@
  */
 
 import { useEffect, useRef } from "react";
+import { resolveScopedStorageKey } from "../../../lib/stagingSandbox";
 import {
   IsoNode,
   IsoSegment,
@@ -249,13 +250,13 @@ interface StorageReadResult {
   isCorrupt: boolean;
 }
 
-function readAndValidateStorage(storage: Storage | null | undefined): StorageReadResult {
+function readAndValidateStorage(storage: Storage | null | undefined, pendingKey: string): StorageReadResult {
   if (!storage) {
     return { raw: null, payload: null, isCorrupt: false };
   }
   let raw: string | null = null;
   try {
-    raw = storage.getItem(PDI_PENDING_INJECTION_KEY);
+    raw = storage.getItem(pendingKey);
   } catch {
     return { raw: null, payload: null, isCorrupt: false };
   }
@@ -292,13 +293,15 @@ export function consumePendingIsoPayload(): IsoInjectionPayload | null {
   try {
     if (typeof window === "undefined") return null;
 
+    const pendingKey = resolveScopedStorageKey(PDI_PENDING_INJECTION_KEY);
+
     let sessionResult: StorageReadResult = { raw: null, payload: null, isCorrupt: false };
     let localResult: StorageReadResult = { raw: null, payload: null, isCorrupt: false };
 
     // 1. Lecture indépendante de sessionStorage
     try {
       if (window.sessionStorage) {
-        sessionResult = readAndValidateStorage(window.sessionStorage);
+        sessionResult = readAndValidateStorage(window.sessionStorage, pendingKey);
       }
     } catch {
       // sessionStorage inaccessible ou désactivé
@@ -307,7 +310,7 @@ export function consumePendingIsoPayload(): IsoInjectionPayload | null {
     // 2. Lecture indépendante de localStorage
     try {
       if (window.localStorage) {
-        localResult = readAndValidateStorage(window.localStorage);
+        localResult = readAndValidateStorage(window.localStorage, pendingKey);
       }
     } catch {
       // localStorage inaccessible ou désactivé
@@ -316,24 +319,24 @@ export function consumePendingIsoPayload(): IsoInjectionPayload | null {
     // Purge des entrées corrompues identifiées
     if (sessionResult.isCorrupt) {
       try {
-        window.sessionStorage?.removeItem(PDI_PENDING_INJECTION_KEY);
+        window.sessionStorage?.removeItem(pendingKey);
       } catch {}
     }
     if (localResult.isCorrupt) {
       try {
-        window.localStorage?.removeItem(PDI_PENDING_INJECTION_KEY);
+        window.localStorage?.removeItem(pendingKey);
       } catch {}
     }
 
     // 3. Arbitrage avec priorité stricte : sessionStorage > localStorage
     if (sessionResult.payload) {
       try {
-        window.sessionStorage?.removeItem(PDI_PENDING_INJECTION_KEY);
+        window.sessionStorage?.removeItem(pendingKey);
       } catch {}
       // Si localStorage contenait un résidu, le purger également
       if (localResult.raw) {
         try {
-          window.localStorage?.removeItem(PDI_PENDING_INJECTION_KEY);
+          window.localStorage?.removeItem(pendingKey);
         } catch {}
       }
       return sessionResult.payload;
@@ -341,7 +344,7 @@ export function consumePendingIsoPayload(): IsoInjectionPayload | null {
 
     if (localResult.payload) {
       try {
-        window.localStorage?.removeItem(PDI_PENDING_INJECTION_KEY);
+        window.localStorage?.removeItem(pendingKey);
       } catch {}
       return localResult.payload;
     }
@@ -419,11 +422,12 @@ export function useIsoInjection({ onCommit }: UseIsoInjectionOptions): void {
       if (customEv.detail && customEv.detail.data) {
         // Nettoyage synchrone de tout résidu éventuel dans le stockage
         try {
-          if (typeof window !== "undefined") {
-            window.sessionStorage.removeItem(PDI_PENDING_INJECTION_KEY);
-            window.localStorage.removeItem(PDI_PENDING_INJECTION_KEY);
-          }
-        } catch {}
+        if (typeof window !== "undefined") {
+          const pendingKey = resolveScopedStorageKey(PDI_PENDING_INJECTION_KEY);
+          window.sessionStorage.removeItem(pendingKey);
+          window.localStorage.removeItem(pendingKey);
+        }
+      } catch {}
 
         const rawData = customEv.detail.data;
         const resolvedTransferId =
@@ -446,7 +450,7 @@ export function useIsoInjection({ onCommit }: UseIsoInjectionOptions): void {
         const customEv = e as CustomEvent<{ activeModule?: string; transferId?: string }>;
         const activeModule =
           customEv.detail?.activeModule ||
-          window.localStorage.getItem(PDI_ACTIVE_MODULE_KEY);
+          window.localStorage.getItem(resolveScopedStorageKey(PDI_ACTIVE_MODULE_KEY));
 
         // N'intervenir que si le module actif est "isometric"
         if (activeModule !== "isometric") {

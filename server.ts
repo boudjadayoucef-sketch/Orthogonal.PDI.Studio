@@ -11,7 +11,13 @@ import path from "path";
 // PATCH 017G : inspection reelle du dossier dist/assets.
 import fs from "fs";
 import { createServer as createViteServer } from "vite";
-import { requireAuth, requireSuperAdmin, requireEmailVerified, AuthRequest } from "./src/middleware/auth.ts";
+import {
+  requireAuth,
+  requireSuperAdmin,
+  requireEmailVerified,
+  rejectInStagingSandboxMode,
+  AuthRequest,
+} from "./src/middleware/auth.ts";
 import { adminAuth, adminDb } from "./src/lib/firebase-admin.ts";
 import { 
   createBoundedRateLimiter,
@@ -40,10 +46,10 @@ import {
 import { getOrCreateUser } from "./src/db/users.ts";
 
 
-// Validation sûre de la configuration au démarrage (Section D2)
+// Validation sûre de la configuration au démarrage (Section D2 & Protection C5 STAGING-00-B3)
 const configValidation = verifyProductionConfig();
 if (!configValidation.isSafe) {
-  if (process.env.NODE_ENV === "production") {
+  if (process.env.NODE_ENV === "production" || configValidation.hasFatalSandboxConfigError) {
     console.error(configValidation.errorMessage);
     process.exit(1);
   } else {
@@ -134,8 +140,8 @@ const handleHealthCheck = (_req: express.Request, res: express.Response) => {
 app.get("/api/health", handleHealthCheck);
 app.get("/healthz", handleHealthCheck);
 
-// Cloud SQL User Sync & Projects Endpoints
-app.post("/api/auth/sync-user", requireAuth, async (req: AuthRequest, res) => {
+// Cloud SQL User Sync & Projects Endpoints (Protected by C2 rejectInStagingSandboxMode)
+app.post("/api/auth/sync-user", rejectInStagingSandboxMode, requireAuth, async (req: AuthRequest, res) => {
   try {
     const uid = req.user?.uid;
     const email = req.user?.email || "unknown@domain.com";
@@ -154,8 +160,8 @@ app.post("/api/auth/sync-user", requireAuth, async (req: AuthRequest, res) => {
   }
 });
 
-// Admin: Assign Custom Claims (Role) securely via Firebase Admin SDK (Section A3)
-app.post("/api/admin/set-user-role", requireAuth, requireSuperAdmin, requireEmailVerified, async (req: AuthRequest, res) => {
+// Admin: Assign Custom Claims (Role) securely via Firebase Admin SDK (Section A3 & Protection C2)
+app.post("/api/admin/set-user-role", rejectInStagingSandboxMode, requireAuth, requireSuperAdmin, requireEmailVerified, async (req: AuthRequest, res) => {
   try {
     const { targetUid, role } = req.body;
     if (!targetUid || typeof targetUid !== "string" || targetUid.trim().length === 0 || targetUid.length > 128) {
@@ -195,7 +201,7 @@ app.post("/api/admin/set-user-role", requireAuth, requireSuperAdmin, requireEmai
 });
 
 // ==========================================
-// Slick-Pay & Paddle Webhook IPN & Pending Order Endpoints (SEC-01-FIX-05-B)
+// Slick-Pay & Paddle Webhook IPN & Pending Order Endpoints (SEC-01-FIX-05-B & Protection C2)
 // ==========================================
 const pendingOrderRepository = createPendingOrderRepository({
   adminDb
@@ -215,24 +221,26 @@ const paymentWebhookProcessor = createPaymentWebhookProcessor({
 // Authoritative Pending Order Creation (Server-side UID & unguessable orderId)
 app.post(
   "/api/payments/orders",
+  rejectInStagingSandboxMode,
   ...createPendingOrderRoute({
     pendingOrderRepository
   })
 );
 
 // Slick-Pay Webhook (Algeria - BaridiMob / Edahabia) — Strict Fail-Closed
-app.post("/api/webhooks/slickpay", createSlickPayWebhookHandler());
+app.post("/api/webhooks/slickpay", rejectInStagingSandboxMode, createSlickPayWebhookHandler());
 
 // Paddle Webhook (International EUR/USD) — Strict Isolated RawBody Parser (256kb) & Order Association (SEC-01-FIX-07-R1 D2.2)
 app.post(
   "/api/webhooks/paddle",
+  rejectInStagingSandboxMode,
   createPaddleWebhookBodyParser(),
   createPaddleWebhookHandler({
     processor: paymentWebhookProcessor
   })
 );
 
-app.get("/api/projects", requireAuth, async (req: AuthRequest, res) => {
+app.get("/api/projects", rejectInStagingSandboxMode, requireAuth, async (req: AuthRequest, res) => {
   try {
     const uid = req.user?.uid;
     if (!uid) return res.status(401).json({ error: "Unauthorized" });
@@ -244,7 +252,7 @@ app.get("/api/projects", requireAuth, async (req: AuthRequest, res) => {
   }
 });
 
-app.post("/api/projects", requireAuth, async (req: AuthRequest, res) => {
+app.post("/api/projects", rejectInStagingSandboxMode, requireAuth, async (req: AuthRequest, res) => {
   try {
     const uid = req.user?.uid;
     if (!uid) return res.status(401).json({ error: "Unauthorized" });
@@ -256,7 +264,7 @@ app.post("/api/projects", requireAuth, async (req: AuthRequest, res) => {
   }
 });
 
-app.delete("/api/projects/:id", requireAuth, async (req: AuthRequest, res) => {
+app.delete("/api/projects/:id", rejectInStagingSandboxMode, requireAuth, async (req: AuthRequest, res) => {
   try {
     const uid = req.user?.uid;
     const projectId = Number(req.params.id);
