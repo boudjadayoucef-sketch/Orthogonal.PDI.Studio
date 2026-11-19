@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from 'express';
-import { adminAuth } from '../lib/firebase-admin.ts';
+import { getServerAdminAuth } from '../lib/firebase-admin.ts';
 import { DecodedIdToken } from 'firebase-admin/auth';
 import {
   isStagingSandboxMode,
@@ -12,7 +12,7 @@ export interface AuthRequest extends Request {
 }
 
 /**
- * Protection C2 (STAGING-00-B3):
+ * Protection C2 (STAGING-00-B3 / STAGING-00-B3-R1):
  * Refuses administrative, payment, webhook, and server database routes when Sandbox mode is active.
  */
 export const rejectInStagingSandboxMode = (
@@ -66,8 +66,16 @@ export const requireAuth = async (
     });
   }
 
+  // STAGING-00-B3-R1 (Partie B): In Sandbox mode, Firebase Admin authentication is disabled on the server
+  if (isStagingSandboxMode(process.env)) {
+    return res.status(403).json({
+      error: 'Forbidden: Firebase Admin authentication is disabled in Sandbox mode.',
+      code: 'sandbox/server-auth-disabled',
+    });
+  }
+
   try {
-    const decodedToken = await adminAuth.verifyIdToken(token);
+    const decodedToken = await getServerAdminAuth().verifyIdToken(token);
     if (
       isSyntheticSandboxUid(decodedToken?.uid) ||
       (decodedToken as Record<string, unknown>)?.sandbox_synthetic === true

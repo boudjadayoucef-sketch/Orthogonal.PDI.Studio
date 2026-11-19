@@ -1,6 +1,7 @@
 import { initializeApp, getApps, getApp } from 'firebase-admin/app';
 import { getAuth } from 'firebase-admin/auth';
 import { Firestore } from '@google-cloud/firestore';
+import { isStagingSandboxMode, resolvePdiEnvironmentMode } from './stagingSandbox.ts';
 
 export const EXPECTED_SERVER_PROJECT_ID = 'graphical-router-x18qq';
 export const EXPECTED_SERVER_DATABASE_ID =
@@ -11,6 +12,42 @@ const SERVER_PROJECT_ENV_KEYS = [
   'GOOGLE_CLOUD_PROJECT',
   'GCLOUD_PROJECT'
 ] as const;
+
+export const SANDBOX_SERVER_FIREBASE_FORBIDDEN_ERROR =
+  'Coupe-circuit Sandbox Serveur (C1/C2) : Firebase Admin et Firestore Serveur sont strictement désactivés en mode Sandbox. Aucune connexion à Firebase Production n’est autorisée.';
+
+function shouldBlockServerFirebaseInit(env?: Record<string, unknown>): boolean {
+  if (isStagingSandboxMode(env)) {
+    return true;
+  }
+  const resolution = resolvePdiEnvironmentMode(env);
+  return !resolution.isValid || resolution.isSandbox;
+}
+
+function createSandboxDisabledServerProxy<T extends object>(serviceName: string): T {
+  const throwForbidden = (): never => {
+    throw new Error(`${SANDBOX_SERVER_FIREBASE_FORBIDDEN_ERROR} [Service refusé : ${serviceName}]`);
+  };
+
+  return new Proxy(Object.create(null), {
+    get(_target, prop) {
+      if (prop === '__sandboxDisabled') return true;
+      if (prop === 'then') return undefined;
+      if (prop === Symbol.toStringTag) return `SandboxDisabled(${serviceName})`;
+      throwForbidden();
+    },
+    set() {
+      return throwForbidden();
+    },
+    apply() {
+      return throwForbidden();
+    },
+    has(_target, prop) {
+      if (prop === '__sandboxDisabled') return true;
+      return throwForbidden();
+    }
+  }) as unknown as T;
+}
 
 /**
  * FIRESTORE-NAMED-DB-01-FIX-01 & FIX-02 :
@@ -76,6 +113,12 @@ export function resolveServerFirestoreConfig(
     : {},
   options?: { requireExplicitEnv?: boolean }
 ): { projectId: string; databaseId: string } {
+  if (shouldBlockServerFirebaseInit(env)) {
+    throw new Error(
+      `${SANDBOX_SERVER_FIREBASE_FORBIDDEN_ERROR} [resolveServerFirestoreConfig interdit en mode Sandbox]`
+    );
+  }
+
   const sourceEnv = env && typeof env === 'object' ? env : {};
   const requireExplicit = Boolean(options?.requireExplicitEnv);
 
@@ -172,8 +215,15 @@ export function getOrInitializeServerFirebaseApp(
     getApps?: typeof getApps;
     getApp?: typeof getApp;
     initializeApp?: typeof initializeApp;
-  }
+  },
+  env?: Record<string, unknown>
 ): ReturnType<typeof initializeApp> {
+  if (shouldBlockServerFirebaseInit(env)) {
+    throw new Error(
+      `${SANDBOX_SERVER_FIREBASE_FORBIDDEN_ERROR} [getOrInitializeServerFirebaseApp / initializeApp interdit en mode Sandbox]`
+    );
+  }
+
   const expectedProjectId = validateServerProjectId(
     config && Object.prototype.hasOwnProperty.call(config, 'projectId')
       ? config.projectId
@@ -220,8 +270,14 @@ export function getOrInitializeServerFirebaseApp(
 export function createServerAdminAuth(
   appInstance: any,
   expectedProjectId: unknown = EXPECTED_SERVER_PROJECT_ID,
-  authFactory: typeof getAuth = getAuth
+  authFactory: typeof getAuth = getAuth,
+  env?: Record<string, unknown>
 ): ReturnType<typeof getAuth> {
+  if (shouldBlockServerFirebaseInit(env)) {
+    throw new Error(
+      `${SANDBOX_SERVER_FIREBASE_FORBIDDEN_ERROR} [createServerAdminAuth / getAuth interdit en mode Sandbox]`
+    );
+  }
   validateServerFirebaseAppProjectId(appInstance, expectedProjectId);
   return authFactory(appInstance);
 }
@@ -396,8 +452,16 @@ export function assertValidServerFirestoreInstance(
  */
 export function createServerFirestoreClient(
   config?: { projectId?: unknown; databaseId?: unknown },
-  adminAppInstance?: any
+  adminAppInstance?: any,
+  firestoreFactory?: (settings: { projectId: string; databaseId: string }) => Firestore,
+  env?: Record<string, unknown>
 ): Firestore {
+  if (shouldBlockServerFirebaseInit(env)) {
+    throw new Error(
+      `${SANDBOX_SERVER_FIREBASE_FORBIDDEN_ERROR} [createServerFirestoreClient / Firestore interdit en mode Sandbox]`
+    );
+  }
+
   const validatedProjectId = validateServerProjectId(
     config && Object.prototype.hasOwnProperty.call(config, 'projectId')
       ? config.projectId
@@ -413,10 +477,15 @@ export function createServerFirestoreClient(
     validateServerFirebaseAppProjectId(adminAppInstance, validatedProjectId);
   }
 
-  const firestoreClient = new Firestore({
-    projectId: validatedProjectId,
-    databaseId: validatedDatabaseId
-  });
+  const firestoreClient = firestoreFactory
+    ? firestoreFactory({
+        projectId: validatedProjectId,
+        databaseId: validatedDatabaseId
+      })
+    : new Firestore({
+        projectId: validatedProjectId,
+        databaseId: validatedDatabaseId
+      });
 
   assertValidServerFirestoreInstance(
     firestoreClient,
@@ -430,9 +499,97 @@ export function createServerFirestoreClient(
   return firestoreClient;
 }
 
-const serverFirestoreConfig = resolveServerFirestoreConfig();
-const app = getOrInitializeServerFirebaseApp(serverFirestoreConfig);
+export interface ServerFirebaseAdminRuntime {
+  sandboxDisabled: boolean;
+  config: { projectId: string; databaseId: string } | null;
+  adminApp: ReturnType<typeof initializeApp>;
+  adminAuth: ReturnType<typeof getAuth>;
+  adminDb: Firestore;
+}
 
-export const adminApp = app;
-export const adminAuth = createServerAdminAuth(app, serverFirestoreConfig.projectId);
-export const adminDb = createServerFirestoreClient(serverFirestoreConfig, app);
+/**
+ * STAGING-00-B3-R1 (Partie B) :
+ * Initialise conditionnellement Firebase Admin et Firestore côté serveur.
+ * - En mode Sandbox (`isStagingSandboxMode(env) === true`) :
+ *   1. Aucune résolution de configuration Firebase Production.
+ *   2. Aucun appel à `initializeApp` (Firebase Admin).
+ *   3. Aucun appel à `getAuth` (Firebase Admin Auth).
+ *   4. Aucune instanciation de `Firestore` (`@google-cloud/firestore`).
+ *   5. Retourne des proxies fail-closed qui refusent immédiatement tout accès accidentel en Sandbox.
+ * - Hors mode Sandbox :
+ *   Exécute l'initialisation nominale complète avec validation stricte du projet et de la base Firestore nommée.
+ */
+export function initializeServerFirebaseAdminRuntime(
+  env: Record<string, string | undefined> = typeof process !== 'undefined' && process.env
+    ? process.env
+    : {},
+  sdk?: {
+    getApps?: typeof getApps;
+    getApp?: typeof getApp;
+    initializeApp?: typeof initializeApp;
+    getAuth?: typeof getAuth;
+    createFirestore?: (settings: { projectId: string; databaseId: string }) => Firestore;
+  }
+): ServerFirebaseAdminRuntime {
+  if (shouldBlockServerFirebaseInit(env)) {
+    return {
+      sandboxDisabled: true,
+      config: null,
+      adminApp: createSandboxDisabledServerProxy<ReturnType<typeof initializeApp>>('adminApp'),
+      adminAuth: createSandboxDisabledServerProxy<ReturnType<typeof getAuth>>('adminAuth'),
+      adminDb: createSandboxDisabledServerProxy<Firestore>('adminDb')
+    };
+  }
+
+  const serverFirestoreConfig = resolveServerFirestoreConfig(env);
+  const appInstance = getOrInitializeServerFirebaseApp(serverFirestoreConfig, sdk, env);
+  const authInstance = createServerAdminAuth(
+    appInstance,
+    serverFirestoreConfig.projectId,
+    sdk?.getAuth ?? getAuth,
+    env
+  );
+  const dbInstance = createServerFirestoreClient(
+    serverFirestoreConfig,
+    appInstance,
+    sdk?.createFirestore,
+    env
+  );
+
+  return {
+    sandboxDisabled: false,
+    config: serverFirestoreConfig,
+    adminApp: appInstance,
+    adminAuth: authInstance,
+    adminDb: dbInstance
+  };
+}
+
+const activeServerFirebaseRuntime = initializeServerFirebaseAdminRuntime();
+
+export const isServerFirebaseSandboxDisabled = activeServerFirebaseRuntime.sandboxDisabled;
+export const adminApp = activeServerFirebaseRuntime.adminApp;
+export const adminAuth = activeServerFirebaseRuntime.adminAuth;
+export const adminDb = activeServerFirebaseRuntime.adminDb;
+
+export function getServerAdminApp(env?: Record<string, unknown>): ReturnType<typeof initializeApp> {
+  if (shouldBlockServerFirebaseInit(env) || activeServerFirebaseRuntime.sandboxDisabled) {
+    throw new Error(`${SANDBOX_SERVER_FIREBASE_FORBIDDEN_ERROR} [Accès à adminApp refusé]`);
+  }
+  return adminApp;
+}
+
+export function getServerAdminAuth(env?: Record<string, unknown>): ReturnType<typeof getAuth> {
+  if (shouldBlockServerFirebaseInit(env) || activeServerFirebaseRuntime.sandboxDisabled) {
+    throw new Error(`${SANDBOX_SERVER_FIREBASE_FORBIDDEN_ERROR} [Accès à adminAuth refusé]`);
+  }
+  return adminAuth;
+}
+
+export function getServerAdminDb(env?: Record<string, unknown>): Firestore {
+  if (shouldBlockServerFirebaseInit(env) || activeServerFirebaseRuntime.sandboxDisabled) {
+    throw new Error(`${SANDBOX_SERVER_FIREBASE_FORBIDDEN_ERROR} [Accès à adminDb refusé]`);
+  }
+  return adminDb;
+}
+

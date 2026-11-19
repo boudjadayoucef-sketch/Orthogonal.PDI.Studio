@@ -18,7 +18,8 @@ import {
   rejectInStagingSandboxMode,
   AuthRequest,
 } from "./src/middleware/auth.ts";
-import { adminAuth, adminDb } from "./src/lib/firebase-admin.ts";
+import { getServerAdminAuth, getServerAdminDb } from "./src/lib/firebase-admin.ts";
+import { isStagingSandboxMode } from "./src/lib/stagingSandbox.ts";
 import { 
   createBoundedRateLimiter,
   verifyProductionConfig,
@@ -182,7 +183,7 @@ app.post("/api/admin/set-user-role", rejectInStagingSandboxMode, requireAuth, re
       return res.status(400).json({ error: "Un super-administrateur ne peut pas rétrograder son propre compte via cette route." });
     }
 
-    await adminAuth.setCustomUserClaims(targetUid, { role });
+    await getServerAdminAuth().setCustomUserClaims(targetUid, { role });
     console.log(`[Admin] Custom Claim 'role: ${role}' assigned to UID: ${targetUid} by verified super_admin UID: ${req.user?.uid}`);
     
     res.json({ 
@@ -201,44 +202,54 @@ app.post("/api/admin/set-user-role", rejectInStagingSandboxMode, requireAuth, re
 });
 
 // ==========================================
-// Slick-Pay & Paddle Webhook IPN & Pending Order Endpoints (SEC-01-FIX-05-B & Protection C2)
+// Slick-Pay & Paddle Webhook IPN & Pending Order Endpoints (SEC-01-FIX-05-B & Protection C2 STAGING-00-B3-R1)
 // ==========================================
-const pendingOrderRepository = createPendingOrderRepository({
-  adminDb
-});
+if (isStagingSandboxMode(process.env)) {
+  // STAGING-00-B3-R1 (Partie B): In Sandbox mode, do NOT instantiate Firebase-backed repositories or processors.
+  app.post("/api/payments/orders", rejectInStagingSandboxMode);
+  app.post("/api/webhooks/slickpay", rejectInStagingSandboxMode);
+  app.post("/api/webhooks/paddle", rejectInStagingSandboxMode);
+} else {
+  const activeAdminDb = getServerAdminDb();
+  const activeAdminAuth = getServerAdminAuth();
 
-const webhookIdempotencyRepository = createWebhookIdempotencyRepository({
-  adminDb
-});
+  const pendingOrderRepository = createPendingOrderRepository({
+    adminDb: activeAdminDb
+  });
 
-const paymentWebhookProcessor = createPaymentWebhookProcessor({
-  adminDb,
-  adminAuth,
-  idempotencyRepository: webhookIdempotencyRepository,
-  pendingOrderRepository
-});
+  const webhookIdempotencyRepository = createWebhookIdempotencyRepository({
+    adminDb: activeAdminDb
+  });
 
-// Authoritative Pending Order Creation (Server-side UID & unguessable orderId)
-app.post(
-  "/api/payments/orders",
-  rejectInStagingSandboxMode,
-  ...createPendingOrderRoute({
+  const paymentWebhookProcessor = createPaymentWebhookProcessor({
+    adminDb: activeAdminDb,
+    adminAuth: activeAdminAuth,
+    idempotencyRepository: webhookIdempotencyRepository,
     pendingOrderRepository
-  })
-);
+  });
 
-// Slick-Pay Webhook (Algeria - BaridiMob / Edahabia) — Strict Fail-Closed
-app.post("/api/webhooks/slickpay", rejectInStagingSandboxMode, createSlickPayWebhookHandler());
+  // Authoritative Pending Order Creation (Server-side UID & unguessable orderId)
+  app.post(
+    "/api/payments/orders",
+    rejectInStagingSandboxMode,
+    ...createPendingOrderRoute({
+      pendingOrderRepository
+    })
+  );
 
-// Paddle Webhook (International EUR/USD) — Strict Isolated RawBody Parser (256kb) & Order Association (SEC-01-FIX-07-R1 D2.2)
-app.post(
-  "/api/webhooks/paddle",
-  rejectInStagingSandboxMode,
-  createPaddleWebhookBodyParser(),
-  createPaddleWebhookHandler({
-    processor: paymentWebhookProcessor
-  })
-);
+  // Slick-Pay Webhook (Algeria - BaridiMob / Edahabia) — Strict Fail-Closed
+  app.post("/api/webhooks/slickpay", rejectInStagingSandboxMode, createSlickPayWebhookHandler());
+
+  // Paddle Webhook (International EUR/USD) — Strict Isolated RawBody Parser (256kb) & Order Association (SEC-01-FIX-07-R1 D2.2)
+  app.post(
+    "/api/webhooks/paddle",
+    rejectInStagingSandboxMode,
+    createPaddleWebhookBodyParser(),
+    createPaddleWebhookHandler({
+      processor: paymentWebhookProcessor
+    })
+  );
+}
 
 app.get("/api/projects", rejectInStagingSandboxMode, requireAuth, async (req: AuthRequest, res) => {
   try {

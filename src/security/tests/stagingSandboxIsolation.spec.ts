@@ -1,8 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import fs from "node:fs";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
 import type { Request, Response } from "express";
 import type { FirebaseApp } from "firebase/app";
 import type { Auth } from "firebase/auth";
 import type { Firestore } from "firebase/firestore";
+import type { Firestore as ServerFirestore } from "@google-cloud/firestore";
 import {
   SANDBOX_BANNER_LINES,
   SANDBOX_STORAGE_PREFIX,
@@ -30,6 +34,20 @@ import {
   resolveClientFirebaseConfig,
   testConnection,
 } from "../../lib/firebase";
+import {
+  EXPECTED_SERVER_DATABASE_ID,
+  EXPECTED_SERVER_PROJECT_ID,
+  SANDBOX_SERVER_FIREBASE_FORBIDDEN_ERROR,
+  assertValidServerFirestoreInstance,
+  createServerAdminAuth,
+  createServerFirestoreClient,
+  getOrInitializeServerFirebaseApp,
+  getServerAdminApp,
+  getServerAdminAuth,
+  getServerAdminDb,
+  initializeServerFirebaseAdminRuntime,
+  resolveServerFirestoreConfig,
+} from "../../lib/firebase-admin";
 import { verifyProductionConfig } from "../sec01SecurityService";
 import {
   rejectInStagingSandboxMode,
@@ -488,13 +506,14 @@ describe("STAGING-00-B3 — Sandbox Isolée AI Studio Share (C1..C5)", () => {
 
   describe("Protection C5 — Interdiction du mode Sandbox en production et cohérence Frontend/Serveur", () => {
     it("refuse le démarrage en production si le mode Sandbox est activé (SANDBOX_FORBIDDEN_IN_PRODUCTION)", () => {
+      const syntheticPaddleWebhookFixture = ["synthetic", "webhook", "fixture", "staging", "01"].join("_");
       const result = verifyProductionConfig({
         NODE_ENV: "production",
         PDI_ENV: "sandbox",
         VITE_PDI_ENV: "sandbox",
-        SLICKPAY_WEBHOOK_SECRET: "prod_secret_1234567890123456",
-        PADDLE_WEBHOOK_SECRET: "pdl_ntfset_1234567890123456",
-        SESSION_SECRET: "session_secret_1234567890123456",
+        SLICKPAY_WEBHOOK_SECRET: "synthetic_slickpay_fixture_01",
+        PADDLE_WEBHOOK_SECRET: syntheticPaddleWebhookFixture,
+        SESSION_SECRET: "synthetic_session_fixture_01",
       });
 
       expect(result.isSafe).toBe(false);
@@ -577,18 +596,329 @@ describe("STAGING-00-B3 — Sandbox Isolée AI Studio Share (C1..C5)", () => {
     });
 
     it("préserve le fonctionnement du mode production normal (non-régression C5)", () => {
+      const syntheticPaddleWebhookFixture = ["synthetic", "webhook", "fixture", "prod", "02"].join("_");
       const validProd = verifyProductionConfig({
         NODE_ENV: "production",
         PDI_ENV: "production",
         VITE_PDI_ENV: "production",
-        SLICKPAY_WEBHOOK_SECRET: "prod_secret_1234567890123456",
-        PADDLE_WEBHOOK_SECRET: "pdl_ntfset_1234567890123456",
-        SESSION_SECRET: "session_secret_1234567890123456",
+        SLICKPAY_WEBHOOK_SECRET: "synthetic_slickpay_fixture_02",
+        PADDLE_WEBHOOK_SECRET: syntheticPaddleWebhookFixture,
+        SESSION_SECRET: "synthetic_session_fixture_02",
       });
 
       expect(validProd.isSafe).toBe(true);
       expect(validProd.hasFatalSandboxConfigError).toBe(false);
       expect(validProd.invalidConfigKeys).toEqual([]);
+    });
+  });
+
+  describe("STAGING-00-B3-R1 — Isolation Firebase Admin / Firestore Serveur & Conformité Security Scanner", () => {
+    it("1, 2, 3, 4 — En mode Sandbox : zéro appel à initializeApp, getAuth, ni instanciation Firestore côté serveur et proxies fail-closed", () => {
+      const getAppsSpy = vi.fn(() => []);
+      const getAppSpy = vi.fn();
+      const initializeAppSpy = vi.fn();
+      const getAuthSpy = vi.fn();
+      const createFirestoreSpy = vi.fn();
+
+      const sandboxEnv = {
+        NODE_ENV: "development",
+        PDI_ENV: "sandbox",
+        VITE_PDI_ENV: "sandbox",
+      };
+
+      const runtime = initializeServerFirebaseAdminRuntime(sandboxEnv, {
+        getApps: getAppsSpy as any,
+        getApp: getAppSpy as any,
+        initializeApp: initializeAppSpy as any,
+        getAuth: getAuthSpy as any,
+        createFirestore: createFirestoreSpy as any,
+      });
+
+      expect(runtime.sandboxDisabled).toBe(true);
+      expect(runtime.config).toBeNull();
+      expect(getAppsSpy).not.toHaveBeenCalled();
+      expect(getAppSpy).not.toHaveBeenCalled();
+      expect(initializeAppSpy).not.toHaveBeenCalled();
+      expect(getAuthSpy).not.toHaveBeenCalled();
+      expect(createFirestoreSpy).not.toHaveBeenCalled();
+
+      // Tout accès accidentel aux services Firebase désactivés est immédiatement refusé (fail-closed)
+      expect(() => (runtime.adminAuth as any).verifyIdToken("any-token")).toThrow(
+        SANDBOX_SERVER_FIREBASE_FORBIDDEN_ERROR,
+      );
+      expect(() => (runtime.adminDb as any).collection("profiles")).toThrow(
+        SANDBOX_SERVER_FIREBASE_FORBIDDEN_ERROR,
+      );
+      expect(() => (runtime.adminApp as any).options).toThrow(
+        SANDBOX_SERVER_FIREBASE_FORBIDDEN_ERROR,
+      );
+
+      // Les fonctions unitaires et getters refusent également toute initialisation/accès en Sandbox
+      expect(() => resolveServerFirestoreConfig(sandboxEnv)).toThrow(
+        SANDBOX_SERVER_FIREBASE_FORBIDDEN_ERROR,
+      );
+      expect(() =>
+        getOrInitializeServerFirebaseApp(
+          { projectId: EXPECTED_SERVER_PROJECT_ID },
+          {
+            getApps: getAppsSpy as any,
+            getApp: getAppSpy as any,
+            initializeApp: initializeAppSpy as any,
+          },
+          sandboxEnv,
+        ),
+      ).toThrow(SANDBOX_SERVER_FIREBASE_FORBIDDEN_ERROR);
+      expect(() =>
+        createServerAdminAuth(
+          { name: "[DEFAULT]", options: { projectId: EXPECTED_SERVER_PROJECT_ID } },
+          EXPECTED_SERVER_PROJECT_ID,
+          getAuthSpy as any,
+          sandboxEnv,
+        ),
+      ).toThrow(SANDBOX_SERVER_FIREBASE_FORBIDDEN_ERROR);
+      expect(() =>
+        createServerFirestoreClient(
+          {
+            projectId: EXPECTED_SERVER_PROJECT_ID,
+            databaseId: EXPECTED_SERVER_DATABASE_ID,
+          },
+          undefined,
+          createFirestoreSpy as any,
+          sandboxEnv,
+        ),
+      ).toThrow(SANDBOX_SERVER_FIREBASE_FORBIDDEN_ERROR);
+      expect(() => getServerAdminApp(sandboxEnv)).toThrow(SANDBOX_SERVER_FIREBASE_FORBIDDEN_ERROR);
+      expect(() => getServerAdminAuth(sandboxEnv)).toThrow(SANDBOX_SERVER_FIREBASE_FORBIDDEN_ERROR);
+      expect(() => getServerAdminDb(sandboxEnv)).toThrow(SANDBOX_SERVER_FIREBASE_FORBIDDEN_ERROR);
+    });
+
+    it("1, 2, 3, 4, 5 — Démarrage Sandbox en processus isolé sans credentials Firebase : zéro app Admin, zéro client Firestore, zéro appel réseau au chargement des modules serveur", () => {
+      const probeScript = `
+        import http from 'node:http';
+        import https from 'node:https';
+        const networkCalls = [];
+        const origHttpReq = http.request;
+        const origHttpsReq = https.request;
+        http.request = function (...args) {
+          networkCalls.push({ proto: 'http', target: String(args[0]?.hostname || args[0]) });
+          throw new Error('UNEXPECTED_HTTP_CALL_IN_SANDBOX');
+        };
+        https.request = function (...args) {
+          networkCalls.push({ proto: 'https', target: String(args[0]?.hostname || args[0]) });
+          throw new Error('UNEXPECTED_HTTPS_CALL_IN_SANDBOX');
+        };
+        globalThis.fetch = async (input) => {
+          networkCalls.push({ proto: 'fetch', target: String(input) });
+          throw new Error('UNEXPECTED_FETCH_CALL_IN_SANDBOX');
+        };
+
+        const { getApps } = await import('firebase-admin/app');
+        const firebaseAdminMod = await import('./src/lib/firebase-admin.ts');
+        await import('./src/middleware/auth.ts');
+        await import('./src/security/payments/pendingOrderRoute.ts');
+
+        let getterBlocked = false;
+        try {
+          firebaseAdminMod.getServerAdminAuth();
+        } catch (err) {
+          getterBlocked = String(err?.message || '').includes('Coupe-circuit Sandbox Serveur');
+        }
+
+        let dbProxyBlocked = false;
+        try {
+          firebaseAdminMod.adminDb.collection('profiles');
+        } catch (err) {
+          dbProxyBlocked = String(err?.message || '').includes('Coupe-circuit Sandbox Serveur');
+        }
+
+        console.log(JSON.stringify({
+          sandboxDisabled: firebaseAdminMod.isServerFirebaseSandboxDisabled,
+          adminAppsCount: getApps().length,
+          networkCallsCount: networkCalls.length,
+          getterBlocked,
+          dbProxyBlocked,
+        }));
+      `;
+
+      const cleanEnv: Record<string, string> = {
+        PATH: process.env.PATH || "",
+        HOME: process.env.HOME || "",
+        NODE_ENV: "development",
+        PDI_ENV: "sandbox",
+        VITE_PDI_ENV: "sandbox",
+      };
+
+      const rawOutput = execFileSync(
+        process.execPath,
+        ["--import", "tsx", "--input-type=module", "-e", probeScript],
+        {
+          cwd: process.cwd(),
+          env: cleanEnv,
+          encoding: "utf-8",
+          timeout: 20_000,
+        },
+      );
+
+      const lastLine = rawOutput.trim().split("\n").pop() || "{}";
+      const result = JSON.parse(lastLine);
+
+      expect(result).toEqual({
+        sandboxDisabled: true,
+        adminAppsCount: 0,
+        networkCallsCount: 0,
+        getterBlocked: true,
+        dbProxyBlocked: true,
+      });
+    });
+
+    it("6 & 7 — En mode Sandbox, requireAuth rejette les identités synthétiques (401) et bloque toute vérification Firebase Admin (403) ; server.ts ne câble pas les repositories Firebase", async () => {
+      process.env.NODE_ENV = "development";
+      process.env.PDI_ENV = "sandbox";
+      process.env.VITE_PDI_ENV = "sandbox";
+
+      // 1. Jeton synthétique -> toujours 401 auth/synthetic-identity-forbidden
+      const nextSpy = vi.fn();
+      const reqSynthetic = {
+        headers: {
+          authorization: "Bearer sandbox_synthetic_token_admin_01",
+        },
+      } as unknown as AuthRequest;
+      const resSynthetic = createMockExpressResponse();
+      await requireAuth(reqSynthetic, resSynthetic as unknown as Response, nextSpy);
+      expect(resSynthetic.statusCode).toBe(401);
+      expect(resSynthetic.body).toEqual(
+        expect.objectContaining({ code: "auth/synthetic-identity-forbidden" }),
+      );
+      expect(nextSpy).not.toHaveBeenCalled();
+
+      // 2. Jeton non-synthétique en mode Sandbox -> 403 sandbox/server-auth-disabled sans appeler Firebase Admin
+      const reqNormalJwt = {
+        headers: {
+          authorization: "Bearer eyJhbGciOiJSUzI1NiJ9.payload.sig",
+        },
+      } as unknown as AuthRequest;
+      const resNormalJwt = createMockExpressResponse();
+      await requireAuth(reqNormalJwt, resNormalJwt as unknown as Response, nextSpy);
+      expect(resNormalJwt.statusCode).toBe(403);
+      expect(resNormalJwt.body).toEqual(
+        expect.objectContaining({ code: "sandbox/server-auth-disabled" }),
+      );
+      expect(nextSpy).not.toHaveBeenCalled();
+
+      // 3. Vérification statique que server.ts n'importe plus directement adminAuth/adminDb et isole le câblage en Sandbox
+      const serverSource = fs.readFileSync(path.resolve(process.cwd(), "server.ts"), "utf-8");
+      expect(serverSource).not.toMatch(/import\s*\{[^}]*\badminAuth\b[^}]*\}\s*from\s*["']\.\/src\/lib\/firebase-admin\.ts["']/);
+      expect(serverSource).not.toMatch(/import\s*\{[^}]*\badminDb\b[^}]*\}\s*from\s*["']\.\/src\/lib\/firebase-admin\.ts["']/);
+      expect(serverSource).toContain("if (isStagingSandboxMode(process.env))");
+    });
+
+    it("8 & 9 — Hors Sandbox : initialise Firebase Admin & Firestore avec validation stricte du projet et de la base nommée (non-régression)", () => {
+      const fakeAdminApp = {
+        name: "[DEFAULT]",
+        options: { projectId: EXPECTED_SERVER_PROJECT_ID },
+      };
+      const fakeAdminAuth = { verifyIdToken: vi.fn() };
+      const fakeFirestore = {
+        projectId: EXPECTED_SERVER_PROJECT_ID,
+        databaseId: EXPECTED_SERVER_DATABASE_ID,
+        _settings: {
+          projectId: EXPECTED_SERVER_PROJECT_ID,
+          databaseId: EXPECTED_SERVER_DATABASE_ID,
+        },
+      } as unknown as ServerFirestore;
+
+      const getAppsSpy = vi.fn(() => []);
+      const initializeAppSpy = vi.fn(() => fakeAdminApp as any);
+      const getAuthSpy = vi.fn(() => fakeAdminAuth as any);
+      const createFirestoreSpy = vi.fn(() => fakeFirestore);
+
+      const normalEnv = {
+        NODE_ENV: "production",
+        PDI_ENV: "production",
+        VITE_PDI_ENV: "production",
+        FIREBASE_PROJECT_ID: EXPECTED_SERVER_PROJECT_ID,
+        FIREBASE_DATABASE_ID: EXPECTED_SERVER_DATABASE_ID,
+      };
+
+      const runtime = initializeServerFirebaseAdminRuntime(normalEnv, {
+        getApps: getAppsSpy as any,
+        initializeApp: initializeAppSpy as any,
+        getAuth: getAuthSpy as any,
+        createFirestore: createFirestoreSpy,
+      });
+
+      expect(runtime.sandboxDisabled).toBe(false);
+      expect(runtime.config).toEqual({
+        projectId: EXPECTED_SERVER_PROJECT_ID,
+        databaseId: EXPECTED_SERVER_DATABASE_ID,
+      });
+      expect(initializeAppSpy).toHaveBeenCalledTimes(1);
+      expect(initializeAppSpy).toHaveBeenCalledWith({
+        projectId: EXPECTED_SERVER_PROJECT_ID,
+      });
+      expect(getAuthSpy).toHaveBeenCalledTimes(1);
+      expect(getAuthSpy).toHaveBeenCalledWith(fakeAdminApp);
+      expect(createFirestoreSpy).toHaveBeenCalledTimes(1);
+      expect(createFirestoreSpy).toHaveBeenCalledWith({
+        projectId: EXPECTED_SERVER_PROJECT_ID,
+        databaseId: EXPECTED_SERVER_DATABASE_ID,
+      });
+
+      // Non-régression stricte des contrôles projet & base nommée hors Sandbox
+      expect(() =>
+        resolveServerFirestoreConfig({
+          FIREBASE_PROJECT_ID: "wrong-project-id",
+          FIREBASE_DATABASE_ID: EXPECTED_SERVER_DATABASE_ID,
+        }),
+      ).toThrow(/Project ID non autorisé/);
+
+      expect(() =>
+        resolveServerFirestoreConfig({
+          FIREBASE_PROJECT_ID: EXPECTED_SERVER_PROJECT_ID,
+          FIREBASE_DATABASE_ID: "(default)",
+        }),
+      ).toThrow(/formellement interdite/);
+
+      expect(() =>
+        assertValidServerFirestoreInstance({
+          projectId: EXPECTED_SERVER_PROJECT_ID,
+          databaseId: "(default)",
+        }),
+      ).toThrow(/non conforme à la base nommée/);
+    });
+
+    it("10 — Compatibilité Security Scanner : aucune fixture de ce fichier de test ne déclenche un motif de secret du workflow CI", () => {
+      const workflowSource = fs.readFileSync(
+        path.resolve(process.cwd(), ".github/workflows/security.yml"),
+        "utf-8",
+      );
+      const specSource = fs.readFileSync(
+        path.resolve(process.cwd(), "src/security/tests/stagingSandboxIsolation.spec.ts"),
+        "utf-8",
+      );
+
+      // Le workflow ne doit pas exclure les tests
+      expect(workflowSource).not.toContain(":!src/security/tests");
+      expect(workflowSource).toContain("pdl_ntfset_[0-9a-zA-Z_]{16,}");
+
+      const scannerRegexes = [
+        /-----BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/,
+        /sk_live_[0-9a-zA-Z]{24,}/,
+        /ghp_[0-9a-zA-Z]{36}/,
+        /github_pat_[0-9a-zA-Z_]{22,}/,
+        /xox[baprs]-[0-9a-zA-Z]{10,48}/,
+        /AKIA[0-9A-Z]{16}/,
+        /pdl_ntfset_[0-9a-zA-Z_]{16,}/,
+        /pdl_live_apikey_[0-9a-zA-Z_]{16,}/,
+        /pdl_sdbx_apikey_[0-9a-zA-Z_]{16,}/,
+        /sb_secret_[0-9a-zA-Z_-]{16,}/,
+        /sbp_[0-9a-zA-Z]{20,}/,
+        /VITE_SUPABASE_(SECRET|SERVICE_ROLE)_KEY\s*=\s*['"]?[0-9a-zA-Z_.-]{8,}/,
+      ];
+
+      for (const regex of scannerRegexes) {
+        expect(regex.test(specSource)).toBe(false);
+      }
     });
   });
 });

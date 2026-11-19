@@ -13,7 +13,7 @@
  */
 
 import type { Request, Response, NextFunction, RequestHandler } from "express";
-import { adminAuth } from "../../lib/firebase-admin.ts";
+import { getServerAdminAuth } from "../../lib/firebase-admin.ts";
 import type { PdiAccountType, PdiSubscriptionPlan } from "../../lib/firebase.ts";
 import {
   getPaymentConfigForCountry,
@@ -64,7 +64,7 @@ const VALID_PROVIDERS: ReadonlySet<PdiPaymentProvider> = new Set([
 export function createPendingOrderRoute(deps: PendingOrderRouteDeps): RequestHandler[] {
   const verifyToken =
     deps.verifyIdToken ??
-    ((token: string) => adminAuth.verifyIdToken(token) as Promise<VerifiedOrderTokenClaims>);
+    ((token: string) => getServerAdminAuth().verifyIdToken(token) as Promise<VerifiedOrderTokenClaims>);
   const resolveConfig = deps.resolvePaymentConfig ?? getPaymentConfigForCountry;
 
   const requireOrderAuth: RequestHandler = async (
