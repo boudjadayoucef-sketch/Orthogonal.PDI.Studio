@@ -54,6 +54,127 @@ const ALLOWED_PDI_ENV_VALUES = new Set<string>([
   "sandbox",
 ]);
 
+export const PDI_RUNTIME_CONFIG_GLOBAL_KEY = "__PDI_RUNTIME_CONFIG__" as const;
+
+/**
+ * STAGING-00-B4-FIX-ENV-02 (Partie C) :
+ * Configuration publique minimale injectée par le serveur dans `index.html` avant
+ * le chargement des modules frontend.
+ * Ne contient JAMAIS de secret, clé API, URL de base de données ni identifiant.
+ */
+export interface PdiPublicRuntimeConfig {
+  pdiEnv: PdiEnvironmentMode;
+}
+
+export interface InjectedBrowserRuntimeConfigRead {
+  present: boolean;
+  isValid: boolean;
+  rawValue?: string;
+  pdiEnv?: PdiEnvironmentMode;
+}
+
+export function readInjectedBrowserRuntimeConfig(
+  globalObj: Record<string, unknown> | undefined = typeof globalThis !== "undefined"
+    ? (globalThis as unknown as Record<string, unknown>)
+    : undefined
+): InjectedBrowserRuntimeConfigRead {
+  const fromWindow =
+    typeof window !== "undefined"
+      ? (window as unknown as Record<string, unknown>)[PDI_RUNTIME_CONFIG_GLOBAL_KEY]
+      : undefined;
+  const candidate =
+    globalObj && Object.prototype.hasOwnProperty.call(globalObj, PDI_RUNTIME_CONFIG_GLOBAL_KEY)
+      ? globalObj[PDI_RUNTIME_CONFIG_GLOBAL_KEY]
+      : fromWindow;
+
+  if (candidate === undefined || candidate === null) {
+    return { present: false, isValid: true };
+  }
+
+  if (typeof candidate !== "object" || Array.isArray(candidate)) {
+    return { present: true, isValid: false, rawValue: String(candidate) };
+  }
+
+  const rawPdiEnv = (candidate as Record<string, unknown>).pdiEnv;
+  if (typeof rawPdiEnv !== "string" || rawPdiEnv.trim().length === 0) {
+    return { present: true, isValid: false, rawValue: String(rawPdiEnv ?? "") };
+  }
+
+  const normalized = rawPdiEnv.trim();
+  if (!ALLOWED_PDI_ENV_VALUES.has(normalized)) {
+    return { present: true, isValid: false, rawValue: normalized };
+  }
+
+  return {
+    present: true,
+    isValid: true,
+    rawValue: normalized,
+    pdiEnv: normalized as PdiEnvironmentMode,
+  };
+}
+
+/**
+ * Construit la configuration publique minimale à injecter côté serveur dans `index.html`.
+ * Retourne `null` si la configuration serveur est absente, incomplète, invalide, incohérente
+ * ou en violation de la protection C5 (`NODE_ENV=production` + `sandbox`).
+ */
+export function buildPublicBrowserRuntimeConfig(
+  env?: Record<string, unknown>
+): PdiPublicRuntimeConfig | null {
+  const resolution = resolvePdiEnvironmentMode(env, {
+    requireServerClientCoherence: true,
+  });
+
+  if (!resolution.isValid) {
+    return null;
+  }
+
+  const hasExplicitServerEnv =
+    typeof resolution.serverPdiEnv === "string" && resolution.serverPdiEnv.trim().length > 0;
+  const hasExplicitClientEnv =
+    typeof resolution.clientVitePdiEnv === "string" &&
+    resolution.clientVitePdiEnv.trim().length > 0;
+
+  if (!hasExplicitServerEnv || !hasExplicitClientEnv) {
+    return null;
+  }
+
+  if (!ALLOWED_PDI_ENV_VALUES.has(resolution.mode)) {
+    return null;
+  }
+
+  return {
+    pdiEnv: resolution.mode,
+  };
+}
+
+export function serializePublicRuntimeConfigScript(
+  config: PdiPublicRuntimeConfig | null
+): string {
+  if (!config || !ALLOWED_PDI_ENV_VALUES.has(config.pdiEnv)) {
+    return "";
+  }
+  const safePayload = JSON.stringify({ pdiEnv: config.pdiEnv });
+  return `<script id="pdi-runtime-config">window.${PDI_RUNTIME_CONFIG_GLOBAL_KEY}=Object.freeze(${safePayload});</script>`;
+}
+
+export function injectPublicRuntimeConfigIntoHtml(
+  html: string,
+  config: PdiPublicRuntimeConfig | null
+): string {
+  const scriptTag = serializePublicRuntimeConfigScript(config);
+  if (!scriptTag) {
+    return html;
+  }
+  if (html.includes("</head>")) {
+    return html.replace("</head>", `    ${scriptTag}\n  </head>`);
+  }
+  if (html.includes("<script")) {
+    return html.replace("<script", `${scriptTag}\n<script`);
+  }
+  return `${scriptTag}\n${html}`;
+}
+
 let sandboxTestOverride: boolean | null = null;
 
 /**
@@ -68,7 +189,30 @@ export function getRuntimeCombinedEnv(
   explicitEnv?: Record<string, unknown>
 ): Record<string, unknown> {
   if (explicitEnv && typeof explicitEnv === "object") {
-    return explicitEnv;
+    const injectedInExplicit = Object.prototype.hasOwnProperty.call(
+      explicitEnv,
+      PDI_RUNTIME_CONFIG_GLOBAL_KEY
+    )
+      ? readInjectedBrowserRuntimeConfig(explicitEnv)
+      : { present: false, isValid: true };
+
+    if (!injectedInExplicit.present) {
+      return explicitEnv;
+    }
+
+    const mergedExplicit: Record<string, unknown> = { ...explicitEnv };
+    const injectedValue = injectedInExplicit.rawValue ?? "__invalid_runtime_config__";
+    const existingBuildClientEnv =
+      typeof mergedExplicit.VITE_PDI_ENV === "string" &&
+      mergedExplicit.VITE_PDI_ENV.trim().length > 0
+        ? mergedExplicit.VITE_PDI_ENV.trim()
+        : undefined;
+
+    mergedExplicit.PDI_ENV = injectedValue;
+    if (!existingBuildClientEnv) {
+      mergedExplicit.VITE_PDI_ENV = injectedValue;
+    }
+    return mergedExplicit;
   }
 
   const combined: Record<string, unknown> = {};
@@ -89,6 +233,23 @@ export function getRuntimeCombinedEnv(
       if (v !== undefined) {
         combined[k] = v;
       }
+    }
+  }
+
+  // STAGING-00-B4-FIX-ENV-02 (Partie C) :
+  // Priorité explicite à la configuration publique runtime injectée par le serveur dans `index.html`,
+  // tout en préservant la détection d'incohérence si le bundle Vite a été compilé avec un VITE_PDI_ENV différent.
+  const injectedRuntime = readInjectedBrowserRuntimeConfig();
+  if (injectedRuntime.present) {
+    const injectedValue = injectedRuntime.rawValue ?? "__invalid_runtime_config__";
+    const existingBuildClientEnv =
+      typeof combined.VITE_PDI_ENV === "string" && combined.VITE_PDI_ENV.trim().length > 0
+        ? combined.VITE_PDI_ENV.trim()
+        : undefined;
+
+    combined.PDI_ENV = injectedValue;
+    if (!existingBuildClientEnv) {
+      combined.VITE_PDI_ENV = injectedValue;
     }
   }
 

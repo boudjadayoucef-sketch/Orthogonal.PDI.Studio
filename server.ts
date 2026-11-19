@@ -26,10 +26,15 @@ import {
   isServerFirebaseRuntimeDisabled,
   shouldBlockServerFirebaseInit,
 } from "./src/lib/firebase-admin.ts";
-import { isStagingSandboxMode } from "./src/lib/stagingSandbox.ts";
+import {
+  buildPublicBrowserRuntimeConfig,
+  injectPublicRuntimeConfigIntoHtml,
+  isStagingSandboxMode,
+} from "./src/lib/stagingSandbox.ts";
 import { 
   createBoundedRateLimiter,
   verifyProductionConfig,
+  resolveServerDeliveryMode,
   isSuspiciousRequestPath,
   validateAllowedOrigins,
   resolveCspFrameAncestors,
@@ -61,6 +66,7 @@ export interface PdiServerDependencies {
   createOrUpdateProject?: typeof createOrUpdateProject;
   deleteUserProject?: typeof deleteUserProject;
   getOrCreateUser?: typeof getOrCreateUser;
+  createViteServer?: typeof createViteServer;
 }
 
 export interface CreatePdiExpressAppOptions {
@@ -73,6 +79,7 @@ export interface StartServerOptions {
   host?: string;
   port?: number;
   attachFrontend?: boolean;
+  distPath?: string;
   env?: NodeJS.ProcessEnv;
   dependencies?: PdiServerDependencies;
 }
@@ -98,10 +105,15 @@ export function createPdiExpressApp(options: CreatePdiExpressAppOptions = {}): e
   const runtimeEnv = options.env ?? process.env;
   const deps = options.dependencies ?? {};
 
-  // Validation sûre de la configuration au démarrage (Section D2 & Protection C5 STAGING-00-B3)
+  // Validation sûre de la configuration au démarrage (Section D2, Protection C5 & FIX-ENV-02)
+  const deliveryMode = resolveServerDeliveryMode(runtimeEnv);
   const configValidation = verifyProductionConfig(runtimeEnv);
   if (!configValidation.isSafe) {
-    if (runtimeEnv.NODE_ENV === "production" || configValidation.hasFatalSandboxConfigError) {
+    if (
+      deliveryMode.strictSecurityMode ||
+      configValidation.hasFatalSandboxConfigError ||
+      !deliveryMode.isValid
+    ) {
       throw new Error(configValidation.errorMessage || "Fatal server configuration error");
     } else {
       console.warn("[SECURITY WARN] Development configuration note:", configValidation.errorMessage);
@@ -121,13 +133,25 @@ export function createPdiExpressApp(options: CreatePdiExpressAppOptions = {}): e
     next();
   });
 
-  // Configuration explicite Trust Proxy pour Hostinger VPS / Nginx / LiteSpeed (Section E1)
-  const trustProxyConfig = runtimeEnv.TRUST_PROXY || (runtimeEnv.NODE_ENV === "production" ? 1 : false);
+  // Configuration explicite Trust Proxy pour Cloud Run / Hostinger VPS / Nginx / LiteSpeed (Section E1 & FIX-ENV-02)
+  const rawTrustProxy = runtimeEnv.TRUST_PROXY?.trim();
+  const trustProxyConfig =
+    rawTrustProxy !== undefined && rawTrustProxy.length > 0
+      ? rawTrustProxy === "true"
+        ? true
+        : rawTrustProxy === "false"
+        ? false
+        : /^\d+$/.test(rawTrustProxy)
+        ? Number(rawTrustProxy)
+        : rawTrustProxy
+      : deliveryMode.strictSecurityMode
+      ? 1
+      : false;
   app.set("trust proxy", trustProxyConfig);
 
-  // Whitelist CORS dynamique contrôlée et validée via environnement (Section E2 & SEC-01-FIX-07-R1 D1.2)
+  // Whitelist CORS dynamique contrôlée et validée via environnement (Section E2, SEC-01-FIX-07-R1 D1.2 & FIX-ENV-02)
   const allowedOriginsValidation = validateAllowedOrigins(runtimeEnv.ALLOWED_ORIGINS, {
-    isProduction: runtimeEnv.NODE_ENV === "production",
+    isProduction: deliveryMode.strictSecurityMode,
     appUrl: runtimeEnv.APP_URL
   });
   const ALLOWED_ORIGINS = allowedOriginsValidation.origins;
@@ -405,15 +429,18 @@ export async function startServer(options: StartServerOptions = {}): Promise<Sta
     dependencies: options.dependencies,
   });
 
+  const deliveryMode = resolveServerDeliveryMode(runtimeEnv);
+  const viteServerFactory = options.dependencies?.createViteServer ?? createViteServer;
+
   if (attachFrontend) {
-    if (runtimeEnv.NODE_ENV !== "production") {
-      const vite = await createViteServer({
+    if (!deliveryMode.serveStaticDist) {
+      const vite = await viteServerFactory({
         server: { middlewareMode: true },
         appType: "spa",
       });
       app.use(vite.middlewares);
     } else {
-      const distPath = path.join(process.cwd(), "dist");
+      const distPath = options.distPath ?? path.join(process.cwd(), "dist");
 
       // Protection Path Traversal & Dotfiles pour les requêtes statiques (Section E4)
       app.use((req, res, next) => {
@@ -423,10 +450,35 @@ export async function startServer(options: StartServerOptions = {}): Promise<Sta
         next();
       });
 
+      // STAGING-00-B4-FIX-ENV-02 (Partie C) :
+      // Sert index.html avec injection de la configuration publique runtime minimale validée
+      // AVANT le chargement des modules frontend (zéro secret, zéro URL DB, zéro identifiant).
+      const sendRuntimeConfiguredIndexHtml = (_req: express.Request, res: express.Response) => {
+        try {
+          const indexPath = path.join(distPath, "index.html");
+          if (!fs.existsSync(indexPath)) {
+            res.status(404).type("text/plain").send("Asset not found");
+            return;
+          }
+          const rawHtml = fs.readFileSync(indexPath, "utf-8");
+          const publicRuntimeConfig = buildPublicBrowserRuntimeConfig(runtimeEnv);
+          const renderedHtml = injectPublicRuntimeConfigIntoHtml(rawHtml, publicRuntimeConfig);
+          res.setHeader("Content-Type", "text/html; charset=utf-8");
+          res.setHeader("Cache-Control", "no-store");
+          res.send(renderedHtml);
+        } catch (err: any) {
+          console.error("Error serving runtime-configured index.html:", err?.message || err);
+          res.status(500).type("text/plain").send("Internal Server Error");
+        }
+      };
+
+      app.get(["/", "/index.html"], sendRuntimeConfiguredIndexHtml);
+
       // PATCH 017G : index.html ne doit jamais etre mis en cache, sinon il
       // continue de pointer vers des assets haches qui n existent plus.
       app.use(
         express.static(distPath, {
+          index: false,
           dotfiles: "ignore",
           setHeaders: (res, filePath) => {
             if (filePath.endsWith("index.html")) res.setHeader("Cache-Control", "no-store");
@@ -434,9 +486,9 @@ export async function startServer(options: StartServerOptions = {}): Promise<Sta
         })
       );
 
-      // PATCH 017G : sonde de diagnostic des assets (Section E6 : minimisée en production)
+      // PATCH 017G : sonde de diagnostic des assets (Section E6 & FIX-ENV-02 : minimisée en mode strict/Cloud Run)
       app.get("/api/health/assets", (_req, res) => {
-        if (runtimeEnv.NODE_ENV === "production" && !runtimeEnv.ENABLE_ASSET_DIAGNOSTICS) {
+        if (deliveryMode.strictSecurityMode && !runtimeEnv.ENABLE_ASSET_DIAGNOSTICS) {
           return res.json({
             status: "ok",
             ready: fs.existsSync(distPath) && fs.existsSync(path.join(distPath, "index.html"))
@@ -490,8 +542,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Sta
           res.status(404).type("text/plain").send("Asset not found");
           return;
         }
-        res.setHeader("Cache-Control", "no-store");
-        res.sendFile(path.join(distPath, "index.html"));
+        return sendRuntimeConfiguredIndexHtml(req, res);
       });
     }
   }

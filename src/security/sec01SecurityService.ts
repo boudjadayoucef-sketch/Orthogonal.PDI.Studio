@@ -702,10 +702,103 @@ export interface CspFrameAncestorsResolution {
  * - Forbids `*` in production (`NODE_ENV === "production"`).
  * - Never concatenates unvalidated environment strings into the CSP header; falls closed to `'self' https://aistudio.google.com` on error.
  */
+const ALLOWED_STATIC_DIST_FLAGS = new Set<string>(["true", "false", "1", "0"]);
+
+export interface ServerDeliveryModeResolution {
+  isValid: boolean;
+  serveStaticDist: boolean;
+  strictSecurityMode: boolean;
+  isProductionNodeEnv: boolean;
+  isStagingNodeEnv: boolean;
+  explicitStaticDistFlag?: string;
+  errorMessage?: string;
+}
+
+/**
+ * STAGING-00-B4-FIX-ENV-02 (Parties A & E) :
+ * Dissocie la livraison statique compilée (`dist/`) et le durcissement Cloud Run de `NODE_ENV=production`
+ * tout en préservant strictement la protection C5 (`NODE_ENV=production` + `sandbox` toujours interdit).
+ *
+ * Règles explicites :
+ * - `PDI_SERVE_STATIC_DIST` accepte uniquement `true`, `false`, `1`, `0` (ou absent).
+ * - `NODE_ENV=production` exige la livraison statique (`PDI_SERVE_STATIC_DIST=false` refusé).
+ * - `NODE_ENV=staging` exige explicitement `PDI_SERVE_STATIC_DIST=true` (ou `1`) ; le serveur dev Vite
+ *   est strictement interdit en staging (comportement fail-closed explicite).
+ * - En mode `production`, `staging` ou `PDI_SERVE_STATIC_DIST=true`, `strictSecurityMode === true`
+ *   (trust proxy, CORS strict, CSP sans wildcard ni localhost, validation de config bloquante, `/api/health/assets` minimal).
+ */
+export function resolveServerDeliveryMode(
+  env: Record<string, string | undefined> = process.env
+): ServerDeliveryModeResolution {
+  const rawNodeEnv = typeof env.NODE_ENV === "string" ? env.NODE_ENV.trim().toLowerCase() : "";
+  const isProductionNodeEnv = rawNodeEnv === "production";
+  const isStagingNodeEnv = rawNodeEnv === "staging";
+
+  const rawFlag =
+    typeof env.PDI_SERVE_STATIC_DIST === "string"
+      ? env.PDI_SERVE_STATIC_DIST.trim().toLowerCase()
+      : undefined;
+  const hasExplicitFlag = rawFlag !== undefined && rawFlag.length > 0;
+
+  if (hasExplicitFlag && !ALLOWED_STATIC_DIST_FLAGS.has(rawFlag!)) {
+    return {
+      isValid: false,
+      serveStaticDist: false,
+      strictSecurityMode: true,
+      isProductionNodeEnv,
+      isStagingNodeEnv,
+      explicitStaticDistFlag: rawFlag,
+      errorMessage: `Valeur invalide pour PDI_SERVE_STATIC_DIST ('${rawFlag}'). Valeurs autorisées : true, false, 1, 0.`,
+    };
+  }
+
+  const explicitTrue = rawFlag === "true" || rawFlag === "1";
+  const explicitFalse = rawFlag === "false" || rawFlag === "0";
+
+  if (isProductionNodeEnv && explicitFalse) {
+    return {
+      isValid: false,
+      serveStaticDist: false,
+      strictSecurityMode: true,
+      isProductionNodeEnv,
+      isStagingNodeEnv,
+      explicitStaticDistFlag: rawFlag,
+      errorMessage:
+        "Configuration interdite : PDI_SERVE_STATIC_DIST=false est interdit lorsque NODE_ENV=production (serveur de développement Vite interdit en production).",
+    };
+  }
+
+  if (isStagingNodeEnv && !explicitTrue) {
+    return {
+      isValid: false,
+      serveStaticDist: false,
+      strictSecurityMode: true,
+      isProductionNodeEnv,
+      isStagingNodeEnv,
+      explicitStaticDistFlag: rawFlag,
+      errorMessage:
+        "Politique de sécurité Cloud Run / Staging : NODE_ENV=staging exige PDI_SERVE_STATIC_DIST=true pour servir le bundle statique compilé dist/. Le serveur de développement Vite est strictement interdit en staging.",
+    };
+  }
+
+  const serveStaticDist = explicitTrue || isProductionNodeEnv;
+  const strictSecurityMode = isProductionNodeEnv || isStagingNodeEnv || serveStaticDist;
+
+  return {
+    isValid: true,
+    serveStaticDist,
+    strictSecurityMode,
+    isProductionNodeEnv,
+    isStagingNodeEnv,
+    explicitStaticDistFlag: hasExplicitFlag ? rawFlag : undefined,
+  };
+}
+
 export function resolveCspFrameAncestors(
   env: Record<string, string | undefined> = process.env
 ): CspFrameAncestorsResolution {
-  const isProd = env.NODE_ENV === "production";
+  const deliveryMode = resolveServerDeliveryMode(env);
+  const isProd = deliveryMode.strictSecurityMode;
   const failClosedAncestors = ["'self'", VERIFIED_AISTUDIO_FRAME_ANCESTOR];
   const failClosedValue = failClosedAncestors.join(" ");
 
@@ -868,11 +961,20 @@ export function containsExposedSupabaseSecretCredential(value: unknown): boolean
 export function verifyProductionConfig(
   env: Record<string, string | undefined> = process.env
 ): ConfigValidationResult {
-  const isProduction = env.NODE_ENV === "production";
+  const deliveryMode = resolveServerDeliveryMode(env);
+  const isProduction = deliveryMode.isProductionNodeEnv;
+  const isStrictSecurity = deliveryMode.strictSecurityMode;
   const missingCriticalKeys: string[] = [];
   const forbiddenViteSecretKeys: string[] = [];
   const invalidConfigKeys: string[] = [];
   let hasFatalSandboxConfigError = false;
+
+  if (!deliveryMode.isValid) {
+    hasFatalSandboxConfigError = true;
+    invalidConfigKeys.push(
+      `PDI_SERVE_STATIC_DIST (${deliveryMode.errorMessage ?? "Invalid static delivery configuration"})`
+    );
+  }
 
   // Check for accidentally leaked server secrets using VITE_ prefix
   const sensitiveSecretNames = [
@@ -937,7 +1039,7 @@ export function verifyProductionConfig(
     );
   }
 
-  // SEC-01-FIX-07-R1 (D1.1 & D1.2): Validate APP_URL, ALLOWED_ORIGINS, and CSP_FRAME_ANCESTORS
+  // SEC-01-FIX-07-R1 (D1.1 & D1.2) & FIX-ENV-02 (Partie E): Validate APP_URL, ALLOWED_ORIGINS, and CSP_FRAME_ANCESTORS
   if (env.APP_URL !== undefined && env.APP_URL.trim() !== "") {
     const appUrlCheck = validateAppUrl(env.APP_URL);
     if (!appUrlCheck.isValid) {
@@ -947,7 +1049,7 @@ export function verifyProductionConfig(
 
   if (env.ALLOWED_ORIGINS !== undefined && env.ALLOWED_ORIGINS.trim() !== "") {
     const originsCheck = validateAllowedOrigins(env.ALLOWED_ORIGINS, {
-      isProduction,
+      isProduction: isStrictSecurity,
       appUrl: env.APP_URL
     });
     if (!originsCheck.isValid) {

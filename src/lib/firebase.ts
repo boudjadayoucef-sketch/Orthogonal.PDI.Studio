@@ -31,7 +31,9 @@ import {
 } from "firebase/auth";
 import { isSuperAdminClaimAuthorized } from "../security/clientAuthorization";
 import {
+  getRuntimeCombinedEnv,
   isStagingSandboxMode,
+  resolvePdiEnvironmentMode,
   getSandboxSyntheticProfile,
   seedSandboxDefaultProjectIfEmpty,
   resolveScopedStorageKey,
@@ -88,8 +90,8 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
 }
 
 export async function testConnection(explicitEnv?: Record<string, unknown>) {
-  // Protection C1 (STAGING-00-B3): Never call getDocFromServer or touch Firestore in Sandbox mode
-  if (isStagingSandboxMode(explicitEnv)) {
+  // Protection C1 & FIX-ENV-02: Never call getDocFromServer or touch Firestore in Sandbox or fail-closed mode
+  if (isStagingSandboxMode(explicitEnv) || evaluateClientFirebaseInitGate(explicitEnv).blocked) {
     return;
   }
   try {
@@ -160,6 +162,99 @@ export const SANDBOX_DISABLED_FIREBASE_CONFIG: ClientFirebaseConfig = Object.fre
   firestoreDatabaseId: "sandbox-disabled-no-firestore",
 });
 
+export const CLIENT_FIREBASE_FAIL_CLOSED_CONFIG: ClientFirebaseConfig = Object.freeze({
+  apiKey: "",
+  authDomain: "",
+  projectId: "fail-closed-firebase-disabled",
+  storageBucket: "",
+  messagingSenderId: "",
+  appId: "",
+  firestoreDatabaseId: "fail-closed-firestore-disabled",
+});
+
+export const CLIENT_FIREBASE_FAIL_CLOSED_ERROR =
+  "Coupe-circuit Fail-Closed Client (STAGING-00-B4-FIX-ENV-02) : initialisation Firebase Client refusée (mode d'environnement explicite, valide et cohérent requis via configuration runtime serveur ou VITE_PDI_ENV).";
+
+export type ClientFirebaseBlockReason =
+  | "SANDBOX_MODE"
+  | "MISSING_RUNTIME_ENV"
+  | "SANDBOX_FORBIDDEN_IN_PRODUCTION"
+  | "FRONTEND_SERVER_ENV_MISMATCH"
+  | "AMBIGUOUS_PDI_ENV";
+
+export interface ClientFirebaseInitGateResult {
+  blocked: boolean;
+  sandboxDisabled: boolean;
+  runtimeDisabled: boolean;
+  blockReason: ClientFirebaseBlockReason | null;
+}
+
+/**
+ * STAGING-00-B4-FIX-ENV-02 (Partie D) :
+ * Validation fail-closed exécutée AVANT toute initialisation Firebase Client.
+ * - Mode Sandbox : BLOQUER (`SANDBOX_MODE`).
+ * - Configuration absente (`VITE_PDI_ENV` et `PDI_ENV` / runtime absent) : BLOQUER (`MISSING_RUNTIME_ENV`).
+ * - Configuration invalide, incohérente ou C5 (`NODE_ENV=production` + sandbox) : BLOQUER.
+ * - Mode explicite valide hors Sandbox (`production` | `development` | `test`) : AUTORISER.
+ */
+export function evaluateClientFirebaseInitGate(
+  env?: Record<string, unknown>
+): ClientFirebaseInitGateResult {
+  if (isStagingSandboxMode(env)) {
+    return {
+      blocked: true,
+      sandboxDisabled: true,
+      runtimeDisabled: true,
+      blockReason: "SANDBOX_MODE",
+    };
+  }
+
+  const resolution = resolvePdiEnvironmentMode(env);
+
+  if (!resolution.isValid) {
+    const reason: ClientFirebaseBlockReason =
+      resolution.errorCode ?? "AMBIGUOUS_PDI_ENV";
+    return {
+      blocked: true,
+      sandboxDisabled: reason === "SANDBOX_FORBIDDEN_IN_PRODUCTION",
+      runtimeDisabled: true,
+      blockReason: reason,
+    };
+  }
+
+  if (resolution.isSandbox) {
+    return {
+      blocked: true,
+      sandboxDisabled: true,
+      runtimeDisabled: true,
+      blockReason: "SANDBOX_MODE",
+    };
+  }
+
+  const hasExplicitClientEnv =
+    typeof resolution.clientVitePdiEnv === "string" &&
+    resolution.clientVitePdiEnv.trim().length > 0;
+  const hasExplicitServerEnv =
+    typeof resolution.serverPdiEnv === "string" &&
+    resolution.serverPdiEnv.trim().length > 0;
+
+  if (!hasExplicitClientEnv && !hasExplicitServerEnv) {
+    return {
+      blocked: true,
+      sandboxDisabled: false,
+      runtimeDisabled: true,
+      blockReason: "MISSING_RUNTIME_ENV",
+    };
+  }
+
+  return {
+    blocked: false,
+    sandboxDisabled: false,
+    runtimeDisabled: false,
+    blockReason: null,
+  };
+}
+
 export function resolveClientFirebaseConfig(
   env?: Record<string, unknown>,
   options?: { requireExplicitEnv?: boolean }
@@ -191,6 +286,15 @@ export function resolveClientFirebaseConfig(
       ? sourceEnv.VITE_FIREBASE_DATABASE_ID
       : EXPECTED_FIRESTORE_DATABASE_ID;
   const validatedDatabaseId = validateClientFirestoreDatabaseId(rawDatabaseId);
+
+  // STAGING-00-B4-FIX-ENV-02 (Partie D): Aucune bascule silencieuse vers Firebase Production
+  // lorsque le mode d'environnement runtime est absent, invalide ou incohérent.
+  const gate = evaluateClientFirebaseInitGate(env);
+  if (gate.blocked) {
+    throw new Error(
+      `${CLIENT_FIREBASE_FAIL_CLOSED_ERROR} [Raison : ${gate.blockReason ?? "BLOCKED"}]`
+    );
+  }
 
   return {
     apiKey:
@@ -411,22 +515,31 @@ export function initializeClientFirebaseRuntime(
   }
 ): {
   sandboxDisabled: boolean;
+  runtimeDisabled: boolean;
+  blockReason: ClientFirebaseBlockReason | null;
   activeConfig: ClientFirebaseConfig;
   app: ReturnType<typeof initializeApp>;
   db: ReturnType<typeof initializeFirestore>;
   auth: ReturnType<typeof getAuth>;
 } {
-  if (isStagingSandboxMode(env)) {
+  const effectiveEnv = getRuntimeCombinedEnv(env);
+  const gate = evaluateClientFirebaseInitGate(effectiveEnv);
+
+  if (gate.blocked) {
     return {
-      sandboxDisabled: true,
-      activeConfig: SANDBOX_DISABLED_FIREBASE_CONFIG,
+      sandboxDisabled: gate.sandboxDisabled,
+      runtimeDisabled: true,
+      blockReason: gate.blockReason,
+      activeConfig: gate.sandboxDisabled
+        ? SANDBOX_DISABLED_FIREBASE_CONFIG
+        : CLIENT_FIREBASE_FAIL_CLOSED_CONFIG,
       app: SANDBOX_DISABLED_APP,
       db: SANDBOX_DISABLED_DB,
       auth: SANDBOX_DISABLED_AUTH,
     };
   }
 
-  const resolvedConfig = resolveClientFirebaseConfig(env);
+  const resolvedConfig = resolveClientFirebaseConfig(effectiveEnv);
   const resolvedApp = getOrInitializeClientFirebaseApp(resolvedConfig, sdk);
   validateClientFirebaseAppProjectId(resolvedApp, resolvedConfig.projectId);
   const resolvedDb = sdk?.initializeFirestore
@@ -444,6 +557,8 @@ export function initializeClientFirebaseRuntime(
 
   return {
     sandboxDisabled: false,
+    runtimeDisabled: false,
+    blockReason: null,
     activeConfig: resolvedConfig,
     app: resolvedApp,
     db: resolvedDb,
@@ -451,11 +566,26 @@ export function initializeClientFirebaseRuntime(
   };
 }
 
-const metaEnv = (typeof import.meta !== "undefined" && (import.meta as any)?.env) || undefined;
-const clientFirebaseRuntime = initializeClientFirebaseRuntime(metaEnv);
-const { app, db, auth, activeConfig } = clientFirebaseRuntime;
+const clientFirebaseRuntime = initializeClientFirebaseRuntime();
+const {
+  app,
+  db,
+  auth,
+  activeConfig,
+  sandboxDisabled: isClientFirebaseSandboxDisabled,
+  runtimeDisabled: isClientFirebaseRuntimeDisabled,
+  blockReason: clientFirebaseBlockReason,
+} = clientFirebaseRuntime;
 
-export { app, db, auth, activeConfig };
+export {
+  app,
+  db,
+  auth,
+  activeConfig,
+  isClientFirebaseSandboxDisabled,
+  isClientFirebaseRuntimeDisabled,
+  clientFirebaseBlockReason,
+};
 
 // ==========================================
 // MODELS & SERVICES
