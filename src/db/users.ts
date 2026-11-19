@@ -1,8 +1,9 @@
-import { db } from './index.ts';
+import { getDb } from './index.ts';
 import { users } from './schema.ts';
 import { eq } from 'drizzle-orm';
 
 export async function getOrCreateUser(uid: string, email: string, displayName?: string, photoUrl?: string) {
+  const db = getDb();
   try {
     const result = await db.insert(users)
       .values({
@@ -30,6 +31,7 @@ export async function getOrCreateUser(uid: string, email: string, displayName?: 
 }
 
 export async function getUserByUid(uid: string) {
+  const db = getDb();
   try {
     const result = await db.select().from(users).where(eq(users.uid, uid)).limit(1);
     return result[0] || null;

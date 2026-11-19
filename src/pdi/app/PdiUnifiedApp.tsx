@@ -105,8 +105,6 @@ import {
   seedSandboxDefaultProjectIfEmpty,
   getSandboxSyntheticProfile,
   getSandboxSyntheticAuthUser,
-  setSandboxSyntheticRole,
-  type SandboxSyntheticRole,
 } from "../../lib/stagingSandbox";
 
 export type PdiModule = "home" | "isometric" | "drive" | "vision" | "sketch" | "cad" | "json" | "pdf" | "projects" | "assistant" | "profile" | "subscription" | "super_admin_console" | "license_keys";
@@ -124,6 +122,93 @@ export function getStagingSandboxBannerSpec(explicitEnv?: Record<string, unknown
     dismissible: false as const,
     lines: SANDBOX_BANNER_LINES,
   };
+}
+
+/**
+ * Protection C4 & STAGING-00-B4-E :
+ * Bandeau permanent, non masquable, visible sur tous les écrans (accueil, connexion, espace de travail,
+ * changement de module) sans aucun bouton de fermeture ni privilège Super Admin.
+ */
+export function StagingSandboxBanner({
+  onResetSandboxTestData,
+}: {
+  onResetSandboxTestData?: () => void;
+}) {
+  return (
+    <div
+      data-testid="pdi-staging-sandbox-banner"
+      data-dismissible="false"
+      role="region"
+      aria-label="Bandeau permanent environnement Sandbox"
+      style={{
+        position: "fixed",
+        top: 0,
+        left: 0,
+        right: 0,
+        zIndex: 99999,
+        background: "linear-gradient(90deg, #451a03 0%, #78350f 50%, #451a03 100%)",
+        borderBottom: "2px solid #f59e0b",
+        color: "#fef3c7",
+        padding: "4px 14px",
+        display: "flex",
+        flexWrap: "wrap",
+        alignItems: "center",
+        justifyContent: "space-between",
+        gap: 10,
+        fontSize: 11,
+        fontFamily: "Inter, ui-sans-serif, system-ui, sans-serif",
+        boxShadow: "0 4px 20px rgba(0,0,0,0.65)",
+      }}
+    >
+      <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 10, fontWeight: 900, letterSpacing: "0.03em" }}>
+        <span style={{ background: "#f59e0b", color: "#09090b", padding: "2px 8px", borderRadius: 4, fontWeight: 900 }}>
+          {SANDBOX_BANNER_LINES[0]}
+        </span>
+        <span style={{ color: "#fde68a" }}>•</span>
+        <span>{SANDBOX_BANNER_LINES[1]}</span>
+        <span style={{ color: "#fde68a" }}>•</span>
+        <span style={{ color: "#fca5a5" }}>{SANDBOX_BANNER_LINES[2]}</span>
+        <span style={{ color: "#fde68a" }}>•</span>
+        <span style={{ color: "#fde68a", fontWeight: 900 }}>{SANDBOX_BANNER_LINES[3]}</span>
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span
+          data-testid="pdi-sandbox-synthetic-role-badge"
+          style={{
+            background: "rgba(0,0,0,0.45)",
+            border: "1px solid rgba(253, 230, 138, 0.45)",
+            color: "#fef3c7",
+            borderRadius: 6,
+            padding: "2px 8px",
+            fontSize: 10,
+            fontWeight: 800,
+          }}
+        >
+          Profil local : Client Ingénieur (aucun privilège Super Admin)
+        </span>
+        {onResetSandboxTestData ? (
+          <button
+            type="button"
+            data-testid="pdi-sandbox-reset-button"
+            onClick={onResetSandboxTestData}
+            style={{
+              background: "#991b1b",
+              border: "1px solid #f87171",
+              color: "#ffffff",
+              borderRadius: 6,
+              padding: "2px 10px",
+              fontSize: 10,
+              fontWeight: 900,
+              cursor: "pointer",
+            }}
+            title="Supprimer exclusivement les clés localStorage pdi.sandbox.staging.v1.*"
+          >
+            Réinitialiser données Sandbox
+          </button>
+        ) : null}
+      </div>
+    </div>
+  );
 }
 
 // PATCH 017B : modules reellement rendus par la coquille.
@@ -583,13 +668,12 @@ export default function PdiUnifiedApp() {
     if (!sandboxActive) return null;
     seedSandboxDefaultProjectIfEmpty();
     const prof = getSandboxSyntheticProfile();
-    const isSuper = prof.role === "super_admin";
     return {
       status: "active",
       canAccessWorkspace: true,
       canAccessActivation: false,
-      isSuperAdmin: isSuper,
-      authMode: isSuper ? "super_admin" : "client",
+      isSuperAdmin: false,
+      authMode: "client",
       profile: prof as unknown as PdiUserProfile,
     };
   });
@@ -599,8 +683,7 @@ export default function PdiUnifiedApp() {
   // avant que Firebase Auth et le profil Firestore n'aient été vérifiés (hors Sandbox locale isolée C1/C3).
   const [authMode, setAuthMode] = useState<"guest" | "demo" | "pending_email" | "client" | "admin" | "super_admin">(() => {
     if (sandboxActive) {
-      const prof = getSandboxSyntheticProfile();
-      return prof.role === "super_admin" ? "super_admin" : "client";
+      return "client";
     }
     try {
       const saved = window.localStorage.getItem(resolveScopedStorageKey(PDI_AUTH_KEY));
@@ -1044,13 +1127,12 @@ export default function PdiUnifiedApp() {
     if (isStagingSandboxMode()) {
       seedSandboxDefaultProjectIfEmpty();
       const prof = getSandboxSyntheticProfile();
-      const isSuper = prof.role === "super_admin";
       const sandboxRes: WorkspaceSessionResolution = {
         status: "active",
         canAccessWorkspace: true,
         canAccessActivation: false,
-        isSuperAdmin: isSuper,
-        authMode: isSuper ? "super_admin" : "client",
+        isSuperAdmin: false,
+        authMode: "client",
         profile: prof as unknown as PdiUserProfile,
       };
       verifiedSessionRef.current = sandboxRes;
@@ -1311,107 +1393,9 @@ export default function PdiUnifiedApp() {
     );
   }, []);
 
-  const handleSwitchSandboxSyntheticRole = React.useCallback((nextRole: SandboxSyntheticRole) => {
-    if (!isStagingSandboxMode()) return;
-    setSandboxSyntheticRole(nextRole);
-    const prof = getSandboxSyntheticProfile(nextRole);
-    const isSuper = prof.role === "super_admin";
-    const nextSession: WorkspaceSessionResolution = {
-      status: "active",
-      canAccessWorkspace: true,
-      canAccessActivation: false,
-      isSuperAdmin: isSuper,
-      authMode: isSuper ? "super_admin" : "client",
-      profile: prof as unknown as PdiUserProfile,
-    };
-    verifiedSessionRef.current = nextSession;
-    setVerifiedSession(nextSession);
-    setAuthMode(nextSession.authMode);
-    setSavedUserProfile({
-      name: prof.name,
-      email: prof.email,
-      role: nextSession.authMode,
-      company: prof.company,
-      country: prof.country,
-      plan: prof.accountType.toUpperCase(),
-      emailStatus: "vérifié (sandbox locale)",
-      createdAt: prof.createdAt,
-    });
-  }, []);
-
-  // Protection C4 (STAGING-00-B3) : Bandeau permanent non masquable en mode Sandbox
+  // Protection C4 & STAGING-00-B4-E : Bandeau permanent non masquable en mode Sandbox
   const sandboxBannerNode = sandboxActive ? (
-    <div
-      data-testid="pdi-staging-sandbox-banner"
-      role="region"
-      aria-label="Bandeau permanent environnement Sandbox"
-      style={{
-        position: "fixed",
-        top: 0,
-        left: 0,
-        right: 0,
-        zIndex: 99999,
-        background: "linear-gradient(90deg, #451a03 0%, #78350f 50%, #451a03 100%)",
-        borderBottom: "2px solid #f59e0b",
-        color: "#fef3c7",
-        padding: "4px 14px",
-        display: "flex",
-        flexWrap: "wrap",
-        alignItems: "center",
-        justifyContent: "space-between",
-        gap: 10,
-        fontSize: 11,
-        fontFamily: "Inter, ui-sans-serif, system-ui, sans-serif",
-        boxShadow: "0 4px 20px rgba(0,0,0,0.65)",
-      }}
-    >
-      <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 10, fontWeight: 900, letterSpacing: "0.03em" }}>
-        <span style={{ background: "#f59e0b", color: "#09090b", padding: "2px 8px", borderRadius: 4, fontWeight: 900 }}>
-          {SANDBOX_BANNER_LINES[0]}
-        </span>
-        <span style={{ color: "#fde68a" }}>•</span>
-        <span>{SANDBOX_BANNER_LINES[1]}</span>
-        <span style={{ color: "#fde68a" }}>•</span>
-        <span style={{ color: "#fca5a5" }}>{SANDBOX_BANNER_LINES[2]}</span>
-      </div>
-      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-        <button
-          type="button"
-          onClick={() => handleSwitchSandboxSyntheticRole(authMode === "super_admin" ? "client" : "super_admin")}
-          style={{
-            background: "rgba(0,0,0,0.45)",
-            border: "1px solid rgba(253, 230, 138, 0.45)",
-            color: "#fef3c7",
-            borderRadius: 6,
-            padding: "2px 8px",
-            fontSize: 10,
-            fontWeight: 800,
-            cursor: "pointer",
-          }}
-          title="Basculer le profil synthétique local (aucun privilège serveur)"
-        >
-          Profil local : {authMode === "super_admin" ? "Simulation UI Admin" : "Client Ingénieur"}
-        </button>
-        <button
-          type="button"
-          data-testid="pdi-sandbox-reset-button"
-          onClick={handleResetSandboxTestData}
-          style={{
-            background: "#991b1b",
-            border: "1px solid #f87171",
-            color: "#ffffff",
-            borderRadius: 6,
-            padding: "2px 10px",
-            fontSize: 10,
-            fontWeight: 900,
-            cursor: "pointer",
-          }}
-          title="Supprimer exclusivement les clés localStorage pdi.sandbox.staging.v1.*"
-        >
-          Réinitialiser données Sandbox
-        </button>
-      </div>
-    </div>
+    <StagingSandboxBanner onResetSandboxTestData={handleResetSandboxTestData} />
   ) : null;
 
   // STAGE 1 : PAGE COMMERCIALE (HOME PDI / LANDING)

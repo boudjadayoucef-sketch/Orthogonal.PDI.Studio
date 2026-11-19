@@ -478,7 +478,7 @@ describe("STAGING-00-B3 — Sandbox Isolée AI Studio Share (C1..C5)", () => {
   });
 
   describe("Protection C4 — Bandeau permanent non masquable en mode Sandbox", () => {
-    it("affiche les 3 mentions obligatoires exactes et interdit le masquage en mode Sandbox", () => {
+    it("affiche les 4 mentions obligatoires exactes et interdit le masquage en mode Sandbox", () => {
       const spec = getStagingSandboxBannerSpec({
         VITE_PDI_ENV: "sandbox",
         PDI_ENV: "sandbox",
@@ -491,6 +491,7 @@ describe("STAGING-00-B3 — Sandbox Isolée AI Studio Share (C1..C5)", () => {
         "ENVIRONNEMENT SANDBOX DE TEST — AI STUDIO SHARE",
         "DONNÉES SYNTHÉTIQUES LOCALES",
         "FIREBASE PRODUCTION DÉSACTIVÉ",
+        "STAGING-00-B4 — ENVIRONNEMENT DE TEST",
       ]);
       expect(spec.lines).toEqual(SANDBOX_BANNER_LINES);
     });
@@ -811,7 +812,9 @@ describe("STAGING-00-B3 — Sandbox Isolée AI Studio Share (C1..C5)", () => {
       const serverSource = fs.readFileSync(path.resolve(process.cwd(), "server.ts"), "utf-8");
       expect(serverSource).not.toMatch(/import\s*\{[^}]*\badminAuth\b[^}]*\}\s*from\s*["']\.\/src\/lib\/firebase-admin\.ts["']/);
       expect(serverSource).not.toMatch(/import\s*\{[^}]*\badminDb\b[^}]*\}\s*from\s*["']\.\/src\/lib\/firebase-admin\.ts["']/);
-      expect(serverSource).toContain("if (isStagingSandboxMode(process.env))");
+      expect(serverSource).toContain("const runtimeEnv = options.env ?? process.env;");
+      expect(serverSource).toContain("const sandboxModeActive = isStagingSandboxMode(runtimeEnv);");
+      expect(serverSource).toContain("createRejectInStagingSandboxMode(runtimeEnv)");
     });
 
     it("8 & 9 — Hors Sandbox : initialise Firebase Admin & Firestore avec validation stricte du projet et de la base nommée (non-régression)", () => {

@@ -1,8 +1,9 @@
-import { db } from './index.ts';
+import { getDb } from './index.ts';
 import { projects, driveFiles } from './schema.ts';
 import { eq, desc, and } from 'drizzle-orm';
 
 export async function getUserProjects(uid: string) {
+  const db = getDb();
   try {
     return await db.select().from(projects).where(eq(projects.uid, uid)).orderBy(desc(projects.updatedAt));
   } catch (error) {
@@ -25,6 +26,7 @@ export async function createOrUpdateProject(
     data?: any;
   }
 ) {
+  const db = getDb();
   try {
     if (projectData.id) {
       const updated = await db.update(projects)
@@ -65,6 +67,7 @@ export async function createOrUpdateProject(
 }
 
 export async function deleteUserProject(uid: string, projectId: number) {
+  const db = getDb();
   try {
     return await db.delete(projects).where(and(eq(projects.id, projectId), eq(projects.uid, uid))).returning();
   } catch (error) {
@@ -74,6 +77,7 @@ export async function deleteUserProject(uid: string, projectId: number) {
 }
 
 export async function getDriveFiles(uid: string) {
+  const db = getDb();
   try {
     return await db.select().from(driveFiles).where(eq(driveFiles.uid, uid)).orderBy(desc(driveFiles.lastSyncedAt));
   } catch (error) {
@@ -95,6 +99,7 @@ export async function saveDriveFileRecord(
     isPdiProject?: boolean;
   }
 ) {
+  const db = getDb();
   try {
     const inserted = await db.insert(driveFiles)
       .values({

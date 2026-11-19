@@ -1615,17 +1615,16 @@ export async function resolveAuthoritativeWorkspaceSession(
   } | null,
   options?: { forceRefreshToken?: boolean }
 ): Promise<WorkspaceSessionResolution> {
-  // Protection C1 (STAGING-00-B3): In Sandbox mode, resolve synthetic local session without touching Firebase Auth or Firestore
+  // Protection C1 & STAGING-00-B4-E: In Sandbox mode, resolve synthetic local session without touching Firebase Auth or Firestore and without Super Admin privileges
   if (isStagingSandboxMode()) {
     seedSandboxDefaultProjectIfEmpty();
     const syntheticProfile = getSandboxSyntheticProfile();
-    const isSuper = syntheticProfile.role === "super_admin";
     return {
       status: "active",
       canAccessWorkspace: true,
       canAccessActivation: false,
-      isSuperAdmin: isSuper,
-      authMode: isSuper ? "super_admin" : "client",
+      isSuperAdmin: false,
+      authMode: "client",
       profile: syntheticProfile as unknown as PdiUserProfile,
     };
   }

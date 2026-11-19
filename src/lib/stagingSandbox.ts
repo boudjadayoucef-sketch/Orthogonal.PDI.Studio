@@ -18,6 +18,7 @@ export const SANDBOX_BANNER_LINES = [
   "ENVIRONNEMENT SANDBOX DE TEST — AI STUDIO SHARE",
   "DONNÉES SYNTHÉTIQUES LOCALES",
   "FIREBASE PRODUCTION DÉSACTIVÉ",
+  "STAGING-00-B4 — ENVIRONNEMENT DE TEST",
 ] as const;
 
 export const HISTORICAL_PROTECTED_STORAGE_PREFIXES = [
@@ -380,7 +381,7 @@ export function resetSandboxLocalStorageOnly(
 // SYNTHETIC LOCAL PROFILES & DEMO SEED DATA (SANDBOX ONLY, NEVER SERVER AUTH)
 // ============================================================================
 
-export type SandboxSyntheticRole = "client" | "super_admin";
+export type SandboxSyntheticRole = "client";
 
 export interface SandboxSyntheticProfile {
   uid: string;
@@ -390,8 +391,8 @@ export interface SandboxSyntheticProfile {
   country: string;
   countryCode: string;
   city: string;
-  role: "client" | "super_admin";
-  accountType: "pro" | "enterprise";
+  role: "client";
+  accountType: "pro";
   subscriptionPlan: "yearly";
   status: "active";
   createdAt: string;
@@ -399,49 +400,30 @@ export interface SandboxSyntheticProfile {
 
 const SANDBOX_ROLE_KEY = `${SANDBOX_STORAGE_PREFIX}synthetic.role.v1`;
 
+/**
+ * STAGING-00-B4-E :
+ * L'identité synthétique Sandbox reste strictement locale et ne possède jamais de privilège Super Admin.
+ */
 export function getSandboxSyntheticRole(
-  storage: Pick<Storage, "getItem"> | null = getDefaultStorage()
+  _storage: Pick<Storage, "getItem"> | null = getDefaultStorage()
 ): SandboxSyntheticRole {
-  try {
-    const saved = storage?.getItem(SANDBOX_ROLE_KEY);
-    if (saved === "super_admin") return "super_admin";
-  } catch {
-    // Ignore
-  }
   return "client";
 }
 
 export function setSandboxSyntheticRole(
-  role: SandboxSyntheticRole,
+  _role: SandboxSyntheticRole,
   storage: Pick<Storage, "setItem"> | null = getDefaultStorage()
 ): void {
   try {
-    storage?.setItem(SANDBOX_ROLE_KEY, role);
+    storage?.setItem(SANDBOX_ROLE_KEY, "client");
   } catch {
     // Ignore
   }
 }
 
 export function getSandboxSyntheticProfile(
-  role: SandboxSyntheticRole = getSandboxSyntheticRole()
+  _role: SandboxSyntheticRole = getSandboxSyntheticRole()
 ): SandboxSyntheticProfile {
-  if (role === "super_admin") {
-    return {
-      uid: `${SANDBOX_SYNTHETIC_UID_PREFIX}admin_preview`,
-      email: "sandbox.admin.local@orthogonal-pdi.invalid",
-      name: "Simulation UI Admin (Sandbox Locale)",
-      company: "ORTHOGONAL PD&I — Sandbox Locale",
-      country: "Algérie",
-      countryCode: "DZ",
-      city: "Alger",
-      role: "super_admin",
-      accountType: "enterprise",
-      subscriptionPlan: "yearly",
-      status: "active",
-      createdAt: "2026-01-01T00:00:00.000Z",
-    };
-  }
-
   return {
     uid: `${SANDBOX_SYNTHETIC_UID_PREFIX}engineer_01`,
     email: "sandbox.engineer.local@orthogonal-pdi.invalid",

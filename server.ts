@@ -7,21 +7,24 @@
 
 import "dotenv/config";
 import express from "express";
+import type { Server } from "http";
+import type { AddressInfo } from "net";
 import path from "path";
 // PATCH 017G : inspection reelle du dossier dist/assets.
 import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import {
-  requireAuth,
+  createRequireAuth,
   requireSuperAdmin,
   requireEmailVerified,
-  rejectInStagingSandboxMode,
+  createRejectInStagingSandboxMode,
   AuthRequest,
 } from "./src/middleware/auth.ts";
 import {
   getServerAdminAuth,
   getServerAdminDb,
   isServerFirebaseRuntimeDisabled,
+  shouldBlockServerFirebaseInit,
 } from "./src/lib/firebase-admin.ts";
 import { isStagingSandboxMode } from "./src/lib/stagingSandbox.ts";
 import { 
@@ -50,366 +53,495 @@ import {
 } from "./src/db/projects.ts";
 import { getOrCreateUser } from "./src/db/users.ts";
 
-
-// Validation sûre de la configuration au démarrage (Section D2 & Protection C5 STAGING-00-B3)
-const configValidation = verifyProductionConfig();
-if (!configValidation.isSafe) {
-  if (process.env.NODE_ENV === "production" || configValidation.hasFatalSandboxConfigError) {
-    console.error(configValidation.errorMessage);
-    process.exit(1);
-  } else {
-    console.warn("[SECURITY WARN] Development configuration note:", configValidation.errorMessage);
-  }
+export interface PdiServerDependencies {
+  requireAuthMiddleware?: express.RequestHandler;
+  getAdminAuth?: typeof getServerAdminAuth;
+  getAdminDb?: typeof getServerAdminDb;
+  getUserProjects?: typeof getUserProjects;
+  createOrUpdateProject?: typeof createOrUpdateProject;
+  deleteUserProject?: typeof deleteUserProject;
+  getOrCreateUser?: typeof getOrCreateUser;
 }
 
-const app = express();
-const PORT = Number(process.env.PORT) || 3000;
+export interface CreatePdiExpressAppOptions {
+  env?: NodeJS.ProcessEnv;
+  mountErrorHandler?: boolean;
+  dependencies?: PdiServerDependencies;
+}
 
-// Hardening & Security Middleware ORTHOGONAL - ENG
-app.disable("x-powered-by");
+export interface StartServerOptions {
+  host?: string;
+  port?: number;
+  attachFrontend?: boolean;
+  env?: NodeJS.ProcessEnv;
+  dependencies?: PdiServerDependencies;
+}
 
-// Protection Globale contre Path Traversal, Dotfiles et sondes de fichiers sensibles (SEC-01-FIX-02)
-app.use((req, res, next) => {
-  if (isSuspiciousRequestPath(req.originalUrl || req.url)) {
-    return res.status(403).type("text/plain").send("Forbidden: Invalid request path or file probe");
-  }
-  next();
-});
+export interface StartedPdiServer {
+  app: express.Express;
+  server: Server;
+  host: string;
+  port: number;
+  close: () => Promise<void>;
+}
 
-// Configuration explicite Trust Proxy pour Hostinger VPS / Nginx / LiteSpeed (Section E1)
-const trustProxyConfig = process.env.TRUST_PROXY || (process.env.NODE_ENV === "production" ? 1 : false);
-app.set("trust proxy", trustProxyConfig);
+// Keep unused DB helpers explicitly referenced without invoking PostgreSQL
+void getDriveFiles;
+void saveDriveFileRecord;
 
-// Whitelist CORS dynamique contrôlée et validée via environnement (Section E2 & SEC-01-FIX-07-R1 D1.2)
-const allowedOriginsValidation = validateAllowedOrigins(process.env.ALLOWED_ORIGINS, {
-  isProduction: process.env.NODE_ENV === "production",
-  appUrl: process.env.APP_URL
-});
-const ALLOWED_ORIGINS = allowedOriginsValidation.origins;
+/**
+ * STAGING-00-B4-C :
+ * Construit la véritable application Express avec tous les middlewares de sécurité,
+ * les routes santé, les routes protégées et le coupe-circuit Sandbox/Fail-Closed.
+ */
+export function createPdiExpressApp(options: CreatePdiExpressAppOptions = {}): express.Express {
+  const runtimeEnv = options.env ?? process.env;
+  const deps = options.dependencies ?? {};
 
-// In-Memory Rate Limiter BORNÉ pour protéger l'API sans fuite mémoire (Section F1)
-const apiRateLimiter = createBoundedRateLimiter({
-  windowMs: 60000, // 1 minute
-  maxRequests: 100, // Max 100 requêtes/min par IP
-  maxEntries: 5000 // Borne supérieure stricte
-});
-
-// Middleware Global de Sécurité (Headers, CORS, CSP, HSTS)
-app.use((req, res, next) => {
-  // CORS sécurisé dynamique
-  const origin = req.headers.origin;
-  if (origin && ALLOWED_ORIGINS.includes(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Access-Control-Allow-Credentials", "true");
-  }
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,Paddle-Signature,X-SlickPay-Signature,X-Signature");
-
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(200);
+  // Validation sûre de la configuration au démarrage (Section D2 & Protection C5 STAGING-00-B3)
+  const configValidation = verifyProductionConfig(runtimeEnv);
+  if (!configValidation.isSafe) {
+    if (runtimeEnv.NODE_ENV === "production" || configValidation.hasFatalSandboxConfigError) {
+      throw new Error(configValidation.errorMessage || "Fatal server configuration error");
+    } else {
+      console.warn("[SECURITY WARN] Development configuration note:", configValidation.errorMessage);
+    }
   }
 
-  // Headers de sécurité
-  res.setHeader("X-Content-Type-Options", "nosniff");
-  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
-  res.setHeader("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload");
+  const app = express();
 
-  // Content-Security-Policy durcie : frame-ancestors résolu et validé sans wildcard '*' en production (SEC-01-FIX-07-R1 D1.1)
-  const frameAncestorsPolicy = resolveCspFrameAncestors(process.env);
-  res.setHeader(
-    "Content-Security-Policy",
-    `default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://apis.google.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: https: blob:; connect-src 'self' https: wss:; frame-src 'self' https://ais-dev-6etwlfzn4irzgw5ljyhzsh-76486687314.europe-west2.run.app https://ais-pre-6etwlfzn4irzgw5ljyhzsh-76486687314.europe-west2.run.app; ${frameAncestorsPolicy.directive}; object-src 'none'`
-  );
-  res.setHeader("X-Engine-Vendor", "ORTHOGONAL - ENG");
-  res.setHeader("X-Engine-Product", "Piping Design & Isometrics");
-  next();
-});
+  // Hardening & Security Middleware ORTHOGONAL - ENG
+  app.disable("x-powered-by");
 
-// Appliquer le rate limiter borné sur toutes les requêtes API (Section F1)
-app.use("/api", apiRateLimiter.middleware());
-
-// Limites strictes des corps HTTP (256kb max, sans capture rawBody globale — SEC-01-FIX-07-R1 D2.1)
-app.use(createStandardJsonParser());
-app.use(createStandardUrlencodedParser());
-
-// Endpoints santé minimaux (Section E5)
-const handleHealthCheck = (_req: express.Request, res: express.Response) => {
-  res.json({
-    status: "ok",
-    service: "pdi-industrial-cad",
-    vendor: "ORTHOGONAL - ENG",
-    engineVersion: "4.8d",
-    timestamp: new Date().toISOString()
+  // Protection Globale contre Path Traversal, Dotfiles et sondes de fichiers sensibles (SEC-01-FIX-02)
+  app.use((req, res, next) => {
+    if (isSuspiciousRequestPath(req.originalUrl || req.url)) {
+      return res.status(403).type("text/plain").send("Forbidden: Invalid request path or file probe");
+    }
+    next();
   });
-};
-app.get("/api/health", handleHealthCheck);
-app.get("/healthz", handleHealthCheck);
 
-// Cloud SQL User Sync & Projects Endpoints (Protected by C2 rejectInStagingSandboxMode)
-app.post("/api/auth/sync-user", rejectInStagingSandboxMode, requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const uid = req.user?.uid;
-    const email = req.user?.email || "unknown@domain.com";
-    if (!uid) return res.status(401).json({ error: "Missing user uid" });
+  // Configuration explicite Trust Proxy pour Hostinger VPS / Nginx / LiteSpeed (Section E1)
+  const trustProxyConfig = runtimeEnv.TRUST_PROXY || (runtimeEnv.NODE_ENV === "production" ? 1 : false);
+  app.set("trust proxy", trustProxyConfig);
 
-    const user = await getOrCreateUser(
-      uid,
-      email,
-      req.body?.displayName || req.user?.name,
-      req.body?.photoUrl || req.user?.picture
+  // Whitelist CORS dynamique contrôlée et validée via environnement (Section E2 & SEC-01-FIX-07-R1 D1.2)
+  const allowedOriginsValidation = validateAllowedOrigins(runtimeEnv.ALLOWED_ORIGINS, {
+    isProduction: runtimeEnv.NODE_ENV === "production",
+    appUrl: runtimeEnv.APP_URL
+  });
+  const ALLOWED_ORIGINS = allowedOriginsValidation.origins;
+
+  // In-Memory Rate Limiter BORNÉ pour protéger l'API sans fuite mémoire (Section F1)
+  const apiRateLimiter = createBoundedRateLimiter({
+    windowMs: 60000, // 1 minute
+    maxRequests: 100, // Max 100 requêtes/min par IP
+    maxEntries: 5000 // Borne supérieure stricte
+  });
+
+  // Middleware Global de Sécurité (Headers, CORS, CSP, HSTS)
+  app.use((req, res, next) => {
+    // CORS sécurisé dynamique
+    const origin = req.headers.origin;
+    if (origin && ALLOWED_ORIGINS.includes(origin)) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Access-Control-Allow-Credentials", "true");
+    }
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,Paddle-Signature,X-SlickPay-Signature,X-Signature");
+
+    if (req.method === "OPTIONS") {
+      return res.sendStatus(200);
+    }
+
+    // Headers de sécurité
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+    res.setHeader("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload");
+
+    // Content-Security-Policy durcie : frame-ancestors résolu et validé sans wildcard '*' en production (SEC-01-FIX-07-R1 D1.1)
+    const frameAncestorsPolicy = resolveCspFrameAncestors(runtimeEnv);
+    res.setHeader(
+      "Content-Security-Policy",
+      `default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://apis.google.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: https: blob:; connect-src 'self' https: wss:; frame-src 'self' https://ais-dev-6etwlfzn4irzgw5ljyhzsh-76486687314.europe-west2.run.app https://ais-pre-6etwlfzn4irzgw5ljyhzsh-76486687314.europe-west2.run.app; ${frameAncestorsPolicy.directive}; object-src 'none'`
     );
-    res.json({ user });
-  } catch (err: any) {
-    console.error("Error syncing user to Cloud SQL:", err);
-    res.status(500).json({ error: "Failed to sync user profile." });
-  }
-});
+    res.setHeader("X-Engine-Vendor", "ORTHOGONAL - ENG");
+    res.setHeader("X-Engine-Product", "Piping Design & Isometrics");
+    next();
+  });
 
-// Admin: Assign Custom Claims (Role) securely via Firebase Admin SDK (Section A3 & Protection C2)
-app.post("/api/admin/set-user-role", rejectInStagingSandboxMode, requireAuth, requireSuperAdmin, requireEmailVerified, async (req: AuthRequest, res) => {
-  try {
-    const { targetUid, role } = req.body;
-    if (!targetUid || typeof targetUid !== "string" || targetUid.trim().length === 0 || targetUid.length > 128) {
-      return res.status(400).json({ error: "Paramètre targetUid valide requis." });
-    }
-    if (!role || typeof role !== "string") {
-      return res.status(400).json({ error: "Paramètre role requis." });
-    }
+  // Appliquer le rate limiter borné sur toutes les requêtes API (Section F1)
+  app.use("/api", apiRateLimiter.middleware());
 
-    // Alignment strictly with PdiUserRole ("super_admin" | "admin" | "client" | "guest" | "demo")
-    const validRoles = ["super_admin", "admin", "client", "guest", "demo"];
-    if (!validRoles.includes(role)) {
-      return res.status(400).json({ error: `Rôle invalide. Rôles autorisés: ${validRoles.join(", ")}` });
-    }
+  // Limites strictes des corps HTTP (256kb max, sans capture rawBody globale — SEC-01-FIX-07-R1 D2.1)
+  app.use(createStandardJsonParser());
+  app.use(createStandardUrlencodedParser());
 
-    // Protection anti-escalade / anti-verrouillage : un administrateur ne peut pas rétrograder son propre compte directement
-    if (req.user?.uid === targetUid && role !== "super_admin") {
-      return res.status(400).json({ error: "Un super-administrateur ne peut pas rétrograder son propre compte via cette route." });
-    }
-
-    await getServerAdminAuth().setCustomUserClaims(targetUid, { role });
-    console.log(`[Admin] Custom Claim 'role: ${role}' assigned to UID: ${targetUid} by verified super_admin UID: ${req.user?.uid}`);
-    
-    res.json({ 
-      success: true, 
-      targetUid, 
-      role, 
-      message: "Rôle attribué via Firebase Custom Claim. Un rafraîchissement du token client (getIdToken(true)) est nécessaire pour appliquer le rôle." 
-    });
-  } catch (err: any) {
-    console.error("Error setting custom user claim:", err?.message || err);
-    res.status(500).json({
-      error: "Internal server error",
-      code: "ADMIN_ROLE_UPDATE_FAILED"
-    });
-  }
-});
-
-// ==========================================
-// Slick-Pay & Paddle Webhook IPN & Pending Order Endpoints (SEC-01-FIX-05-B & Protection C2 STAGING-00-B3-R1/R2)
-// ==========================================
-if (isStagingSandboxMode(process.env) || isServerFirebaseRuntimeDisabled) {
-  // STAGING-00-B3-R1 / R2: Do NOT instantiate Firebase-backed repositories or processors when Sandbox or fail-closed gate is active.
-  const rejectWhenFirebaseRuntimeDisabled: express.RequestHandler = (req, res, next) => {
-    if (isStagingSandboxMode(process.env)) {
-      return rejectInStagingSandboxMode(req, res, next);
-    }
-    return res.status(503).json({
-      error:
-        "Service Unavailable: Server Firebase Admin runtime is disabled (explicit coherent PDI_ENV and VITE_PDI_ENV required).",
-      code: "server/firebase-runtime-disabled",
+  // Endpoints santé minimaux (Section E5)
+  const handleHealthCheck = (_req: express.Request, res: express.Response) => {
+    res.json({
+      status: "ok",
+      service: "pdi-industrial-cad",
+      vendor: "ORTHOGONAL - ENG",
+      engineVersion: "4.8d",
+      timestamp: new Date().toISOString()
     });
   };
-  app.post("/api/payments/orders", rejectWhenFirebaseRuntimeDisabled);
-  app.post("/api/webhooks/slickpay", rejectWhenFirebaseRuntimeDisabled);
-  app.post("/api/webhooks/paddle", rejectWhenFirebaseRuntimeDisabled);
-} else {
-  const activeAdminDb = getServerAdminDb();
-  const activeAdminAuth = getServerAdminAuth();
+  app.get("/api/health", handleHealthCheck);
+  app.get("/healthz", handleHealthCheck);
 
-  const pendingOrderRepository = createPendingOrderRepository({
-    adminDb: activeAdminDb
+  const sandboxGuard = createRejectInStagingSandboxMode(runtimeEnv);
+  const resolveAdminAuth = deps.getAdminAuth ?? getServerAdminAuth;
+  const resolveAdminDb = deps.getAdminDb ?? getServerAdminDb;
+  const authMiddleware =
+    deps.requireAuthMiddleware ??
+    createRequireAuth(runtimeEnv, { getAdminAuth: resolveAdminAuth });
+  const fetchProjects = deps.getUserProjects ?? getUserProjects;
+  const upsertProject = deps.createOrUpdateProject ?? createOrUpdateProject;
+  const removeProject = deps.deleteUserProject ?? deleteUserProject;
+  const syncUser = deps.getOrCreateUser ?? getOrCreateUser;
+
+  // Cloud SQL User Sync & Projects Endpoints (Protected by C2 sandboxGuard bound to runtimeEnv)
+  app.post("/api/auth/sync-user", sandboxGuard, authMiddleware, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user?.uid;
+      const email = req.user?.email || "unknown@domain.com";
+      if (!uid) return res.status(401).json({ error: "Missing user uid" });
+
+      const user = await syncUser(
+        uid,
+        email,
+        req.body?.displayName || req.user?.name,
+        req.body?.photoUrl || req.user?.picture
+      );
+      res.json({ user });
+    } catch (err: any) {
+      console.error("Error syncing user to Cloud SQL:", err);
+      res.status(500).json({ error: "Failed to sync user profile." });
+    }
   });
 
-  const webhookIdempotencyRepository = createWebhookIdempotencyRepository({
-    adminDb: activeAdminDb
-  });
-
-  const paymentWebhookProcessor = createPaymentWebhookProcessor({
-    adminDb: activeAdminDb,
-    adminAuth: activeAdminAuth,
-    idempotencyRepository: webhookIdempotencyRepository,
-    pendingOrderRepository
-  });
-
-  // Authoritative Pending Order Creation (Server-side UID & unguessable orderId)
-  app.post(
-    "/api/payments/orders",
-    rejectInStagingSandboxMode,
-    ...createPendingOrderRoute({
-      pendingOrderRepository
-    })
-  );
-
-  // Slick-Pay Webhook (Algeria - BaridiMob / Edahabia) — Strict Fail-Closed
-  app.post("/api/webhooks/slickpay", rejectInStagingSandboxMode, createSlickPayWebhookHandler());
-
-  // Paddle Webhook (International EUR/USD) — Strict Isolated RawBody Parser (256kb) & Order Association (SEC-01-FIX-07-R1 D2.2)
-  app.post(
-    "/api/webhooks/paddle",
-    rejectInStagingSandboxMode,
-    createPaddleWebhookBodyParser(),
-    createPaddleWebhookHandler({
-      processor: paymentWebhookProcessor
-    })
-  );
-}
-
-app.get("/api/projects", rejectInStagingSandboxMode, requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const uid = req.user?.uid;
-    if (!uid) return res.status(401).json({ error: "Unauthorized" });
-    const userProjects = await getUserProjects(uid);
-    res.json({ projects: userProjects });
-  } catch (err: any) {
-    console.error("Error fetching projects from Cloud SQL:", err);
-    res.status(500).json({ error: "Failed to fetch projects." });
-  }
-});
-
-app.post("/api/projects", rejectInStagingSandboxMode, requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const uid = req.user?.uid;
-    if (!uid) return res.status(401).json({ error: "Unauthorized" });
-    const saved = await createOrUpdateProject(uid, req.body);
-    res.json({ project: saved });
-  } catch (err: any) {
-    console.error("Error saving project to Cloud SQL:", err);
-    res.status(500).json({ error: "Failed to save project." });
-  }
-});
-
-app.delete("/api/projects/:id", rejectInStagingSandboxMode, requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const uid = req.user?.uid;
-    const projectId = Number(req.params.id);
-    if (!uid || isNaN(projectId)) return res.status(400).json({ error: "Invalid request" });
-    await deleteUserProject(uid, projectId);
-    res.json({ success: true });
-  } catch (err: any) {
-    console.error("Error deleting project from Cloud SQL:", err);
-    res.status(500).json({ error: "Failed to delete project." });
-  }
-});
-
-// =========================================================================
-// PIPELINE OCR & DÉTECTION TOPOLOGIQUE ISOMÉTRIE (0 API EXTERNE / LOCAL)
-// =========================================================================
-app.post("/api/sketch/detect-iso", async (_req, res) => {
-  // L'application fonctionne en 0 API externe (détection locale autonome / pointage assisté)
-  return res.json({
-    success: true,
-    data: null,
-  });
-});
-
-// Configure Express to serve built frontend static assets or mount Vite dev server
-async function startServer() {
-  if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), "dist");
-
-    // Protection Path Traversal & Dotfiles pour les requêtes statiques (Section E4)
-    app.use((req, res, next) => {
-      if (req.path.includes("..") || req.path.includes("/.") || req.path.startsWith("/.")) {
-        return res.status(403).type("text/plain").send("Forbidden: Invalid path syntax");
+  // Admin: Assign Custom Claims (Role) securely via Firebase Admin SDK (Section A3 & Protection C2)
+  app.post("/api/admin/set-user-role", sandboxGuard, authMiddleware, requireSuperAdmin, requireEmailVerified, async (req: AuthRequest, res) => {
+    try {
+      const { targetUid, role } = req.body;
+      if (!targetUid || typeof targetUid !== "string" || targetUid.trim().length === 0 || targetUid.length > 128) {
+        return res.status(400).json({ error: "Paramètre targetUid valide requis." });
       }
-      next();
+      if (!role || typeof role !== "string") {
+        return res.status(400).json({ error: "Paramètre role requis." });
+      }
+
+      // Alignment strictly with PdiUserRole ("super_admin" | "admin" | "client" | "guest" | "demo")
+      const validRoles = ["super_admin", "admin", "client", "guest", "demo"];
+      if (!validRoles.includes(role)) {
+        return res.status(400).json({ error: `Rôle invalide. Rôles autorisés: ${validRoles.join(", ")}` });
+      }
+
+      // Protection anti-escalade / anti-verrouillage : un administrateur ne peut pas rétrograder son propre compte directement
+      if (req.user?.uid === targetUid && role !== "super_admin") {
+        return res.status(400).json({ error: "Un super-administrateur ne peut pas rétrograder son propre compte via cette route." });
+      }
+
+      await resolveAdminAuth().setCustomUserClaims(targetUid, { role });
+      console.log(`[Admin] Custom Claim 'role: ${role}' assigned to UID: ${targetUid} by verified super_admin UID: ${req.user?.uid}`);
+      
+      res.json({ 
+        success: true, 
+        targetUid, 
+        role, 
+        message: "Rôle attribué via Firebase Custom Claim. Un rafraîchissement du token client (getIdToken(true)) est nécessaire pour appliquer le rôle." 
+      });
+    } catch (err: any) {
+      console.error("Error setting custom user claim:", err?.message || err);
+      res.status(500).json({
+        error: "Internal server error",
+        code: "ADMIN_ROLE_UPDATE_FAILED"
+      });
+    }
+  });
+
+  // ==========================================
+  // Slick-Pay & Paddle Webhook IPN & Pending Order Endpoints (SEC-01-FIX-05-B & Protection C2 STAGING-00-B3-R1/R2/B4)
+  // ==========================================
+  const hasInjectedFirebaseDeps = Boolean(deps.getAdminDb && deps.getAdminAuth);
+  const sandboxModeActive = isStagingSandboxMode(runtimeEnv);
+  const firebaseRuntimeBlocked =
+    sandboxModeActive ||
+    shouldBlockServerFirebaseInit(runtimeEnv) ||
+    (!hasInjectedFirebaseDeps && isServerFirebaseRuntimeDisabled);
+
+  if (firebaseRuntimeBlocked) {
+    // STAGING-00-B3-R1 / R2 / B4-B / FIX-01: Do NOT instantiate Firebase-backed repositories or processors when Sandbox or fail-closed gate is active for runtimeEnv.
+    const rejectWhenFirebaseRuntimeDisabled: express.RequestHandler = (req, res, _next) => {
+      return sandboxGuard(req, res, () => {
+        if (sandboxModeActive) {
+          return res.status(403).json({
+            error:
+              "Forbidden: Server-side administrative, payment, webhook, and database persistence routes are disabled in Sandbox mode.",
+            code: "sandbox/server-mutation-forbidden",
+          });
+        }
+        return res.status(503).json({
+          error:
+            "Service Unavailable: Server Firebase Admin runtime is disabled (explicit coherent PDI_ENV and VITE_PDI_ENV required).",
+          code: "server/firebase-runtime-disabled",
+        });
+      });
+    };
+    app.post("/api/payments/orders", rejectWhenFirebaseRuntimeDisabled);
+    app.post("/api/webhooks/slickpay", rejectWhenFirebaseRuntimeDisabled);
+    app.post("/api/webhooks/paddle", rejectWhenFirebaseRuntimeDisabled);
+  } else {
+    const activeAdminDb = resolveAdminDb();
+    const activeAdminAuth = resolveAdminAuth();
+
+    const pendingOrderRepository = createPendingOrderRepository({
+      adminDb: activeAdminDb
     });
 
-    // PATCH 017G : index.html ne doit jamais etre mis en cache, sinon il
-    // continue de pointer vers des assets haches qui n existent plus.
-    app.use(
-      express.static(distPath, {
-        dotfiles: "ignore",
-        setHeaders: (res, filePath) => {
-          if (filePath.endsWith("index.html")) res.setHeader("Cache-Control", "no-store");
-        },
+    const webhookIdempotencyRepository = createWebhookIdempotencyRepository({
+      adminDb: activeAdminDb
+    });
+
+    const paymentWebhookProcessor = createPaymentWebhookProcessor({
+      adminDb: activeAdminDb,
+      adminAuth: activeAdminAuth,
+      idempotencyRepository: webhookIdempotencyRepository,
+      pendingOrderRepository
+    });
+
+    // Authoritative Pending Order Creation (Server-side UID & unguessable orderId)
+    app.post(
+      "/api/payments/orders",
+      sandboxGuard,
+      ...createPendingOrderRoute({
+        pendingOrderRepository,
+        verifyIdToken: deps.getAdminAuth
+          ? (token) => activeAdminAuth.verifyIdToken(token)
+          : undefined,
       })
     );
 
-    // PATCH 017G : sonde de diagnostic des assets (Section E6 : minimisée en production)
-    app.get("/api/health/assets", (_req, res) => {
-      if (process.env.NODE_ENV === "production" && !process.env.ENABLE_ASSET_DIAGNOSTICS) {
-        return res.json({
-          status: "ok",
-          ready: fs.existsSync(distPath) && fs.existsSync(path.join(distPath, "index.html"))
-        });
-      }
-      try {
-        const assetsDir = path.join(distPath, "assets");
-        const files = fs.existsSync(assetsDir) ? fs.readdirSync(assetsDir) : [];
-        res.json({
-          distExists: fs.existsSync(distPath),
-          indexHtml: fs.existsSync(path.join(distPath, "index.html")),
-          css: files.filter((f) => f.endsWith(".css")),
-          jsCount: files.filter((f) => f.endsWith(".js")).length,
-        });
-      } catch (err: any) {
-        console.error("Asset health check error:", err?.message || err);
-        res.status(500).json({ error: "Internal asset health check error" });
-      }
-    });
+    // Slick-Pay Webhook (Algeria - BaridiMob / Edahabia) — Strict Fail-Closed
+    app.post("/api/webhooks/slickpay", sandboxGuard, createSlickPayWebhookHandler());
 
-    // PATCH 017H : route de secours pour les styles. Certaines plateformes
-    // repondent 403 sur /assets/*.css ; /api/* reste accessible. On concatene
-    // les CSS presents dans dist/assets et on les sert en text/css.
-    app.get("/api/style/main.css", (_req, res) => {
-      try {
-        const assetsDir = path.join(distPath, "assets");
-        const files = fs.existsSync(assetsDir)
-          ? fs.readdirSync(assetsDir).filter((f) => f.endsWith(".css"))
-          : [];
-        if (files.length === 0) {
-          res.status(404).type("text/plain").send("Aucun bundle CSS dans dist/assets");
+    // Paddle Webhook (International EUR/USD) — Strict Isolated RawBody Parser (256kb) & Order Association (SEC-01-FIX-07-R1 D2.2)
+    app.post(
+      "/api/webhooks/paddle",
+      sandboxGuard,
+      createPaddleWebhookBodyParser(),
+      createPaddleWebhookHandler({
+        processor: paymentWebhookProcessor
+      })
+    );
+  }
+
+  app.get("/api/projects", sandboxGuard, authMiddleware, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user?.uid;
+      if (!uid) return res.status(401).json({ error: "Unauthorized" });
+      const userProjects = await fetchProjects(uid);
+      res.json({ projects: userProjects });
+    } catch (err: any) {
+      console.error("Error fetching projects from Cloud SQL:", err);
+      res.status(500).json({ error: "Failed to fetch projects." });
+    }
+  });
+
+  app.post("/api/projects", sandboxGuard, authMiddleware, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user?.uid;
+      if (!uid) return res.status(401).json({ error: "Unauthorized" });
+      const saved = await upsertProject(uid, req.body);
+      res.json({ project: saved });
+    } catch (err: any) {
+      console.error("Error saving project to Cloud SQL:", err);
+      res.status(500).json({ error: "Failed to save project." });
+    }
+  });
+
+  app.delete("/api/projects/:id", sandboxGuard, authMiddleware, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user?.uid;
+      const projectId = Number(req.params.id);
+      if (!uid || isNaN(projectId)) return res.status(400).json({ error: "Invalid request" });
+      await removeProject(uid, projectId);
+      res.json({ success: true });
+    } catch (err: any) {
+      console.error("Error deleting project from Cloud SQL:", err);
+      res.status(500).json({ error: "Failed to delete project." });
+    }
+  });
+
+  // =========================================================================
+  // PIPELINE OCR & DÉTECTION TOPOLOGIQUE ISOMÉTRIE (0 API EXTERNE / LOCAL)
+  // =========================================================================
+  app.post("/api/sketch/detect-iso", async (_req, res) => {
+    // L'application fonctionne en 0 API externe (détection locale autonome / pointage assisté)
+    return res.json({
+      success: true,
+      data: null,
+    });
+  });
+
+  if (options.mountErrorHandler !== false) {
+    app.use(createGlobalExpressErrorHandler());
+  }
+
+  return app;
+}
+
+// Configure Express to serve built frontend static assets or mount Vite dev server
+export async function startServer(options: StartServerOptions = {}): Promise<StartedPdiServer> {
+  const runtimeEnv = options.env ?? process.env;
+  const host = options.host ?? "0.0.0.0";
+  const port = options.port !== undefined ? options.port : Number(runtimeEnv.PORT) || 3000;
+  const attachFrontend = options.attachFrontend !== false;
+
+  const app = createPdiExpressApp({
+    env: runtimeEnv,
+    mountErrorHandler: false,
+    dependencies: options.dependencies,
+  });
+
+  if (attachFrontend) {
+    if (runtimeEnv.NODE_ENV !== "production") {
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: "spa",
+      });
+      app.use(vite.middlewares);
+    } else {
+      const distPath = path.join(process.cwd(), "dist");
+
+      // Protection Path Traversal & Dotfiles pour les requêtes statiques (Section E4)
+      app.use((req, res, next) => {
+        if (req.path.includes("..") || req.path.includes("/.") || req.path.startsWith("/.")) {
+          return res.status(403).type("text/plain").send("Forbidden: Invalid path syntax");
+        }
+        next();
+      });
+
+      // PATCH 017G : index.html ne doit jamais etre mis en cache, sinon il
+      // continue de pointer vers des assets haches qui n existent plus.
+      app.use(
+        express.static(distPath, {
+          dotfiles: "ignore",
+          setHeaders: (res, filePath) => {
+            if (filePath.endsWith("index.html")) res.setHeader("Cache-Control", "no-store");
+          },
+        })
+      );
+
+      // PATCH 017G : sonde de diagnostic des assets (Section E6 : minimisée en production)
+      app.get("/api/health/assets", (_req, res) => {
+        if (runtimeEnv.NODE_ENV === "production" && !runtimeEnv.ENABLE_ASSET_DIAGNOSTICS) {
+          return res.json({
+            status: "ok",
+            ready: fs.existsSync(distPath) && fs.existsSync(path.join(distPath, "index.html"))
+          });
+        }
+        try {
+          const assetsDir = path.join(distPath, "assets");
+          const files = fs.existsSync(assetsDir) ? fs.readdirSync(assetsDir) : [];
+          res.json({
+            distExists: fs.existsSync(distPath),
+            indexHtml: fs.existsSync(path.join(distPath, "index.html")),
+            css: files.filter((f) => f.endsWith(".css")),
+            jsCount: files.filter((f) => f.endsWith(".js")).length,
+          });
+        } catch (err: any) {
+          console.error("Asset health check error:", err?.message || err);
+          res.status(500).json({ error: "Internal asset health check error" });
+        }
+      });
+
+      // PATCH 017H : route de secours pour les styles. Certaines plateformes
+      // repondent 403 sur /assets/*.css ; /api/* reste accessible. On concatene
+      // les CSS presents dans dist/assets et on les sert en text/css.
+      app.get("/api/style/main.css", (_req, res) => {
+        try {
+          const assetsDir = path.join(distPath, "assets");
+          const files = fs.existsSync(assetsDir)
+            ? fs.readdirSync(assetsDir).filter((f) => f.endsWith(".css"))
+            : [];
+          if (files.length === 0) {
+            res.status(404).type("text/plain").send("Aucun bundle CSS dans dist/assets");
+            return;
+          }
+          const css = files
+            .map((f) => fs.readFileSync(path.join(assetsDir, f), "utf-8"))
+            .join("\n");
+          res.setHeader("Content-Type", "text/css; charset=utf-8");
+          res.setHeader("Cache-Control", "no-store");
+          res.send(css);
+        } catch (err: any) {
+          console.error("Error reading CSS bundle:", err?.message || err);
+          res.status(500).type("text/plain").send("Internal Server Error");
+        }
+      });
+
+      app.get("*", (req, res) => {
+        // PATCH 017G : ne jamais renvoyer index.html a la place d un asset.
+        // C est ce fallback qui masquait l absence du bundle CSS : le navigateur
+        // recevait du HTML en text/html et ignorait la feuille sans erreur.
+        if (path.extname(req.path)) {
+          res.status(404).type("text/plain").send("Asset not found");
           return;
         }
-        const css = files
-          .map((f) => fs.readFileSync(path.join(assetsDir, f), "utf-8"))
-          .join("\n");
-        res.setHeader("Content-Type", "text/css; charset=utf-8");
         res.setHeader("Cache-Control", "no-store");
-        res.send(css);
-      } catch (err: any) {
-        console.error("Error reading CSS bundle:", err?.message || err);
-        res.status(500).type("text/plain").send("Internal Server Error");
-      }
-    });
-
-    app.get("*", (req, res) => {
-      // PATCH 017G : ne jamais renvoyer index.html a la place d un asset.
-      // C est ce fallback qui masquait l absence du bundle CSS : le navigateur
-      // recevait du HTML en text/html et ignorait la feuille sans erreur.
-      if (path.extname(req.path)) {
-        res.status(404).type("text/plain").send("Asset not found");
-        return;
-      }
-      res.setHeader("Cache-Control", "no-store");
-      res.sendFile(path.join(distPath, "index.html"));
-    });
+        res.sendFile(path.join(distPath, "index.html"));
+      });
+    }
   }
 
   // Middleware global de gestion des erreurs de parsing (400 / 413) et d'erreurs internes (500) en fin de chaîne (SEC-01-FIX-07-R1 D2.4 & D3)
   app.use(createGlobalExpressErrorHandler());
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://0.0.0.0:${PORT}`);
+  const server = await new Promise<Server>((resolve, reject) => {
+    const httpServer = app.listen(port, host, () => {
+      resolve(httpServer);
+    });
+    httpServer.on("error", reject);
   });
+
+  const address = server.address() as AddressInfo | null;
+  const boundPort = address && typeof address === "object" ? address.port : port;
+  console.log(`Server running on http://${host}:${boundPort}`);
+
+  const close = () =>
+    new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
+    });
+
+  return {
+    app,
+    server,
+    host,
+    port: boundPort,
+    close,
+  };
 }
 
-startServer();
+function isDirectServerExecution(): boolean {
+  if (process.env.PDI_SERVER_NO_AUTOSTART === "1") {
+    return false;
+  }
+  if (typeof require !== "undefined" && typeof module !== "undefined" && require.main === module) {
+    return true;
+  }
+  const entryArg = process.argv[1] ? path.resolve(process.argv[1]) : "";
+  return (
+    entryArg.endsWith(`${path.sep}server.ts`) ||
+    entryArg.endsWith(`${path.sep}server.cjs`) ||
+    entryArg.endsWith(`${path.sep}server.js`)
+  );
+}
+
+if (isDirectServerExecution()) {
+  startServer().catch((err) => {
+    console.error(err instanceof Error ? err.message : err);
+    process.exit(1);
+  });
+}

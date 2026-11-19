@@ -12,95 +12,130 @@ export interface AuthRequest extends Request {
 }
 
 /**
- * Protection C2 (STAGING-00-B3 / STAGING-00-B3-R1):
- * Refuses administrative, payment, webhook, and server database routes when Sandbox mode is active.
+ * Protection C2 (STAGING-00-B3 / STAGING-00-B3-R1 / STAGING-00-B4-D):
+ * 1. Immediately rejects any synthetic Sandbox identity header or Bearer token with HTTP 401
+ *    (`auth/synthetic-identity-forbidden`) before any Firebase or PostgreSQL access.
+ * 2. Refuses administrative, payment, webhook, and server database routes with HTTP 403
+ *    (`sandbox/server-mutation-forbidden`) when Sandbox mode is active.
  */
-export const rejectInStagingSandboxMode = (
-  _req: Request,
-  res: Response,
-  next: NextFunction
-) => {
-  if (isStagingSandboxMode(process.env)) {
-    return res.status(403).json({
-      error:
-        'Forbidden: Server-side administrative, payment, webhook, and database persistence routes are disabled in Sandbox mode.',
-      code: 'sandbox/server-mutation-forbidden',
-    });
-  }
-  next();
-};
-
-export const requireAuth = async (
-  req: AuthRequest,
-  res: Response,
-  next: NextFunction
-) => {
-  if (req.headers['x-pdi-sandbox-identity']) {
-    return res.status(401).json({
-      error: 'Unauthorized: Synthetic Sandbox identity is strictly forbidden on server',
-      code: 'auth/synthetic-identity-forbidden',
-    });
-  }
-
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ 
-      error: 'Unauthorized: Missing or invalid authorization header',
-      code: 'auth/missing-token'
-    });
-  }
-
-  const token = authHeader.split('Bearer ')[1]?.trim();
-  if (!token) {
-    return res.status(401).json({ 
-      error: 'Unauthorized: Empty bearer token',
-      code: 'auth/empty-token'
-    });
-  }
-
-  // Protection C2 (STAGING-00-B3): Never accept a synthetic local Sandbox token on the server
-  if (isSyntheticSandboxToken(token)) {
-    return res.status(401).json({
-      error: 'Unauthorized: Synthetic Sandbox identity is strictly forbidden on server',
-      code: 'auth/synthetic-identity-forbidden',
-    });
-  }
-
-  // STAGING-00-B3-R1 (Partie B): In Sandbox mode, Firebase Admin authentication is disabled on the server
-  if (isStagingSandboxMode(process.env)) {
-    return res.status(403).json({
-      error: 'Forbidden: Firebase Admin authentication is disabled in Sandbox mode.',
-      code: 'sandbox/server-auth-disabled',
-    });
-  }
-
-  try {
-    const decodedToken = await getServerAdminAuth().verifyIdToken(token);
-    if (
-      isSyntheticSandboxUid(decodedToken?.uid) ||
-      (decodedToken as Record<string, unknown>)?.sandbox_synthetic === true
-    ) {
+export function createRejectInStagingSandboxMode(
+  env?: Record<string, unknown>
+) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const effectiveEnv = env ?? process.env;
+    const headers = req?.headers ?? {};
+    if (headers['x-pdi-sandbox-identity']) {
       return res.status(401).json({
         error: 'Unauthorized: Synthetic Sandbox identity is strictly forbidden on server',
         code: 'auth/synthetic-identity-forbidden',
       });
     }
-    req.user = decodedToken;
-    next();
-  } catch (error: any) {
-    console.error('Error verifying Firebase ID token in requireAuth:', error?.code || error?.message || error);
-    if (error?.code === 'auth/id-token-expired') {
-      return res.status(401).json({ 
-        error: 'Unauthorized: Firebase ID token has expired. Please refresh token.',
-        code: 'auth/id-token-expired'
+
+    const authHeader = typeof headers.authorization === 'string' ? headers.authorization : '';
+    if (authHeader.startsWith('Bearer ')) {
+      const token = authHeader.split('Bearer ')[1]?.trim();
+      if (token && isSyntheticSandboxToken(token)) {
+        return res.status(401).json({
+          error: 'Unauthorized: Synthetic Sandbox identity is strictly forbidden on server',
+          code: 'auth/synthetic-identity-forbidden',
+        });
+      }
+    }
+
+    if (isStagingSandboxMode(effectiveEnv)) {
+      return res.status(403).json({
+        error:
+          'Forbidden: Server-side administrative, payment, webhook, and database persistence routes are disabled in Sandbox mode.',
+        code: 'sandbox/server-mutation-forbidden',
       });
     }
-    return res.status(401).json({ 
-      error: 'Unauthorized: Invalid authentication token',
-      code: 'auth/invalid-token'
-    });
-  }
-};
+    next();
+  };
+}
+
+export const rejectInStagingSandboxMode = createRejectInStagingSandboxMode();
+
+export interface CreateRequireAuthOptions {
+  getAdminAuth?: typeof getServerAdminAuth;
+}
+
+export function createRequireAuth(
+  env?: Record<string, unknown>,
+  options: CreateRequireAuthOptions = {}
+) {
+  const resolveAdminAuth = options.getAdminAuth ?? getServerAdminAuth;
+
+  return async (req: AuthRequest, res: Response, next: NextFunction) => {
+    const effectiveEnv = env ?? process.env;
+    if (req.headers['x-pdi-sandbox-identity']) {
+      return res.status(401).json({
+        error: 'Unauthorized: Synthetic Sandbox identity is strictly forbidden on server',
+        code: 'auth/synthetic-identity-forbidden',
+      });
+    }
+
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ 
+        error: 'Unauthorized: Missing or invalid authorization header',
+        code: 'auth/missing-token'
+      });
+    }
+
+    const token = authHeader.split('Bearer ')[1]?.trim();
+    if (!token) {
+      return res.status(401).json({ 
+        error: 'Unauthorized: Empty bearer token',
+        code: 'auth/empty-token'
+      });
+    }
+
+    // Protection C2 (STAGING-00-B3): Never accept a synthetic local Sandbox token on the server
+    if (isSyntheticSandboxToken(token)) {
+      return res.status(401).json({
+        error: 'Unauthorized: Synthetic Sandbox identity is strictly forbidden on server',
+        code: 'auth/synthetic-identity-forbidden',
+      });
+    }
+
+    // STAGING-00-B3-R1 (Partie B): In Sandbox mode, Firebase Admin authentication is disabled on the server
+    if (isStagingSandboxMode(effectiveEnv)) {
+      return res.status(403).json({
+        error: 'Forbidden: Firebase Admin authentication is disabled in Sandbox mode.',
+        code: 'sandbox/server-auth-disabled',
+      });
+    }
+
+    try {
+      const decodedToken = await resolveAdminAuth().verifyIdToken(token);
+      if (
+        isSyntheticSandboxUid(decodedToken?.uid) ||
+        (decodedToken as Record<string, unknown>)?.sandbox_synthetic === true
+      ) {
+        return res.status(401).json({
+          error: 'Unauthorized: Synthetic Sandbox identity is strictly forbidden on server',
+          code: 'auth/synthetic-identity-forbidden',
+        });
+      }
+      req.user = decodedToken;
+      next();
+    } catch (error: any) {
+      console.error('Error verifying Firebase ID token in requireAuth:', error?.code || error?.message || error);
+      if (error?.code === 'auth/id-token-expired') {
+        return res.status(401).json({ 
+          error: 'Unauthorized: Firebase ID token has expired. Please refresh token.',
+          code: 'auth/id-token-expired'
+        });
+      }
+      return res.status(401).json({ 
+        error: 'Unauthorized: Invalid authentication token',
+        code: 'auth/invalid-token'
+      });
+    }
+  };
+}
+
+export const requireAuth = createRequireAuth();
 
 /**
  * Verifies if user has a verified email address on their Firebase ID token.
