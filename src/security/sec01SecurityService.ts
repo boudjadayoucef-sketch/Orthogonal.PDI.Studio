@@ -14,6 +14,7 @@
  */
 
 import crypto from "node:crypto";
+import net from "node:net";
 import express from "express";
 import type { Request, Response, NextFunction, ErrorRequestHandler } from "express";
 import { resolvePdiEnvironmentMode } from "../lib/stagingSandbox.ts";
@@ -794,6 +795,217 @@ export function resolveServerDeliveryMode(
   };
 }
 
+// =========================================================================
+// 5.B STRICT TRUST_PROXY VALIDATION & CENTRALIZED CSP BUILDER (FIX-ENV-03)
+// =========================================================================
+
+export type ExpressTrustProxyValue = boolean | number | string | string[];
+
+export interface TrustProxyResolution {
+  isValid: boolean;
+  value: ExpressTrustProxyValue;
+  rawValue?: string;
+  error?: string;
+}
+
+export const MAX_TRUST_PROXY_HOPS = 32;
+
+/**
+ * Express `proxy-addr` documented named subnet presets.
+ */
+export const ALLOWED_TRUST_PROXY_PRESETS = new Set<string>([
+  "loopback",
+  "linklocal",
+  "uniquelocal",
+]);
+
+function isValidIpOrCidrToken(token: string): boolean {
+  if (!token || /\s/.test(token)) {
+    return false;
+  }
+
+  const slashIdx = token.indexOf("/");
+  if (slashIdx === -1) {
+    return net.isIP(token) !== 0;
+  }
+
+  if (token.indexOf("/", slashIdx + 1) !== -1) {
+    return false;
+  }
+
+  const ipPart = token.slice(0, slashIdx);
+  const prefixPart = token.slice(slashIdx + 1);
+  if (!/^\d+$/.test(prefixPart)) {
+    return false;
+  }
+
+  const ipVersion = net.isIP(ipPart);
+  if (ipVersion === 0) {
+    return false;
+  }
+
+  const prefix = Number(prefixPart);
+  const maxPrefix = ipVersion === 4 ? 32 : 128;
+  return Number.isSafeInteger(prefix) && prefix >= 0 && prefix <= maxPrefix;
+}
+
+/**
+ * STAGING-00-B4-FIX-ENV-03 (FIX-01) :
+ * Valide strictement `TRUST_PROXY` selon les formats documentés par Express :
+ * - absent (`undefined`) -> défaut sûr (`1` en mode strict Cloud Run / production / staging, `false` sinon) ;
+ * - booléens reconnus : `true` | `false` (insensible à la casse) ;
+ * - entiers valides non négatifs : `0..32` (ex. `TRUST_PROXY=1` pour Cloud Run) ;
+ * - liste séparée par virgules de valeurs proxy documentées Express (`loopback`, `linklocal`, `uniquelocal`)
+ *   et/ou d'adresses IPv4/IPv6 ou sous-réseaux CIDR valides.
+ * Toute valeur vide explicite, inconnue, mal formée ou contenant des caractères de contrôle est rejetée.
+ */
+export function resolveTrustProxyConfig(
+  rawTrustProxy: string | undefined,
+  options: { strictSecurityMode?: boolean } = {}
+): TrustProxyResolution {
+  const defaultValue: ExpressTrustProxyValue = options.strictSecurityMode ? 1 : false;
+
+  if (rawTrustProxy === undefined) {
+    return {
+      isValid: true,
+      value: defaultValue,
+    };
+  }
+
+  if (typeof rawTrustProxy !== "string" || /[\x00-\x1f\x7f]/.test(rawTrustProxy)) {
+    return {
+      isValid: false,
+      value: defaultValue,
+      rawValue: String(rawTrustProxy),
+      error: "TRUST_PROXY contient des caractères de contrôle interdits ou un type invalide.",
+    };
+  }
+
+  const trimmed = rawTrustProxy.trim();
+  if (trimmed.length === 0) {
+    return {
+      isValid: false,
+      value: defaultValue,
+      rawValue: rawTrustProxy,
+      error: "TRUST_PROXY ne peut pas être vide lorsqu'il est explicitement défini.",
+    };
+  }
+
+  const lower = trimmed.toLowerCase();
+  if (lower === "true") {
+    return { isValid: true, value: true, rawValue: trimmed };
+  }
+  if (lower === "false") {
+    return { isValid: true, value: false, rawValue: trimmed };
+  }
+
+  if (/^\d+$/.test(trimmed)) {
+    const hops = Number(trimmed);
+    if (!Number.isSafeInteger(hops) || hops < 0 || hops > MAX_TRUST_PROXY_HOPS) {
+      return {
+        isValid: false,
+        value: defaultValue,
+        rawValue: trimmed,
+        error: `TRUST_PROXY entier hors bornes ('${trimmed}'). Valeurs autorisées : entier entre 0 et ${MAX_TRUST_PROXY_HOPS}.`,
+      };
+    }
+    return { isValid: true, value: hops, rawValue: trimmed };
+  }
+
+  const rawParts = trimmed.split(",");
+  const normalizedTokens: string[] = [];
+  for (const part of rawParts) {
+    const token = part.trim();
+    if (!token) {
+      return {
+        isValid: false,
+        value: defaultValue,
+        rawValue: trimmed,
+        error: `TRUST_PROXY mal formé ('${trimmed}') : entrée vide dans la liste de proxies.`,
+      };
+    }
+
+    const tokenLower = token.toLowerCase();
+    if (ALLOWED_TRUST_PROXY_PRESETS.has(tokenLower)) {
+      normalizedTokens.push(tokenLower);
+      continue;
+    }
+
+    if (isValidIpOrCidrToken(token)) {
+      normalizedTokens.push(token);
+      continue;
+    }
+
+    return {
+      isValid: false,
+      value: defaultValue,
+      rawValue: trimmed,
+      error: `Valeur TRUST_PROXY non reconnue ou mal formée ('${token}'). Formats autorisés : true, false, entier 0..${MAX_TRUST_PROXY_HOPS}, loopback, linklocal, uniquelocal, IP/CIDR valide.`,
+    };
+  }
+
+  return {
+    isValid: true,
+    value: normalizedTokens.length === 1 ? normalizedTokens[0] : normalizedTokens,
+    rawValue: trimmed,
+  };
+}
+
+export const OPENCV_EMBIND_UNSAFE_EVAL_DEPENDENCY = "@techstark/opencv-js@5.0.0-release.1" as const;
+
+export const OPENCV_EMBIND_UNSAFE_EVAL_JUSTIFICATION =
+  "Requis par @techstark/opencv-js@5.0.0-release.1 (chargé par src/pdi/sketch/openCvSketchDetector.ts) : le runtime Emscripten Embind exécute inconditionnellement `new Function(...)` dans `createJsInvoker` (via `craftInvokerFunction`, 5 sites) et `__emval_get_method_caller` sans fallback statique ; `'wasm-unsafe-eval'` seul autorise WebAssembly mais pas `new Function()`.";
+
+export interface ContentSecurityPolicyResolution {
+  headerValue: string;
+  scriptSrc: string;
+  frameAncestors: CspFrameAncestorsResolution;
+  allowsUnsafeEval: boolean;
+  unsafeEvalDependency: string;
+  unsafeEvalJustification: string;
+}
+
+/**
+ * STAGING-00-B4-FIX-ENV-03 (FIX-02) :
+ * Construit de manière centralisée et testable l'en-tête `Content-Security-Policy` durci :
+ * - Conserve toutes les directives strictes existantes + ajoute `base-uri 'self'` et `form-action 'self'`.
+ * - Inclut `'wasm-unsafe-eval'` pour OpenCV.js / Tesseract.js WebAssembly.
+ * - Maintient `'unsafe-eval'` uniquement en raison de la contrainte technique avérée d'Emscripten Embind
+ *   dans `@techstark/opencv-js@5.0.0-release.1` (`new Function()` inconditionnel sans fallback).
+ * - Conserve `'unsafe-inline'` pour le script d'injection runtime minimal sans secret (`#pdi-runtime-config`).
+ * - Applique `resolveCspFrameAncestors(env)` (sans `*` ni `localhost` en mode strict).
+ */
+export function buildContentSecurityPolicy(
+  env: Record<string, string | undefined> = process.env
+): ContentSecurityPolicyResolution {
+  const frameAncestors = resolveCspFrameAncestors(env);
+  const scriptSrc =
+    "script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' https://apis.google.com";
+
+  const directives = [
+    "default-src 'self'",
+    "base-uri 'self'",
+    "form-action 'self'",
+    scriptSrc,
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    "font-src 'self' https://fonts.gstatic.com data:",
+    "img-src 'self' data: https: blob:",
+    "connect-src 'self' https: wss:",
+    "frame-src 'self' https://ais-dev-6etwlfzn4irzgw5ljyhzsh-76486687314.europe-west2.run.app https://ais-pre-6etwlfzn4irzgw5ljyhzsh-76486687314.europe-west2.run.app",
+    frameAncestors.directive,
+    "object-src 'none'",
+  ];
+
+  return {
+    headerValue: directives.join("; "),
+    scriptSrc,
+    frameAncestors,
+    allowsUnsafeEval: true,
+    unsafeEvalDependency: OPENCV_EMBIND_UNSAFE_EVAL_DEPENDENCY,
+    unsafeEvalJustification: OPENCV_EMBIND_UNSAFE_EVAL_JUSTIFICATION,
+  };
+}
+
 export function resolveCspFrameAncestors(
   env: Record<string, string | undefined> = process.env
 ): CspFrameAncestorsResolution {
@@ -1055,6 +1267,14 @@ export function verifyProductionConfig(
     if (!originsCheck.isValid) {
       invalidConfigKeys.push(`ALLOWED_ORIGINS (${originsCheck.error})`);
     }
+  }
+
+  // STAGING-00-B4-FIX-ENV-03 (FIX-01): Validate TRUST_PROXY strictly (blocking in strict security mode)
+  const trustProxyCheck = resolveTrustProxyConfig(env.TRUST_PROXY, {
+    strictSecurityMode: isStrictSecurity,
+  });
+  if (!trustProxyCheck.isValid) {
+    invalidConfigKeys.push(`TRUST_PROXY (${trustProxyCheck.error})`);
   }
 
   const cspCheck = resolveCspFrameAncestors(env);

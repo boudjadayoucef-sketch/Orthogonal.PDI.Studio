@@ -37,8 +37,11 @@ import {
   setStagingSandboxTestOverride,
 } from "../../lib/stagingSandbox";
 import {
+  OPENCV_EMBIND_UNSAFE_EVAL_DEPENDENCY,
+  buildContentSecurityPolicy,
   resolveServerDeliveryMode,
   resolveCspFrameAncestors,
+  resolveTrustProxyConfig,
   validateAllowedOrigins,
   verifyProductionConfig,
 } from "../sec01SecurityService";
@@ -875,4 +878,194 @@ describe("STAGING-00-B4 — FIX-ENV-02 : Séparation Sandbox / Livraison Cloud R
     expect(report.projStatus).toBe(403);
     expect(report.projCode).toBe("sandbox/server-mutation-forbidden");
   }, 35000);
+
+  // =========================================================================
+  // FIX-ENV-03 — FIX-01 : Validation stricte de TRUST_PROXY (valeurs valides)
+  // =========================================================================
+  it("FIX-ENV-03 (FIX-01A) : accepte uniquement les formats TRUST_PROXY documentés (booléens, entiers 0..32, presets Express, IP/CIDR) et conserve TRUST_PROXY=1 pour Cloud Run", () => {
+    // Valeur absente -> défaut contextuel sûr
+    expect(resolveTrustProxyConfig(undefined, { strictSecurityMode: true })).toEqual({
+      isValid: true,
+      value: 1,
+    });
+    expect(resolveTrustProxyConfig(undefined, { strictSecurityMode: false })).toEqual({
+      isValid: true,
+      value: false,
+    });
+
+    const validCases: Array<{ input: string; expected: boolean | number | string | string[] }> = [
+      { input: "1", expected: 1 },
+      { input: "0", expected: 0 },
+      { input: "2", expected: 2 },
+      { input: "true", expected: true },
+      { input: "FALSE", expected: false },
+      { input: "loopback", expected: "loopback" },
+      { input: "LinkLocal", expected: "linklocal" },
+      { input: "uniquelocal", expected: "uniquelocal" },
+      { input: "127.0.0.1", expected: "127.0.0.1" },
+      { input: "10.0.0.0/8", expected: "10.0.0.0/8" },
+      { input: "::1", expected: "::1" },
+      { input: "fc00::/7", expected: "fc00::/7" },
+      { input: "loopback, 10.0.0.0/8", expected: ["loopback", "10.0.0.0/8"] },
+    ];
+
+    for (const tc of validCases) {
+      const res = resolveTrustProxyConfig(tc.input, { strictSecurityMode: true });
+      expect(res.isValid, tc.input).toBe(true);
+      expect(res.value, tc.input).toEqual(tc.expected);
+
+      const app = createPdiExpressApp({
+        env: {
+          ...CLOUD_RUN_STAGING_SANDBOX_ENV,
+          TRUST_PROXY: tc.input,
+        },
+      });
+      expect(app.get("trust proxy"), tc.input).toEqual(tc.expected);
+    }
+  });
+
+  // =========================================================================
+  // FIX-ENV-03 — FIX-01 : Rejet strict des valeurs TRUST_PROXY invalides / mal formées
+  // =========================================================================
+  it("FIX-ENV-03 (FIX-01B) : rejette toute valeur TRUST_PROXY inconnue ou mal formée et bloque le démarrage en mode strict (production, staging, statique)", async () => {
+    const invalidValues = [
+      "",
+      "   ",
+      "invalid",
+      "all",
+      "yes",
+      "on",
+      "*",
+      "-1",
+      "1.5",
+      "999",
+      "1abc",
+      "999.999.999.999",
+      "10.0.0.1/99",
+      "::1/129",
+      "loopback,",
+      ",127.0.0.1",
+      "1\n2",
+    ];
+
+    for (const bad of invalidValues) {
+      const res = resolveTrustProxyConfig(bad, { strictSecurityMode: true });
+      expect(res.isValid, JSON.stringify(bad)).toBe(false);
+      expect(res.value, JSON.stringify(bad)).toBe(1);
+      expect(res.error, JSON.stringify(bad)).toBeTruthy();
+
+      const stagingEnv: NodeJS.ProcessEnv = {
+        ...CLOUD_RUN_STAGING_SANDBOX_ENV,
+        TRUST_PROXY: bad,
+      };
+      const validation = verifyProductionConfig(stagingEnv);
+      expect(validation.isSafe, JSON.stringify(bad)).toBe(false);
+      expect(validation.invalidConfigKeys?.some((k) => k.startsWith("TRUST_PROXY")), JSON.stringify(bad)).toBe(true);
+
+      expect(() => createPdiExpressApp({ env: stagingEnv }), JSON.stringify(bad)).toThrow(
+        /TRUST_PROXY|Fatal server configuration error/i
+      );
+    }
+
+    // Échec de démarrage confirmé dans les 3 modes stricts : production, staging et livraison statique explicite
+    const strictEnvs: Array<{ label: string; env: NodeJS.ProcessEnv }> = [
+      {
+        label: "production",
+        env: {
+          NODE_ENV: "production",
+          PDI_ENV: "production",
+          VITE_PDI_ENV: "production",
+          TRUST_PROXY: "not-a-proxy",
+        },
+      },
+      {
+        label: "staging",
+        env: {
+          ...CLOUD_RUN_STAGING_SANDBOX_ENV,
+          TRUST_PROXY: "not-a-proxy",
+        },
+      },
+      {
+        label: "static delivery",
+        env: {
+          NODE_ENV: "development",
+          PDI_ENV: "sandbox",
+          VITE_PDI_ENV: "sandbox",
+          PDI_SERVE_STATIC_DIST: "true",
+          TRUST_PROXY: "10.0.0.1/99",
+        },
+      },
+    ];
+
+    for (const mode of strictEnvs) {
+      await expect(
+        startServer({
+          host: "127.0.0.1",
+          port: 0,
+          attachFrontend: false,
+          env: mode.env,
+        }),
+        mode.label
+      ).rejects.toThrow(/TRUST_PROXY|Fatal server configuration error/i);
+    }
+  });
+
+  // =========================================================================
+  // FIX-ENV-03 — FIX-02 : Analyse & durcissement CSP (unsafe-eval documenté pour OpenCV Embind)
+  // =========================================================================
+  it("FIX-ENV-03 (FIX-02) : durcit la CSP (base-uri, form-action, wasm-unsafe-eval, frame-ancestors strict), justifie et vérifie techniquement la dépendance @techstark/opencv-js, et conserve l'injection runtime sans secret", async () => {
+    const distDir = createTemporaryDistDir();
+    tempDirs.push(distDir);
+
+    // 1. Preuve technique directe dans le module installé @techstark/opencv-js :
+    //    Emscripten Embind invoque inconditionnellement `new Function(...)` dans `createJsInvoker`
+    //    (appelé par `craftInvokerFunction`) et `__emval_get_method_caller` sans fallback statique.
+    const openCvPkgPath = path.resolve(process.cwd(), "node_modules", "@techstark", "opencv-js", "package.json");
+    const openCvPkg = JSON.parse(fs.readFileSync(openCvPkgPath, "utf-8"));
+    const openCvEntryPath = path.resolve(
+      process.cwd(),
+      "node_modules",
+      "@techstark",
+      "opencv-js",
+      openCvPkg.main || "dist/opencv.js"
+    );
+    const openCvSource = fs.readFileSync(openCvEntryPath, "utf-8");
+    expect(openCvSource).toContain("function craftInvokerFunction");
+    expect(openCvSource).toContain("return new Function(args1,invokerFnBody)");
+    expect(openCvSource).toContain("new Function(Object.keys(captures),functionBody)");
+
+    // 2. Politique CSP centralisée et durcie en mode Cloud Run statique staging
+    const policy = buildContentSecurityPolicy(CLOUD_RUN_STAGING_SANDBOX_ENV);
+    expect(policy.allowsUnsafeEval).toBe(true);
+    expect(policy.unsafeEvalDependency).toBe(OPENCV_EMBIND_UNSAFE_EVAL_DEPENDENCY);
+    expect(policy.unsafeEvalJustification).toContain("@techstark/opencv-js@5.0.0-release.1");
+    expect(policy.headerValue).toContain("default-src 'self'");
+    expect(policy.headerValue).toContain("base-uri 'self'");
+    expect(policy.headerValue).toContain("form-action 'self'");
+    expect(policy.headerValue).toContain("object-src 'none'");
+    expect(policy.headerValue).toContain("'wasm-unsafe-eval'");
+    expect(policy.headerValue).toContain("frame-ancestors 'self' https://aistudio.google.com");
+    expect(policy.headerValue).not.toContain("http://localhost:3000");
+    expect(policy.headerValue).not.toContain("frame-ancestors *");
+
+    // 3. Vérification HTTP réelle sur le serveur Cloud Run statique + injection runtime intacte
+    const started = await startServer({
+      host: "127.0.0.1",
+      port: 0,
+      attachFrontend: true,
+      distPath: distDir,
+      env: CLOUD_RUN_STAGING_SANDBOX_ENV,
+      dependencies: { createViteServer: vi.fn() as any },
+    });
+    startedServers.push(started);
+
+    const res = await fetch(`http://127.0.0.1:${started.port}/`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-security-policy")).toBe(policy.headerValue);
+
+    const html = await res.text();
+    expect(html).toContain(
+      '<script id="pdi-runtime-config">window.__PDI_RUNTIME_CONFIG__=Object.freeze({"pdiEnv":"sandbox"});</script>'
+    );
+  });
 });

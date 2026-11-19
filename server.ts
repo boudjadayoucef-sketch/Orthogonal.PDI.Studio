@@ -35,9 +35,10 @@ import {
   createBoundedRateLimiter,
   verifyProductionConfig,
   resolveServerDeliveryMode,
+  resolveTrustProxyConfig,
+  buildContentSecurityPolicy,
   isSuspiciousRequestPath,
   validateAllowedOrigins,
-  resolveCspFrameAncestors,
   createPaddleWebhookBodyParser,
   createStandardJsonParser,
   createStandardUrlencodedParser,
@@ -133,21 +134,11 @@ export function createPdiExpressApp(options: CreatePdiExpressAppOptions = {}): e
     next();
   });
 
-  // Configuration explicite Trust Proxy pour Cloud Run / Hostinger VPS / Nginx / LiteSpeed (Section E1 & FIX-ENV-02)
-  const rawTrustProxy = runtimeEnv.TRUST_PROXY?.trim();
-  const trustProxyConfig =
-    rawTrustProxy !== undefined && rawTrustProxy.length > 0
-      ? rawTrustProxy === "true"
-        ? true
-        : rawTrustProxy === "false"
-        ? false
-        : /^\d+$/.test(rawTrustProxy)
-        ? Number(rawTrustProxy)
-        : rawTrustProxy
-      : deliveryMode.strictSecurityMode
-      ? 1
-      : false;
-  app.set("trust proxy", trustProxyConfig);
+  // Configuration explicite et validée Trust Proxy pour Cloud Run / Hostinger VPS / Nginx / LiteSpeed (Section E1, FIX-ENV-02 & FIX-ENV-03)
+  const trustProxyResolution = resolveTrustProxyConfig(runtimeEnv.TRUST_PROXY, {
+    strictSecurityMode: deliveryMode.strictSecurityMode,
+  });
+  app.set("trust proxy", trustProxyResolution.value);
 
   // Whitelist CORS dynamique contrôlée et validée via environnement (Section E2, SEC-01-FIX-07-R1 D1.2 & FIX-ENV-02)
   const allowedOriginsValidation = validateAllowedOrigins(runtimeEnv.ALLOWED_ORIGINS, {
@@ -183,12 +174,9 @@ export function createPdiExpressApp(options: CreatePdiExpressAppOptions = {}): e
     res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
     res.setHeader("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload");
 
-    // Content-Security-Policy durcie : frame-ancestors résolu et validé sans wildcard '*' en production (SEC-01-FIX-07-R1 D1.1)
-    const frameAncestorsPolicy = resolveCspFrameAncestors(runtimeEnv);
-    res.setHeader(
-      "Content-Security-Policy",
-      `default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://apis.google.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: https: blob:; connect-src 'self' https: wss:; frame-src 'self' https://ais-dev-6etwlfzn4irzgw5ljyhzsh-76486687314.europe-west2.run.app https://ais-pre-6etwlfzn4irzgw5ljyhzsh-76486687314.europe-west2.run.app; ${frameAncestorsPolicy.directive}; object-src 'none'`
-    );
+    // Content-Security-Policy durcie et centralisée (SEC-01-FIX-07-R1 D1.1, FIX-ENV-02 & FIX-ENV-03)
+    const cspPolicy = buildContentSecurityPolicy(runtimeEnv);
+    res.setHeader("Content-Security-Policy", cspPolicy.headerValue);
     res.setHeader("X-Engine-Vendor", "ORTHOGONAL - ENG");
     res.setHeader("X-Engine-Product", "Piping Design & Isometrics");
     next();
