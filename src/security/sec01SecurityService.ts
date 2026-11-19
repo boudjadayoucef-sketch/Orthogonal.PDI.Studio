@@ -850,11 +850,13 @@ function isValidIpOrCidrToken(token: string): boolean {
 }
 
 /**
- * STAGING-00-B4-FIX-ENV-03 (FIX-01) :
+ * STAGING-00-B4-FIX-ENV-03 (FIX-01) & FIX-ENV-03-FIX-01 :
  * Valide strictement `TRUST_PROXY` selon les formats documentés par Express :
  * - absent (`undefined`) -> défaut sûr (`1` en mode strict Cloud Run / production / staging, `false` sinon) ;
- * - booléens reconnus : `true` | `false` (insensible à la casse) ;
- * - entiers valides non négatifs : `0..32` (ex. `TRUST_PROXY=1` pour Cloud Run) ;
+ * - booléen `false` (insensible à la casse) -> autorisé dans tous les modes ;
+ * - booléen `true` (insensible à la casse) -> interdit en mode strict (`production`, `staging` ou livraison statique)
+ *   afin d'empêcher l'usurpation d'en-têtes `X-Forwarded-*` (accepté uniquement hors mode strict en développement) ;
+ * - entiers valides non négatifs : `0..32` (ex. `TRUST_PROXY=1` recommandé pour Cloud Run) ;
  * - liste séparée par virgules de valeurs proxy documentées Express (`loopback`, `linklocal`, `uniquelocal`)
  *   et/ou d'adresses IPv4/IPv6 ou sous-réseaux CIDR valides.
  * Toute valeur vide explicite, inconnue, mal formée ou contenant des caractères de contrôle est rejetée.
@@ -893,6 +895,15 @@ export function resolveTrustProxyConfig(
 
   const lower = trimmed.toLowerCase();
   if (lower === "true") {
+    if (options.strictSecurityMode) {
+      return {
+        isValid: false,
+        value: defaultValue,
+        rawValue: trimmed,
+        error:
+          "TRUST_PROXY=true est interdit en mode strict (production, staging ou livraison statique) : utilisez un nombre explicite de sauts (ex. TRUST_PROXY=1 pour Cloud Run), 'false', un preset documenté ou une liste IP/CIDR.",
+      };
+    }
     return { isValid: true, value: true, rawValue: trimmed };
   }
   if (lower === "false") {

@@ -882,7 +882,7 @@ describe("STAGING-00-B4 — FIX-ENV-02 : Séparation Sandbox / Livraison Cloud R
   // =========================================================================
   // FIX-ENV-03 — FIX-01 : Validation stricte de TRUST_PROXY (valeurs valides)
   // =========================================================================
-  it("FIX-ENV-03 (FIX-01A) : accepte uniquement les formats TRUST_PROXY documentés (booléens, entiers 0..32, presets Express, IP/CIDR) et conserve TRUST_PROXY=1 pour Cloud Run", () => {
+  it("FIX-ENV-03 (FIX-01A) : accepte uniquement les formats TRUST_PROXY documentés autorisés en mode strict (false, entiers 0..32, presets Express, IP/CIDR) et conserve TRUST_PROXY=1 pour Cloud Run", () => {
     // Valeur absente -> défaut contextuel sûr
     expect(resolveTrustProxyConfig(undefined, { strictSecurityMode: true })).toEqual({
       isValid: true,
@@ -893,11 +893,11 @@ describe("STAGING-00-B4 — FIX-ENV-02 : Séparation Sandbox / Livraison Cloud R
       value: false,
     });
 
-    const validCases: Array<{ input: string; expected: boolean | number | string | string[] }> = [
+    const validStrictCases: Array<{ input: string; expected: boolean | number | string | string[] }> = [
       { input: "1", expected: 1 },
       { input: "0", expected: 0 },
       { input: "2", expected: 2 },
-      { input: "true", expected: true },
+      { input: "false", expected: false },
       { input: "FALSE", expected: false },
       { input: "loopback", expected: "loopback" },
       { input: "LinkLocal", expected: "linklocal" },
@@ -909,7 +909,7 @@ describe("STAGING-00-B4 — FIX-ENV-02 : Séparation Sandbox / Livraison Cloud R
       { input: "loopback, 10.0.0.0/8", expected: ["loopback", "10.0.0.0/8"] },
     ];
 
-    for (const tc of validCases) {
+    for (const tc of validStrictCases) {
       const res = resolveTrustProxyConfig(tc.input, { strictSecurityMode: true });
       expect(res.isValid, tc.input).toBe(true);
       expect(res.value, tc.input).toEqual(tc.expected);
@@ -925,12 +925,118 @@ describe("STAGING-00-B4 — FIX-ENV-02 : Séparation Sandbox / Livraison Cloud R
   });
 
   // =========================================================================
+  // FIX-ENV-03-FIX-01 : Interdiction de TRUST_PROXY=true/TRUE en mode strict
+  // =========================================================================
+  it("FIX-ENV-03-FIX-01 : interdit TRUST_PROXY=true quelle que soit la casse en mode strict (production, staging, statique), bloque le démarrage, conserve 1/false et préserve le comportement dev", async () => {
+    // 1. Rejet strict de true / TRUE / True / " true " dans resolveTrustProxyConfig, verifyProductionConfig, createPdiExpressApp et startServer
+    const forbiddenTrueVariants = ["true", "TRUE", "True", " true "];
+    const strictModes: Array<{ label: string; baseEnv: NodeJS.ProcessEnv }> = [
+      {
+        label: "production",
+        baseEnv: {
+          NODE_ENV: "production",
+          PDI_ENV: "production",
+          VITE_PDI_ENV: "production",
+        },
+      },
+      {
+        label: "staging",
+        baseEnv: {
+          NODE_ENV: "staging",
+          PDI_ENV: "sandbox",
+          VITE_PDI_ENV: "sandbox",
+          PDI_SERVE_STATIC_DIST: "true",
+        },
+      },
+      {
+        label: "static delivery",
+        baseEnv: {
+          NODE_ENV: "development",
+          PDI_ENV: "sandbox",
+          VITE_PDI_ENV: "sandbox",
+          PDI_SERVE_STATIC_DIST: "true",
+        },
+      },
+    ];
+
+    for (const variant of forbiddenTrueVariants) {
+      const res = resolveTrustProxyConfig(variant, { strictSecurityMode: true });
+      expect(res.isValid, variant).toBe(false);
+      expect(res.value, variant).toBe(1);
+      expect(res.error, variant).toMatch(/TRUST_PROXY=true est interdit en mode strict/i);
+
+      for (const mode of strictModes) {
+        const envWithTrue: NodeJS.ProcessEnv = {
+          ...mode.baseEnv,
+          TRUST_PROXY: variant,
+        };
+        const validation = verifyProductionConfig(envWithTrue);
+        expect(validation.isSafe, `${mode.label} / ${variant}`).toBe(false);
+        expect(
+          validation.invalidConfigKeys?.some((k) => k.startsWith("TRUST_PROXY")),
+          `${mode.label} / ${variant}`
+        ).toBe(true);
+
+        expect(() => createPdiExpressApp({ env: envWithTrue }), `${mode.label} / ${variant}`).toThrow(
+          /TRUST_PROXY|Fatal server configuration error/i
+        );
+
+        await expect(
+          startServer({
+            host: "127.0.0.1",
+            port: 0,
+            attachFrontend: false,
+            env: envWithTrue,
+          }),
+          `${mode.label} / ${variant}`
+        ).rejects.toThrow(/TRUST_PROXY|Fatal server configuration error/i);
+      }
+    }
+
+    // 2. En mode strict, TRUST_PROXY=1 (cible Cloud Run) et TRUST_PROXY=false restent valides
+    for (const mode of strictModes) {
+      const envWithOne: NodeJS.ProcessEnv = { ...mode.baseEnv, TRUST_PROXY: "1" };
+      expect(verifyProductionConfig(envWithOne).isSafe, `${mode.label} / 1`).toBe(true);
+      expect(createPdiExpressApp({ env: envWithOne }).get("trust proxy"), `${mode.label} / 1`).toBe(1);
+
+      const envWithFalse: NodeJS.ProcessEnv = { ...mode.baseEnv, TRUST_PROXY: "false" };
+      expect(verifyProductionConfig(envWithFalse).isSafe, `${mode.label} / false`).toBe(true);
+      expect(createPdiExpressApp({ env: envWithFalse }).get("trust proxy"), `${mode.label} / false`).toBe(false);
+    }
+
+    // 3. Compatibilité développement préservée : hors mode strict, true / TRUE / 1 / false sont acceptés
+    for (const devCase of [
+      { raw: "true", expected: true },
+      { raw: "TRUE", expected: true },
+      { raw: "false", expected: false },
+      { raw: "1", expected: 1 },
+    ]) {
+      const devRes = resolveTrustProxyConfig(devCase.raw, { strictSecurityMode: false });
+      expect(devRes.isValid, `dev / ${devCase.raw}`).toBe(true);
+      expect(devRes.value, `dev / ${devCase.raw}`).toBe(devCase.expected);
+
+      const devEnv: NodeJS.ProcessEnv = {
+        NODE_ENV: "development",
+        PDI_ENV: "development",
+        VITE_PDI_ENV: "development",
+        TRUST_PROXY: devCase.raw,
+      };
+      expect(verifyProductionConfig(devEnv).isSafe, `dev / ${devCase.raw}`).toBe(true);
+      expect(createPdiExpressApp({ env: devEnv }).get("trust proxy"), `dev / ${devCase.raw}`).toBe(
+        devCase.expected
+      );
+    }
+  });
+
+  // =========================================================================
   // FIX-ENV-03 — FIX-01 : Rejet strict des valeurs TRUST_PROXY invalides / mal formées
   // =========================================================================
   it("FIX-ENV-03 (FIX-01B) : rejette toute valeur TRUST_PROXY inconnue ou mal formée et bloque le démarrage en mode strict (production, staging, statique)", async () => {
     const invalidValues = [
       "",
       "   ",
+      "true",
+      "TRUE",
       "invalid",
       "all",
       "yes",
