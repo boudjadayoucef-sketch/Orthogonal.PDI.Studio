@@ -41,12 +41,14 @@ import {
   assertValidServerFirestoreInstance,
   createServerAdminAuth,
   createServerFirestoreClient,
+  evaluateServerFirebaseInitGate,
   getOrInitializeServerFirebaseApp,
   getServerAdminApp,
   getServerAdminAuth,
   getServerAdminDb,
   initializeServerFirebaseAdminRuntime,
   resolveServerFirestoreConfig,
+  shouldBlockServerFirebaseInit,
 } from "../../lib/firebase-admin";
 import { verifyProductionConfig } from "../sec01SecurityService";
 import {
@@ -919,6 +921,262 @@ describe("STAGING-00-B3 — Sandbox Isolée AI Studio Share (C1..C5)", () => {
       for (const regex of scannerRegexes) {
         expect(regex.test(specSource)).toBe(false);
       }
+    });
+  });
+
+  describe("STAGING-00-B3-R2 — Fail-Closed AVANT toute initialisation Firebase Admin (Runtime & Chargement réel du module)", () => {
+    const runIsolatedModuleLoadProbe = (scenarioEnv: Record<string, string>) => {
+      const probeScript = `
+        import http from 'node:http';
+        import https from 'node:https';
+        import { Firestore } from '@google-cloud/firestore';
+
+        const networkCalls = [];
+        http.request = function (...args) {
+          networkCalls.push({ proto: 'http', target: String(args[0]?.hostname || args[0]) });
+          throw new Error('UNEXPECTED_HTTP_CALL');
+        };
+        https.request = function (...args) {
+          networkCalls.push({ proto: 'https', target: String(args[0]?.hostname || args[0]) });
+          throw new Error('UNEXPECTED_HTTPS_CALL');
+        };
+        globalThis.fetch = async (input) => {
+          networkCalls.push({ proto: 'fetch', target: String(input) });
+          throw new Error('UNEXPECTED_FETCH_CALL');
+        };
+
+        const { getApps } = await import('firebase-admin/app');
+        const firebaseAdminMod = await import('./src/lib/firebase-admin.ts');
+
+        let adminDbIsFirestoreInstance = false;
+        let adminDbProxyThrows = false;
+        try {
+          adminDbIsFirestoreInstance = firebaseAdminMod.adminDb instanceof Firestore;
+        } catch {
+          adminDbProxyThrows = true;
+        }
+
+        let adminDbAccessBlocked = false;
+        if (firebaseAdminMod.isServerFirebaseRuntimeDisabled) {
+          try {
+            firebaseAdminMod.adminDb.collection('profiles');
+          } catch (err) {
+            adminDbAccessBlocked = String(err?.message || '').includes('Coupe-circuit Sandbox Serveur');
+          }
+        }
+
+        let getterBlocked = false;
+        if (firebaseAdminMod.isServerFirebaseRuntimeDisabled) {
+          try {
+            firebaseAdminMod.getServerAdminAuth();
+          } catch (err) {
+            getterBlocked = String(err?.message || '').includes('Coupe-circuit Sandbox Serveur');
+          }
+        }
+
+        const adminApps = getApps();
+        console.log(JSON.stringify({
+          sandboxDisabled: firebaseAdminMod.isServerFirebaseSandboxDisabled,
+          runtimeDisabled: firebaseAdminMod.isServerFirebaseRuntimeDisabled,
+          blockReason: firebaseAdminMod.serverFirebaseBlockReason,
+          config: firebaseAdminMod.serverFirebaseRuntimeConfig,
+          adminAppsCount: adminApps.length,
+          adminAppProjectId: adminApps[0]?.options?.projectId ?? null,
+          adminDbIsFirestoreInstance,
+          adminDbProxyThrows,
+          adminDbAccessBlocked,
+          getterBlocked,
+          networkCallsCount: networkCalls.length,
+        }));
+      `;
+
+      const cleanEnv: Record<string, string> = {
+        PATH: process.env.PATH || "",
+        HOME: process.env.HOME || "",
+        ...scenarioEnv,
+      };
+
+      const rawOutput = execFileSync(
+        process.execPath,
+        ["--import", "tsx", "--input-type=module", "-e", probeScript],
+        {
+          cwd: process.cwd(),
+          env: cleanEnv,
+          encoding: "utf-8",
+          timeout: 20_000,
+        },
+      );
+
+      const lastLine = rawOutput.trim().split("\n").pop() || "{}";
+      return JSON.parse(lastLine);
+    };
+
+    const negativeScenarios: Array<{
+      id: number;
+      label: string;
+      env: Record<string, string>;
+      expectedSandboxDisabled: boolean;
+      expectedBlockReason: string;
+    }> = [
+      {
+        id: 1,
+        label: "PDI_ENV absent et VITE_PDI_ENV absent",
+        env: { NODE_ENV: "development" },
+        expectedSandboxDisabled: false,
+        expectedBlockReason: "INCOMPLETE_PDI_ENV",
+      },
+      {
+        id: 2,
+        label: "PDI_ENV=sandbox et VITE_PDI_ENV absent",
+        env: { NODE_ENV: "development", PDI_ENV: "sandbox" },
+        expectedSandboxDisabled: true,
+        expectedBlockReason: "SANDBOX_MODE",
+      },
+      {
+        id: 3,
+        label: "PDI_ENV=development et VITE_PDI_ENV=production",
+        env: {
+          NODE_ENV: "development",
+          PDI_ENV: "development",
+          VITE_PDI_ENV: "production",
+        },
+        expectedSandboxDisabled: false,
+        expectedBlockReason: "FRONTEND_SERVER_ENV_MISMATCH",
+      },
+      {
+        id: 4,
+        label: "PDI_ENV avec une valeur invalide",
+        env: {
+          NODE_ENV: "development",
+          PDI_ENV: "staging_invalid_value",
+          VITE_PDI_ENV: "staging_invalid_value",
+        },
+        expectedSandboxDisabled: false,
+        expectedBlockReason: "AMBIGUOUS_PDI_ENV",
+      },
+      {
+        id: 5,
+        label: "NODE_ENV=production avec PDI_ENV=sandbox et VITE_PDI_ENV=sandbox",
+        env: {
+          NODE_ENV: "production",
+          PDI_ENV: "sandbox",
+          VITE_PDI_ENV: "sandbox",
+        },
+        expectedSandboxDisabled: true,
+        expectedBlockReason: "SANDBOX_FORBIDDEN_IN_PRODUCTION",
+      },
+    ];
+
+    for (const scenario of negativeScenarios) {
+      it(`Scénario négatif ${scenario.id} — ${scenario.label} : bloque AVANT initializeApp, getAuth et createFirestore (runtime + chargement réel du module)`, () => {
+        // 1. Vérification du gate et de initializeServerFirebaseAdminRuntime avec espions
+        expect(shouldBlockServerFirebaseInit(scenario.env)).toBe(true);
+        const gate = evaluateServerFirebaseInitGate(scenario.env);
+        expect(gate.blocked).toBe(true);
+        expect(gate.runtimeDisabled).toBe(true);
+        expect(gate.sandboxDisabled).toBe(scenario.expectedSandboxDisabled);
+        expect(gate.blockReason).toBe(scenario.expectedBlockReason);
+
+        const getAppsSpy = vi.fn(() => []);
+        const getAppSpy = vi.fn();
+        const initializeAppSpy = vi.fn();
+        const getAuthSpy = vi.fn();
+        const createFirestoreSpy = vi.fn();
+
+        const runtime = initializeServerFirebaseAdminRuntime(scenario.env, {
+          getApps: getAppsSpy as any,
+          getApp: getAppSpy as any,
+          initializeApp: initializeAppSpy as any,
+          getAuth: getAuthSpy as any,
+          createFirestore: createFirestoreSpy as any,
+        });
+
+        expect(runtime.runtimeDisabled).toBe(true);
+        expect(runtime.sandboxDisabled).toBe(scenario.expectedSandboxDisabled);
+        expect(runtime.blockReason).toBe(scenario.expectedBlockReason);
+        expect(runtime.config).toBeNull();
+        expect(getAppsSpy).not.toHaveBeenCalled();
+        expect(getAppSpy).not.toHaveBeenCalled();
+        expect(initializeAppSpy).not.toHaveBeenCalled();
+        expect(getAuthSpy).not.toHaveBeenCalled();
+        expect(createFirestoreSpy).not.toHaveBeenCalled();
+
+        expect(() => (runtime.adminAuth as any).verifyIdToken("tok")).toThrow(
+          SANDBOX_SERVER_FIREBASE_FORBIDDEN_ERROR,
+        );
+        expect(() => (runtime.adminDb as any).collection("profiles")).toThrow(
+          SANDBOX_SERVER_FIREBASE_FORBIDDEN_ERROR,
+        );
+
+        // 2. Vérification du comportement RÉEL au chargement du module dans un processus isolé
+        const loaded = runIsolatedModuleLoadProbe(scenario.env);
+        expect(loaded).toEqual({
+          sandboxDisabled: scenario.expectedSandboxDisabled,
+          runtimeDisabled: true,
+          blockReason: scenario.expectedBlockReason,
+          config: null,
+          adminAppsCount: 0,
+          adminAppProjectId: null,
+          adminDbIsFirestoreInstance: false,
+          adminDbProxyThrows: false,
+          adminDbAccessBlocked: true,
+          getterBlocked: true,
+          networkCallsCount: 0,
+        });
+      });
+    }
+
+    it("Production nominale explicitement cohérente (NODE_ENV=production, PDI_ENV=production, VITE_PDI_ENV=production) : autorise l'initialisation réelle au chargement du module et préserve les validations strictes projet/base", () => {
+      const coherentProdEnv = {
+        NODE_ENV: "production",
+        PDI_ENV: "production",
+        VITE_PDI_ENV: "production",
+        FIREBASE_PROJECT_ID: EXPECTED_SERVER_PROJECT_ID,
+        FIREBASE_DATABASE_ID: EXPECTED_SERVER_DATABASE_ID,
+      };
+
+      expect(shouldBlockServerFirebaseInit(coherentProdEnv)).toBe(false);
+      const gate = evaluateServerFirebaseInitGate(coherentProdEnv);
+      expect(gate).toEqual({
+        blocked: false,
+        sandboxDisabled: false,
+        runtimeDisabled: false,
+        blockReason: null,
+      });
+
+      // 1. Chargement réel du module dans un processus isolé avec configuration de production cohérente
+      const loadedProd = runIsolatedModuleLoadProbe(coherentProdEnv);
+      expect(loadedProd).toEqual({
+        sandboxDisabled: false,
+        runtimeDisabled: false,
+        blockReason: null,
+        config: {
+          projectId: EXPECTED_SERVER_PROJECT_ID,
+          databaseId: EXPECTED_SERVER_DATABASE_ID,
+        },
+        adminAppsCount: 1,
+        adminAppProjectId: EXPECTED_SERVER_PROJECT_ID,
+        adminDbIsFirestoreInstance: true,
+        adminDbProxyThrows: false,
+        adminDbAccessBlocked: false,
+        getterBlocked: false,
+        networkCallsCount: 0,
+      });
+
+      // 2. Non-régression : une configuration cohérente mais avec un mauvais projet ou la base '(default)' reste strictement rejetée
+      expect(() =>
+        initializeServerFirebaseAdminRuntime({
+          ...coherentProdEnv,
+          FIREBASE_PROJECT_ID: "wrong-prod-project",
+        }),
+      ).toThrow(/Project ID non autorisé/);
+
+      expect(() =>
+        initializeServerFirebaseAdminRuntime({
+          ...coherentProdEnv,
+          FIREBASE_DATABASE_ID: "(default)",
+        }),
+      ).toThrow(/formellement interdite/);
     });
   });
 });

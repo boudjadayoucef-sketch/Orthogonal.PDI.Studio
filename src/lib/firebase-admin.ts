@@ -16,12 +16,94 @@ const SERVER_PROJECT_ENV_KEYS = [
 export const SANDBOX_SERVER_FIREBASE_FORBIDDEN_ERROR =
   'Coupe-circuit Sandbox Serveur (C1/C2) : Firebase Admin et Firestore Serveur sont strictement désactivés en mode Sandbox. Aucune connexion à Firebase Production n’est autorisée.';
 
-function shouldBlockServerFirebaseInit(env?: Record<string, unknown>): boolean {
+export const SERVER_FIREBASE_FAIL_CLOSED_ERROR =
+  'Coupe-circuit Fail-Closed Serveur (STAGING-00-B3-R2) : initialisation Firebase Admin et Firestore Serveur refusée (PDI_ENV et VITE_PDI_ENV doivent être explicitement définis, valides, cohérents et hors mode Sandbox).';
+
+export type ServerFirebaseBlockReason =
+  | 'SANDBOX_MODE'
+  | 'INCOMPLETE_PDI_ENV'
+  | 'SANDBOX_FORBIDDEN_IN_PRODUCTION'
+  | 'FRONTEND_SERVER_ENV_MISMATCH'
+  | 'AMBIGUOUS_PDI_ENV';
+
+export interface ServerFirebaseInitGateResult {
+  blocked: boolean;
+  sandboxDisabled: boolean;
+  runtimeDisabled: boolean;
+  blockReason: ServerFirebaseBlockReason | null;
+}
+
+/**
+ * STAGING-00-B3-R2 :
+ * Validation fail-closed exécutée AVANT toute initialisation Firebase Admin (`initializeApp`, `getAuth`, `new Firestore`).
+ * Règles impératives :
+ * - résolution invalide : BLOQUER ;
+ * - configuration incomplète (`PDI_ENV` absent ou `VITE_PDI_ENV` absent) : BLOQUER ;
+ * - mode sandbox : BLOQUER ;
+ * - `NODE_ENV=production` avec mode sandbox : BLOQUER ;
+ * - configuration explicitement cohérente `production` / `development` / `test` : AUTORISER.
+ */
+export function evaluateServerFirebaseInitGate(
+  env?: Record<string, unknown>
+): ServerFirebaseInitGateResult {
   if (isStagingSandboxMode(env)) {
-    return true;
+    return {
+      blocked: true,
+      sandboxDisabled: true,
+      runtimeDisabled: true,
+      blockReason: 'SANDBOX_MODE'
+    };
   }
-  const resolution = resolvePdiEnvironmentMode(env);
-  return !resolution.isValid || resolution.isSandbox;
+
+  const resolution = resolvePdiEnvironmentMode(env, {
+    requireServerClientCoherence: true
+  });
+
+  if (!resolution.isValid) {
+    const reason: ServerFirebaseBlockReason =
+      resolution.errorCode ?? 'AMBIGUOUS_PDI_ENV';
+    return {
+      blocked: true,
+      sandboxDisabled: reason === 'SANDBOX_FORBIDDEN_IN_PRODUCTION',
+      runtimeDisabled: true,
+      blockReason: reason
+    };
+  }
+
+  if (resolution.isSandbox) {
+    return {
+      blocked: true,
+      sandboxDisabled: true,
+      runtimeDisabled: true,
+      blockReason: 'SANDBOX_MODE'
+    };
+  }
+
+  const hasExplicitServerEnv =
+    typeof resolution.serverPdiEnv === 'string' && resolution.serverPdiEnv.trim().length > 0;
+  const hasExplicitClientEnv =
+    typeof resolution.clientVitePdiEnv === 'string' &&
+    resolution.clientVitePdiEnv.trim().length > 0;
+
+  if (!hasExplicitServerEnv || !hasExplicitClientEnv) {
+    return {
+      blocked: true,
+      sandboxDisabled: false,
+      runtimeDisabled: true,
+      blockReason: 'INCOMPLETE_PDI_ENV'
+    };
+  }
+
+  return {
+    blocked: false,
+    sandboxDisabled: false,
+    runtimeDisabled: false,
+    blockReason: null
+  };
+}
+
+export function shouldBlockServerFirebaseInit(env?: Record<string, unknown>): boolean {
+  return evaluateServerFirebaseInitGate(env).blocked;
 }
 
 function createSandboxDisabledServerProxy<T extends object>(serviceName: string): T {
@@ -113,9 +195,12 @@ export function resolveServerFirestoreConfig(
     : {},
   options?: { requireExplicitEnv?: boolean }
 ): { projectId: string; databaseId: string } {
-  if (shouldBlockServerFirebaseInit(env)) {
+  const pdiResolution = resolvePdiEnvironmentMode(env, {
+    requireServerClientCoherence: true
+  });
+  if (isStagingSandboxMode(env) || !pdiResolution.isValid || pdiResolution.isSandbox) {
     throw new Error(
-      `${SANDBOX_SERVER_FIREBASE_FORBIDDEN_ERROR} [resolveServerFirestoreConfig interdit en mode Sandbox]`
+      `${SANDBOX_SERVER_FIREBASE_FORBIDDEN_ERROR} [resolveServerFirestoreConfig interdit en mode Sandbox ou configuration invalide]`
     );
   }
 
@@ -501,6 +586,8 @@ export function createServerFirestoreClient(
 
 export interface ServerFirebaseAdminRuntime {
   sandboxDisabled: boolean;
+  runtimeDisabled: boolean;
+  blockReason: ServerFirebaseBlockReason | null;
   config: { projectId: string; databaseId: string } | null;
   adminApp: ReturnType<typeof initializeApp>;
   adminAuth: ReturnType<typeof getAuth>;
@@ -508,15 +595,16 @@ export interface ServerFirebaseAdminRuntime {
 }
 
 /**
- * STAGING-00-B3-R1 (Partie B) :
- * Initialise conditionnellement Firebase Admin et Firestore côté serveur.
- * - En mode Sandbox (`isStagingSandboxMode(env) === true`) :
+ * STAGING-00-B3-R1 & STAGING-00-B3-R2 :
+ * Initialise conditionnellement Firebase Admin et Firestore côté serveur avec contrôle fail-closed préalable.
+ * - Lorsque `shouldBlockServerFirebaseInit(env)` est vrai (mode Sandbox, `PDI_ENV` absent, `VITE_PDI_ENV` absent,
+ *   incohérence `PDI_ENV !== VITE_PDI_ENV`, valeur invalide, ou `NODE_ENV=production` + sandbox) :
  *   1. Aucune résolution de configuration Firebase Production.
  *   2. Aucun appel à `initializeApp` (Firebase Admin).
  *   3. Aucun appel à `getAuth` (Firebase Admin Auth).
  *   4. Aucune instanciation de `Firestore` (`@google-cloud/firestore`).
- *   5. Retourne des proxies fail-closed qui refusent immédiatement tout accès accidentel en Sandbox.
- * - Hors mode Sandbox :
+ *   5. Retourne `config: null`, `runtimeDisabled: true` et des proxies fail-closed.
+ * - Lorsque `PDI_ENV` et `VITE_PDI_ENV` sont explicitement définis, valides, cohérents et hors Sandbox :
  *   Exécute l'initialisation nominale complète avec validation stricte du projet et de la base Firestore nommée.
  */
 export function initializeServerFirebaseAdminRuntime(
@@ -531,9 +619,12 @@ export function initializeServerFirebaseAdminRuntime(
     createFirestore?: (settings: { projectId: string; databaseId: string }) => Firestore;
   }
 ): ServerFirebaseAdminRuntime {
-  if (shouldBlockServerFirebaseInit(env)) {
+  const gate = evaluateServerFirebaseInitGate(env);
+  if (gate.blocked) {
     return {
-      sandboxDisabled: true,
+      sandboxDisabled: gate.sandboxDisabled,
+      runtimeDisabled: true,
+      blockReason: gate.blockReason,
       config: null,
       adminApp: createSandboxDisabledServerProxy<ReturnType<typeof initializeApp>>('adminApp'),
       adminAuth: createSandboxDisabledServerProxy<ReturnType<typeof getAuth>>('adminAuth'),
@@ -558,6 +649,8 @@ export function initializeServerFirebaseAdminRuntime(
 
   return {
     sandboxDisabled: false,
+    runtimeDisabled: false,
+    blockReason: null,
     config: serverFirestoreConfig,
     adminApp: appInstance,
     adminAuth: authInstance,
@@ -568,26 +661,29 @@ export function initializeServerFirebaseAdminRuntime(
 const activeServerFirebaseRuntime = initializeServerFirebaseAdminRuntime();
 
 export const isServerFirebaseSandboxDisabled = activeServerFirebaseRuntime.sandboxDisabled;
+export const isServerFirebaseRuntimeDisabled = activeServerFirebaseRuntime.runtimeDisabled;
+export const serverFirebaseBlockReason = activeServerFirebaseRuntime.blockReason;
+export const serverFirebaseRuntimeConfig = activeServerFirebaseRuntime.config;
 export const adminApp = activeServerFirebaseRuntime.adminApp;
 export const adminAuth = activeServerFirebaseRuntime.adminAuth;
 export const adminDb = activeServerFirebaseRuntime.adminDb;
 
 export function getServerAdminApp(env?: Record<string, unknown>): ReturnType<typeof initializeApp> {
-  if (shouldBlockServerFirebaseInit(env) || activeServerFirebaseRuntime.sandboxDisabled) {
+  if (shouldBlockServerFirebaseInit(env) || activeServerFirebaseRuntime.runtimeDisabled) {
     throw new Error(`${SANDBOX_SERVER_FIREBASE_FORBIDDEN_ERROR} [Accès à adminApp refusé]`);
   }
   return adminApp;
 }
 
 export function getServerAdminAuth(env?: Record<string, unknown>): ReturnType<typeof getAuth> {
-  if (shouldBlockServerFirebaseInit(env) || activeServerFirebaseRuntime.sandboxDisabled) {
+  if (shouldBlockServerFirebaseInit(env) || activeServerFirebaseRuntime.runtimeDisabled) {
     throw new Error(`${SANDBOX_SERVER_FIREBASE_FORBIDDEN_ERROR} [Accès à adminAuth refusé]`);
   }
   return adminAuth;
 }
 
 export function getServerAdminDb(env?: Record<string, unknown>): Firestore {
-  if (shouldBlockServerFirebaseInit(env) || activeServerFirebaseRuntime.sandboxDisabled) {
+  if (shouldBlockServerFirebaseInit(env) || activeServerFirebaseRuntime.runtimeDisabled) {
     throw new Error(`${SANDBOX_SERVER_FIREBASE_FORBIDDEN_ERROR} [Accès à adminDb refusé]`);
   }
   return adminDb;

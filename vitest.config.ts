@@ -5,6 +5,10 @@ export default defineConfig({
   test: {
     globals: true,
     environment: "node",
+    env: {
+      PDI_ENV: "test",
+      VITE_PDI_ENV: "test",
+    },
     include: [
       "src/pdi/**/*.{test,spec}.ts",
       "src/pdi/**/*.{test,spec}.tsx",

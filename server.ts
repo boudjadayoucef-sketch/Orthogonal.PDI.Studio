@@ -18,7 +18,11 @@ import {
   rejectInStagingSandboxMode,
   AuthRequest,
 } from "./src/middleware/auth.ts";
-import { getServerAdminAuth, getServerAdminDb } from "./src/lib/firebase-admin.ts";
+import {
+  getServerAdminAuth,
+  getServerAdminDb,
+  isServerFirebaseRuntimeDisabled,
+} from "./src/lib/firebase-admin.ts";
 import { isStagingSandboxMode } from "./src/lib/stagingSandbox.ts";
 import { 
   createBoundedRateLimiter,
@@ -202,13 +206,23 @@ app.post("/api/admin/set-user-role", rejectInStagingSandboxMode, requireAuth, re
 });
 
 // ==========================================
-// Slick-Pay & Paddle Webhook IPN & Pending Order Endpoints (SEC-01-FIX-05-B & Protection C2 STAGING-00-B3-R1)
+// Slick-Pay & Paddle Webhook IPN & Pending Order Endpoints (SEC-01-FIX-05-B & Protection C2 STAGING-00-B3-R1/R2)
 // ==========================================
-if (isStagingSandboxMode(process.env)) {
-  // STAGING-00-B3-R1 (Partie B): In Sandbox mode, do NOT instantiate Firebase-backed repositories or processors.
-  app.post("/api/payments/orders", rejectInStagingSandboxMode);
-  app.post("/api/webhooks/slickpay", rejectInStagingSandboxMode);
-  app.post("/api/webhooks/paddle", rejectInStagingSandboxMode);
+if (isStagingSandboxMode(process.env) || isServerFirebaseRuntimeDisabled) {
+  // STAGING-00-B3-R1 / R2: Do NOT instantiate Firebase-backed repositories or processors when Sandbox or fail-closed gate is active.
+  const rejectWhenFirebaseRuntimeDisabled: express.RequestHandler = (req, res, next) => {
+    if (isStagingSandboxMode(process.env)) {
+      return rejectInStagingSandboxMode(req, res, next);
+    }
+    return res.status(503).json({
+      error:
+        "Service Unavailable: Server Firebase Admin runtime is disabled (explicit coherent PDI_ENV and VITE_PDI_ENV required).",
+      code: "server/firebase-runtime-disabled",
+    });
+  };
+  app.post("/api/payments/orders", rejectWhenFirebaseRuntimeDisabled);
+  app.post("/api/webhooks/slickpay", rejectWhenFirebaseRuntimeDisabled);
+  app.post("/api/webhooks/paddle", rejectWhenFirebaseRuntimeDisabled);
 } else {
   const activeAdminDb = getServerAdminDb();
   const activeAdminAuth = getServerAdminAuth();
