@@ -849,12 +849,15 @@ describe("STAGING-00-B4 — FIX-ENV-02 : Séparation Sandbox / Livraison Cloud R
       PDI_SERVER_NO_AUTOSTART: "1",
     };
 
-    const tsxBin = path.resolve(process.cwd(), "node_modules", ".bin", "tsx");
-    const { stdout } = await execFileAsync(tsxBin, ["-e", probeScript], {
-      cwd: process.cwd(),
-      env: cleanEnv,
-      timeout: 30000,
-    });
+    const { stdout } = await execFileAsync(
+      process.execPath,
+      ["--import", "tsx", "--input-type=module", "-e", probeScript],
+      {
+        cwd: process.cwd(),
+        env: cleanEnv,
+        timeout: 30000,
+      }
+    );
 
     const marker = "__FIX_ENV_02_PROBE__";
     const line = stdout.split("\n").find((l) => l.includes(marker));

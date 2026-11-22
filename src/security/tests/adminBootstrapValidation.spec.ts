@@ -721,11 +721,15 @@ describe('AUTH-ADMIN-05-FIX-06 à FIX-10 : Suite de validation unitaire du Boots
       });
     `;
 
-    const rawOutput = execFileSync('npx', ['tsx', '-e', probeScript], {
-      cwd: process.cwd(),
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe']
-    });
+    const rawOutput = execFileSync(
+      process.execPath,
+      ['--import', 'tsx', '--input-type=module', '-e', probeScript],
+      {
+        cwd: process.cwd(),
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe']
+      }
+    );
 
     const parsed = JSON.parse(rawOutput.trim());
     expect(parsed.status).toBe('CLEAN_ISOLATED_IMPORT');
