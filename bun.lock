@@ -37,6 +37,7 @@
         "vite": "^6.2.3",
       },
       "devDependencies": {
+        "@electric-sql/pglite": "^0.5.17",
         "@firebase/rules-unit-testing": "^5.0.2",
         "@types/express": "^4.17.21",
         "@types/jszip": "^3.4.0",
@@ -105,9 +106,7 @@
 
     "@drizzle-team/brocli": ["@drizzle-team/brocli@0.10.2", "", {}, "sha512-z33Il7l5dKjUgGULTqBsQBQwckHh5AbIuxhdsIxDDiZAzBOrZO6q9ogcWC65kU382AfynTfgNumVcNIjuIua6w=="],
 
-    "@electric-sql/pglite": ["@electric-sql/pglite@0.3.16", "", {}, "sha512-mZkZfOd9OqTMHsK+1cje8OSzfAQcpD7JmILXTl5ahdempjUDdmg4euf1biDex5/LfQIDJ3gvCu6qDgdnDxfJmA=="],
-
-    "@electric-sql/pglite-tools": ["@electric-sql/pglite-tools@0.2.21", "", { "peerDependencies": { "@electric-sql/pglite": "0.3.16" } }, "sha512-kv8Z7UmmBVECHud63VblgQLp4A+qSklNP7H22VQqFQGrWFTodc73bubcjgmBqThFsIIiEeAEQQYwWGaK2lSDtA=="],
+    "@electric-sql/pglite": ["@electric-sql/pglite@0.5.17", "", {}, "sha512-8SvKjiUjaU+0O0dbxjOfN+jXz14TEqDWbwDkYOW1aQ11y/ph2JvFVI27ABBo5nfw+ZfSqy4hKCNlbnbB1TDE+g=="],
 
     "@esbuild-kit/core-utils": ["@esbuild-kit/core-utils@3.3.2", "", { "dependencies": { "esbuild": "~0.18.20", "source-map-support": "^0.5.21" } }, "sha512-sPRAnw9CdSsRmEtnsl2WXWdyquogVpB3yZ3dgwJfe8zrOzTsV7cJvmwrKVa+0ma5BoiGJ+BoqkMvawbayKUsqQ=="],
 
@@ -1844,6 +1843,10 @@
     "fast-png/pako": ["pako@2.2.0", "", {}, "sha512-zJq6RP/5q+TO2OpFV3FHzlPnFjmkb7Nc99a5SNjJE+uu/PkpChs+NIZSSzbBoD+6kjiISXjfYdwj1ZRQ81dz/w=="],
 
     "firebase-admin/google-auth-library": ["google-auth-library@10.9.1", "", { "dependencies": { "base64-js": "^1.3.0", "ecdsa-sig-formatter": "^1.0.11", "gaxios": "^7.1.4", "gcp-metadata": "8.1.2", "google-logging-utils": "1.1.3", "jws": "^4.0.0" } }, "sha512-i1ydyHrqcIxXkWh/uBmVkzCvIuq5yiK2ATndIe5XxKholrG/MTYP9xGYka4sQhrbIAgGjL2B6NOE7rFaiF3fXw=="],
+
+    "firebase-tools/@electric-sql/pglite": ["@electric-sql/pglite@0.3.16", "", {}, "sha512-mZkZfOd9OqTMHsK+1cje8OSzfAQcpD7JmILXTl5ahdempjUDdmg4euf1biDex5/LfQIDJ3gvCu6qDgdnDxfJmA=="],
+
+    "firebase-tools/@electric-sql/pglite-tools": ["@electric-sql/pglite-tools@0.2.21", "", { "peerDependencies": { "@electric-sql/pglite": "0.3.16" } }, "sha512-kv8Z7UmmBVECHud63VblgQLp4A+qSklNP7H22VQqFQGrWFTodc73bubcjgmBqThFsIIiEeAEQQYwWGaK2lSDtA=="],
 
     "foreground-child/signal-exit": ["signal-exit@4.1.0", "", {}, "sha512-bzyZ1e88w9O1iNJbKnOlvYTrWPDl46O1bG0D3XInv+9tkPrxrN8jUUTiFlDkkmKWgn1M6CfIA13SuGqOa9Korw=="],
 
