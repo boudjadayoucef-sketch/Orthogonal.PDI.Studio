@@ -30,6 +30,7 @@ import { relations } from "drizzle-orm";
 export const MIG02_MIGRATION_FILES = [
   "supabase/migrations/20261123000100_mig02_supabase_core_schema.sql",
   "supabase/migrations/20261123000200_mig02_supabase_rls_and_security.sql",
+  "supabase/migrations/20261123000300_mig02_fix01_security_definer_service_role_guard.sql",
 ] as const;
 
 export const MIG02_SUPABASE_TABLES = [

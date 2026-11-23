@@ -54,6 +54,7 @@ Points d'audit relevés :
 Les migrations SQL versionnées sont situées dans :
 1. `supabase/migrations/20261123000100_mig02_supabase_core_schema.sql` — DDL non destructif, contraintes, index, triggers `updated_at`.
 2. `supabase/migrations/20261123000200_mig02_supabase_rls_and_security.sql` — Fonctions `SECURITY DEFINER`, triggers anti-escalade, révocation de privilèges, `ENABLE` + `FORCE ROW LEVEL SECURITY` et politiques RLS.
+3. `supabase/migrations/20261123000300_mig02_fix01_security_definer_service_role_guard.sql` — Correction MIG-02-FIX-01 : immunisation de `public.is_service_role()` contre l'élévation de `current_user` en contexte `SECURITY DEFINER` et passage de `public.guard_project_member_role()` en `SECURITY INVOKER`.
 
 Le miroir typé Drizzle ORM et les fonctions de mapping transitoire sont définis dans `src/db/supabaseSchema.ts` sans modifier `src/db/schema.ts`.
 
@@ -108,11 +109,11 @@ auth.users (Supabase Auth)
 1. **Deny-by-default :** `REVOKE ALL` sur les 12 tables pour `PUBLIC`, `anon` et `authenticated`, puis octroi minimal explicite à `authenticated` (aucun privilège accordé à `anon`).
 2. **RLS activé et forcé :** `ENABLE ROW LEVEL SECURITY` et `FORCE ROW LEVEL SECURITY` sur 100 % des 12 tables.
 3. **Aucune confiance dans les métadonnées JWT modifiables côté navigateur :** `public.is_super_admin()` est `SECURITY DEFINER` (avec `SET search_path = pg_catalog, public, auth`) et vérifie conjointement `public.profiles.role = 'super_admin'`, `public.profiles.status = 'active'` et `auth.users.email_confirmed_at IS NOT NULL`.
-4. **Autorité serveur stricte :** `public.is_service_role()` repose exclusivement sur le rôle PostgreSQL réel (`current_user IN ('service_role', 'postgres', 'supabase_admin')`) et ignore toute revendication falsifiée dans `request.jwt.claims`.
-5. **Défense en profondeur par triggers `BEFORE INSERT/UPDATE` :**
+4. **Autorité serveur stricte immunisée contre `SECURITY DEFINER` (MIG-02-FIX-01) :** `public.is_service_role()` (`SECURITY INVOKER`) n'utilise **jamais** `current_user` (qui prend la valeur du propriétaire `postgres` à l'intérieur d'une fonction `SECURITY DEFINER`). Elle vérifie en priorité la GUC PostgreSQL `current_setting('role', true)` (toujours positionnée par PostgREST à `anon`, `authenticated` ou `service_role` et jamais modifiée par `SECURITY DEFINER`) ; en l'absence de `SET ROLE` (`role = 'none'`), seule une session administrative directe (`session_user` dans `service_role`, `postgres`, `supabase_admin`) dépourvue d'identité JWT cliente (`auth.uid() IS NULL` et `auth.role()` hors `authenticated`/`anon`) est reconnue comme autorité serveur.
+5. **Défense en profondeur par triggers `BEFORE INSERT/UPDATE` (tous en `SECURITY INVOKER`) :**
    - `trg_profiles_guard_privileged_fields` : impose `email = auth.users.email`, `role = 'client'`, `status = 'pending_activation'`, `account_type = 'basic'`, `subscription_plan = 'monthly'`, `firebase_uid IS NULL`, `payment_gateway IS NULL` et compteurs à 0 à la création ; verrouille toutes les colonnes privilégiées et compteurs serveur en mise à jour.
    - `trg_projects_guard_immutability` : interdit aux clients d'injecter ou de modifier `owner_id`, `tenant_id`, `legacy_pg_id`, `legacy_firestore_id`, `legacy_firebase_uid` et `created_at`.
-   - `trg_project_members_guard_role` : empêche l'attribution du rôle `owner` à un tiers et verrouille `(project_id, user_id)` en mise à jour.
+   - `trg_project_members_guard_role` (`SECURITY INVOKER`, durci par MIG-02-FIX-01) : interdit aux requêtes clientes d'attribuer le rôle `owner` et verrouille `project_id`, `user_id`, `invited_by` et `created_at` en mise à jour.
    - `trg_project_files_guard_immutability` : verrouille `project_id`, `owner_id`, `legacy_drive_record_id`, `legacy_isometric_id` et `created_at`.
    - `trg_feedback_guard_fields` : force `status = 'new'` et `admin_notes IS NULL` à la soumission client ; restreint les mises à jour `super_admin` aux seuls champs `status` et `admin_notes` (le contenu soumis par l'utilisateur est immuable).
 
@@ -150,7 +151,7 @@ auth.users (Supabase Auth)
    ```bash
    npx supabase db push --dry-run
    ```
-3. Appliquer les deux migrations versionnées de `supabase/migrations/` sur le projet Supabase de **test** :
+3. Appliquer les trois migrations versionnées de `supabase/migrations/` sur le projet Supabase de **test** :
    ```bash
    npx supabase db push
    ```
@@ -164,6 +165,7 @@ auth.users (Supabase Auth)
 1. Ouvrir **SQL Editor** sur le projet Supabase de test.
 2. Exécuter intégralement `supabase/migrations/20261123000100_mig02_supabase_core_schema.sql`.
 3. Exécuter intégralement `supabase/migrations/20261123000200_mig02_supabase_rls_and_security.sql`.
+4. Exécuter intégralement `supabase/migrations/20261123000300_mig02_fix01_security_definer_service_role_guard.sql`.
 
 ### Vérifications SQL post-migration sur le projet Supabase de test
 
@@ -204,14 +206,14 @@ WHERE table_schema = 'public'
 
 ## 5. Validation locale automatisée (PostgreSQL réel via PGlite)
 
-Les deux fichiers SQL de `supabase/migrations/` sont exécutés tels quels sur une instance PostgreSQL réelle en mémoire (`@electric-sql/pglite`, zéro réseau, zéro base distante) par la suite dédiée :
+Les trois fichiers SQL de `supabase/migrations/` sont exécutés tels quels sur une instance PostgreSQL réelle en mémoire (`@electric-sql/pglite`, zéro réseau, zéro base distante) par la suite dédiée :
 
 ```bash
-./node_modules/.bin/vitest run src/security/tests/mig02SupabaseSchemaRls.spec.ts
+npx vitest run src/security/tests/mig02SupabaseSchemaRls.spec.ts
 ```
 
 Cette suite vérifie de bout en bout :
-1. Exécution des migrations sur une base vierge, création des 12 tables, `ENABLE` + `FORCE ROW LEVEL SECURITY` et absence de colonnes sensibles.
+1. Exécution des 3 migrations sur une base vierge, création des 12 tables, `ENABLE` + `FORCE ROW LEVEL SECURITY` et absence de colonnes sensibles.
 2. Intégrité référentielle des clés étrangères.
 3. Unicité des identifiants (`email` insensible à la casse, `firebase_uid`, `code`, `order_id`, `(provider, provider_transaction_id)`).
 4. Isolation complète entre deux utilisateurs authentifiés distincts (`User A` vs `User B`).
@@ -220,3 +222,4 @@ Cette suite vérifie de bout en bout :
 7. Refus total pour le rôle `anon` sur les 12 tables.
 8. Protection des membres de projet (`viewer` / `editor`, refus d'auto-adhésion), immuabilité des journaux (`connection_logs`, `audit_logs`, `subscriber_usage` append-only) et règles de triage `feedback`.
 9. Compatibilité complète avec les enregistrements hérités PostgreSQL (Drizzle) et Firestore via `src/db/supabaseSchema.ts`.
+10. Anti-contournement **MIG-02-FIX-01** (`SECURITY DEFINER` / `is_service_role()`) : vérification du catalogue `pg_proc` (`prosecdef = false`), sonde `SECURITY DEFINER` pour `authenticated`/`anon`/`authenticator`/`service_role`/`postgres`, blocage strict de la réaffectation de `user_id`/`project_id` sur `project_members` même par le propriétaire du projet, blocage de l'attribution du rôle `owner`, blocage des modifications croisées et des claims JWT falsifiés, et préservation des opérations serveur et du cycle CRUD autorisé.

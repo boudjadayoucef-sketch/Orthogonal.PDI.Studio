@@ -38,8 +38,7 @@ const USER_C_ID = "33333333-3333-4333-8333-333333333333";
 const SUPER_ADMIN_ID = "99999999-9999-4999-8999-999999999999";
 const UNVERIFIED_ADMIN_ID = "88888888-8888-4888-8888-888888888888";
 
-const MIGRATION_01_PATH = path.resolve(process.cwd(), MIG02_MIGRATION_FILES[0]);
-const MIGRATION_02_PATH = path.resolve(process.cwd(), MIG02_MIGRATION_FILES[1]);
+const MIGRATION_PATHS = MIG02_MIGRATION_FILES.map((file) => path.resolve(process.cwd(), file));
 
 const SUPABASE_AUTH_BOOTSTRAP_SQL = `
   DO $$
@@ -53,11 +52,14 @@ const SUPABASE_AUTH_BOOTSTRAP_SQL = `
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
       CREATE ROLE service_role NOLOGIN NOINHERIT BYPASSRLS;
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticator') THEN
+      CREATE ROLE authenticator NOLOGIN NOINHERIT;
+    END IF;
   END
   $$;
 
   CREATE SCHEMA IF NOT EXISTS auth;
-  GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role;
+  GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role, authenticator;
   GRANT USAGE ON SCHEMA auth TO authenticated, service_role;
 
   CREATE TABLE IF NOT EXISTS auth.users (
@@ -92,18 +94,18 @@ const SUPABASE_AUTH_BOOTSTRAP_SQL = `
     SELECT COALESCE(NULLIF(auth.jwt() ->> 'role', ''), current_user::text);
   $$;
 
-  GRANT EXECUTE ON FUNCTION auth.jwt() TO anon, authenticated, service_role;
-  GRANT EXECUTE ON FUNCTION auth.uid() TO anon, authenticated, service_role;
-  GRANT EXECUTE ON FUNCTION auth.role() TO anon, authenticated, service_role;
+  GRANT EXECUTE ON FUNCTION auth.jwt() TO anon, authenticated, service_role, authenticator;
+  GRANT EXECUTE ON FUNCTION auth.uid() TO anon, authenticated, service_role, authenticator;
+  GRANT EXECUTE ON FUNCTION auth.role() TO anon, authenticated, service_role, authenticator;
 `;
 
 async function createMigratedTestDb(): Promise<PGlite> {
   const db = new PGlite();
   await db.exec(SUPABASE_AUTH_BOOTSTRAP_SQL);
-  const sql01 = fs.readFileSync(MIGRATION_01_PATH, "utf-8");
-  const sql02 = fs.readFileSync(MIGRATION_02_PATH, "utf-8");
-  await db.exec(sql01);
-  await db.exec(sql02);
+  for (const migrationPath of MIGRATION_PATHS) {
+    const sql = fs.readFileSync(migrationPath, "utf-8");
+    await db.exec(sql);
+  }
   return db;
 }
 
@@ -267,9 +269,11 @@ describe("MIG-02 : Schéma PostgreSQL Supabase, Migrations SQL & Sécurité RLS 
   // =========================================================================
   // 1. CRÉATION DU SCHÉMA, INDEX, TRIGGERS ET RLS ACTIVÉ/FORCÉ
   // =========================================================================
-  it("1. exécute les 2 migrations SQL sur une base vierge, crée les 12 tables, active et force RLS sur 100 % des tables", async () => {
-    expect(fs.existsSync(MIGRATION_01_PATH)).toBe(true);
-    expect(fs.existsSync(MIGRATION_02_PATH)).toBe(true);
+  it("1. exécute les 3 migrations SQL sur une base vierge, crée les 12 tables, active et force RLS sur 100 % des tables", async () => {
+    expect(MIGRATION_PATHS).toHaveLength(3);
+    for (const migrationPath of MIGRATION_PATHS) {
+      expect(fs.existsSync(migrationPath), `Migration manquante: ${migrationPath}`).toBe(true);
+    }
 
     const tablesRes = await db.query<{
       relname: string;
@@ -972,5 +976,233 @@ describe("MIG-02 : Schéma PostgreSQL Supabase, Migrations SQL & Sécurité RLS 
     });
     expect(migratedView.projects).toEqual([{ legacy_pg_id: 42, name: "Unité Compression Hassi" }]);
     expect(migratedView.files).toEqual([{ file_kind: "drive_file" }, { file_kind: "isometric" }]);
+  });
+
+  // =========================================================================
+  // 11. MIG-02-FIX-01 : ANTI-CONTOURNEMENT SECURITY DEFINER & `is_service_role()`
+  // =========================================================================
+  it("11. MIG-02-FIX-01 : interdit tout contournement SECURITY DEFINER sur project_members et is_service_role() tout en préservant les opérations légitimes", async () => {
+    // Vérification du catalogue PostgreSQL : guard_project_member_role et is_service_role sont SECURITY INVOKER
+    const fnMeta = await db.query<{ proname: string; prosecdef: boolean }>(
+      `SELECT p.proname, p.prosecdef
+       FROM pg_proc p
+       JOIN pg_namespace n ON n.oid = p.pronamespace
+       WHERE n.nspname = 'public'
+         AND p.proname IN ('guard_project_member_role', 'is_service_role')
+       ORDER BY p.proname`
+    );
+    expect(fnMeta.rows).toEqual([
+      { proname: "guard_project_member_role", prosecdef: false },
+      { proname: "is_service_role", prosecdef: false },
+    ]);
+
+    // Sonde SECURITY DEFINER détenue par postgres : vérifie que `is_service_role()` reste FALSE
+    // pour `authenticated` et `authenticator` même si `current_user` est élevé à `postgres`.
+    await db.exec(`
+      CREATE OR REPLACE FUNCTION public._mig02_fix01_definer_probe()
+      RETURNS boolean
+      LANGUAGE sql
+      STABLE
+      SECURITY DEFINER
+      SET search_path = pg_catalog, public, auth
+      AS $$
+        SELECT public.is_service_role();
+      $$;
+      GRANT EXECUTE ON FUNCTION public._mig02_fix01_definer_probe() TO anon, authenticated, service_role, authenticator;
+    `);
+
+    const authDirect = await runAsAuthenticated(db, USER_A_ID, (tx) =>
+      tx.query<{ v: boolean }>(`SELECT public.is_service_role() AS v`)
+    );
+    const authViaDefiner = await runAsAuthenticated(db, USER_A_ID, (tx) =>
+      tx.query<{ v: boolean }>(`SELECT public._mig02_fix01_definer_probe() AS v`)
+    );
+    const authSpoofedJwtViaDefiner = await runAsAuthenticated(
+      db,
+      USER_A_ID,
+      (tx) => tx.query<{ v: boolean }>(`SELECT public._mig02_fix01_definer_probe() AS v`),
+      { role: "service_role", user_metadata: { role: "service_role" }, app_metadata: { role: "service_role" } }
+    );
+    const anonViaDefiner = await runAsAnon(db, (tx) =>
+      tx.query<{ v: boolean }>(`SELECT public._mig02_fix01_definer_probe() AS v`)
+    );
+    let authenticatorViaDefiner = true;
+    await db.transaction(async (tx) => {
+      await tx.exec(`SET LOCAL ROLE authenticator;`);
+      const res = await tx.query<{ v: boolean }>(`SELECT public._mig02_fix01_definer_probe() AS v`);
+      authenticatorViaDefiner = res.rows[0].v;
+    });
+    const serviceRoleViaDefiner = await runAsServiceRole(db, (tx) =>
+      tx.query<{ v: boolean }>(`SELECT public._mig02_fix01_definer_probe() AS v`)
+    );
+    const directPostgresAdmin = await db.query<{ v: boolean }>(`SELECT public.is_service_role() AS v`);
+
+    expect(authDirect.rows[0].v).toBe(false);
+    expect(authViaDefiner.rows[0].v).toBe(false);
+    expect(authSpoofedJwtViaDefiner.rows[0].v).toBe(false);
+    expect(anonViaDefiner.rows[0].v).toBe(false);
+    expect(authenticatorViaDefiner).toBe(false);
+    expect(serviceRoleViaDefiner.rows[0].v).toBe(true);
+    expect(directPostgresAdmin.rows[0].v).toBe(true);
+
+    // Nettoyage de la sonde temporaire
+    await db.exec(`DROP FUNCTION public._mig02_fix01_definer_probe();`);
+
+    // Création d'un 2e projet appartenant à User A (Alice) et d'une adhésion sur le projet de User B (Bob)
+    const projectA2Res = await runAsAuthenticated(db, USER_A_ID, (tx) =>
+      tx.query<{ id: string }>(
+        `INSERT INTO public.projects (owner_id, name, module, status)
+         VALUES ($1, 'Deuxième Projet Alice', 'isometric', 'draft')
+         RETURNING id`,
+        [USER_A_ID]
+      )
+    );
+    const projectA2Id = projectA2Res.rows[0].id;
+
+    // Création légitime par User B d'une adhésion sur projectBId (pour Charlie)
+    const bobMembershipRes = await runAsAuthenticated(db, USER_B_ID, (tx) =>
+      tx.query<{ id: string; member_role: string }>(
+        `INSERT INTO public.project_members (project_id, user_id, member_role, invited_by)
+         VALUES ($1, $2, 'viewer', $3)
+         RETURNING id, member_role`,
+        [projectBId, USER_C_ID, USER_B_ID]
+      )
+    );
+    const bobMembershipId = bobMembershipRes.rows[0].id;
+    expect(bobMembershipRes.rows[0].member_role).toBe("viewer");
+
+    // Récupérer l'adhésion existante (User B sur projectAId, gérée par User A)
+    const aliceMembershipRes = await runAsAuthenticated(db, USER_A_ID, (tx) =>
+      tx.query<{ id: string }>(
+        `SELECT id FROM public.project_members WHERE project_id = $1 AND user_id = $2`,
+        [projectAId, USER_B_ID]
+      )
+    );
+    const aliceMembershipId = aliceMembershipRes.rows[0].id;
+
+    // 1. User A NE PEUT PAS modifier le `user_id` d'une adhésion appartenant au projet de User A
+    //    (RLS seule autoriserait cet UPDATE car User A est owner : ce test échoue si le bug SECURITY DEFINER revient)
+    await expect(
+      runAsAuthenticated(db, USER_A_ID, (tx) =>
+        tx.query(
+          `UPDATE public.project_members SET user_id = $2 WHERE id = $1`,
+          [aliceMembershipId, USER_C_ID]
+        )
+      )
+    ).rejects.toThrow(/Forbidden|cannot be reassigned/i);
+
+    // 2. User A NE PEUT PAS modifier le `project_id` de cette adhésion pour la rattacher à un autre projet
+    //    (ni vers un 2e projet détenu par User A — où RLS seule laisserait passer — ni vers le projet de User B)
+    await expect(
+      runAsAuthenticated(db, USER_A_ID, (tx) =>
+        tx.query(
+          `UPDATE public.project_members SET project_id = $2 WHERE id = $1`,
+          [aliceMembershipId, projectA2Id]
+        )
+      )
+    ).rejects.toThrow(/Forbidden|cannot be reassigned/i);
+
+    await expect(
+      runAsAuthenticated(db, USER_A_ID, (tx) =>
+        tx.query(
+          `UPDATE public.project_members SET project_id = $2 WHERE id = $1`,
+          [aliceMembershipId, projectBId]
+        )
+      )
+    ).rejects.toThrow(/Forbidden|cannot be reassigned|row-level security/i);
+
+    // 3. User A NE PEUT PAS attribuer le rôle `owner` à un tiers (ni en INSERT, ni en UPDATE)
+    await expect(
+      runAsAuthenticated(db, USER_A_ID, (tx) =>
+        tx.query(
+          `INSERT INTO public.project_members (project_id, user_id, member_role, invited_by)
+           VALUES ($1, $2, 'owner', $3)`,
+          [projectAId, USER_C_ID, USER_A_ID]
+        )
+      )
+    ).rejects.toThrow(/Forbidden|owner role|row-level security/i);
+
+    await expect(
+      runAsAuthenticated(db, USER_A_ID, (tx) =>
+        tx.query(
+          `UPDATE public.project_members SET member_role = 'owner' WHERE id = $1`,
+          [aliceMembershipId]
+        )
+      )
+    ).rejects.toThrow(/Forbidden|owner role|row-level security/i);
+
+    // 4. User A NE PEUT PAS modifier l'adhésion d'un projet appartenant à User B
+    const aliceUpdateBobMembership = await runAsAuthenticated(db, USER_A_ID, (tx) =>
+      tx.query(
+        `UPDATE public.project_members SET member_role = 'editor' WHERE id = $1 RETURNING id`,
+        [bobMembershipId]
+      )
+    );
+    expect(aliceUpdateBobMembership.rows).toEqual([]);
+
+    // 5. User A NE PEUT PAS obtenir les privilèges `service_role` en falsifiant les claims JWT
+    await expect(
+      runAsAuthenticated(
+        db,
+        USER_A_ID,
+        (tx) =>
+          tx.query(
+            `UPDATE public.project_members SET user_id = $2 WHERE id = $1`,
+            [aliceMembershipId, USER_C_ID]
+          ),
+        { role: "service_role", sub: USER_A_ID, app_metadata: { role: "service_role" } }
+      )
+    ).rejects.toThrow(/Forbidden|cannot be reassigned/i);
+
+    await expect(
+      runAsAuthenticated(
+        db,
+        USER_A_ID,
+        (tx) =>
+          tx.query(
+            `UPDATE public.project_members SET project_id = $2 WHERE id = $1`,
+            [aliceMembershipId, projectA2Id]
+          ),
+        { role: "service_role", user_metadata: { role: "super_admin" } }
+      )
+    ).rejects.toThrow(/Forbidden|cannot be reassigned/i);
+
+    // 6. Une véritable opération exécutée avec les privilèges serveur (`service_role`) reste fonctionnelle
+    const serverAssignedOwner = await runAsServiceRole(db, (tx) =>
+      tx.query<{ id: string; member_role: string }>(
+        `INSERT INTO public.project_members (project_id, user_id, member_role)
+         VALUES ($1, $2, 'owner')
+         RETURNING id, member_role`,
+        [projectA2Id, USER_A_ID]
+      )
+    );
+    expect(serverAssignedOwner.rows[0].member_role).toBe("owner");
+
+    // Vérification du cycle de vie normal autorisé (CREATE -> UPDATE role -> DELETE) pour User A
+    const createdAuthorizedMember = await runAsAuthenticated(db, USER_A_ID, (tx) =>
+      tx.query<{ id: string; member_role: string }>(
+        `INSERT INTO public.project_members (project_id, user_id, member_role, invited_by)
+         VALUES ($1, $2, 'viewer', $3)
+         RETURNING id, member_role`,
+        [projectA2Id, USER_C_ID, USER_A_ID]
+      )
+    );
+    expect(createdAuthorizedMember.rows[0].member_role).toBe("viewer");
+
+    const updatedAuthorizedMember = await runAsAuthenticated(db, USER_A_ID, (tx) =>
+      tx.query<{ id: string; member_role: string }>(
+        `UPDATE public.project_members SET member_role = 'editor' WHERE id = $1 RETURNING id, member_role`,
+        [createdAuthorizedMember.rows[0].id]
+      )
+    );
+    expect(updatedAuthorizedMember.rows[0].member_role).toBe("editor");
+
+    const deletedAuthorizedMember = await runAsAuthenticated(db, USER_A_ID, (tx) =>
+      tx.query<{ id: string }>(
+        `DELETE FROM public.project_members WHERE id = $1 RETURNING id`,
+        [createdAuthorizedMember.rows[0].id]
+      )
+    );
+    expect(deletedAuthorizedMember.rows).toHaveLength(1);
   });
 });
