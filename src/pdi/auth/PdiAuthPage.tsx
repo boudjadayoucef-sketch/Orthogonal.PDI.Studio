@@ -14,6 +14,13 @@ import {
 } from "../../lib/firebase";
 import { PdiCountryConfig, PDI_DEFAULT_COUNTRIES } from "../data/pdiGeoData";
 import PdiInfoModals, { ModalType } from "../modals/PdiInfoModals";
+import { isSupabaseBrowserConfigured } from "../../lib/supabase";
+import {
+  loginWithSupabaseEmailPassword,
+  sendSupabasePasswordResetEmail,
+  type SupabaseClientAuthUser,
+} from "../../lib/supabaseAuth";
+import { isStagingSandboxMode } from "../../lib/stagingSandbox";
 
 export function isCoherentAuthorizedLoginResult(
   res: { profile: PdiUserProfile; isSuperAdmin: boolean } | null | undefined,
@@ -116,8 +123,14 @@ export const PDI_OFFERS = [
   }
 ];
 
+export type PdiAuthSuccessMeta = {
+  provider: "firebase" | "supabase";
+  emailVerified: boolean;
+  authUser?: SupabaseClientAuthUser;
+};
+
 export type PdiAuthPageProps = {
-  onSuccess: (profile: PdiUserProfile, isSuperAdmin: boolean) => void;
+  onSuccess: (profile: PdiUserProfile, isSuperAdmin: boolean, meta?: PdiAuthSuccessMeta) => void;
   onBackToLanding: () => void;
   initialTab?: "login" | "register" | "activation";
 };
@@ -128,6 +141,13 @@ export default function PdiAuthPage({
   initialTab = "login"
 }: PdiAuthPageProps) {
   const [tab, setTab] = useState<"login" | "register" | "activation">(initialTab);
+  const supabaseAvailable = useMemo(
+    () => !isStagingSandboxMode() && isSupabaseBrowserConfigured(),
+    []
+  );
+  const [loginProvider, setLoginProvider] = useState<"supabase" | "firebase">(() =>
+    supabaseAvailable ? "supabase" : "firebase"
+  );
   const isSubmittingRef = useRef(false);
   const isMountedRef = useRef(true);
   const transitionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -238,6 +258,31 @@ export default function PdiAuthPage({
     setLoading(true);
 
     try {
+      if (loginProvider === "supabase" && supabaseAvailable) {
+        const sbRes = await loginWithSupabaseEmailPassword(loginEmail, loginPassword);
+        if (!isMountedRef.current) return;
+        if (!isCoherentAuthorizedLoginResult(sbRes, sbRes.authUser)) {
+          throw new Error(
+            "Incohérence de session Supabase détectée : le profil actif ou l'identité vérifiée par le serveur n'est pas valide."
+          );
+        }
+        setSuccessMsg(`Connexion Supabase vérifiée ! Bienvenue ${sbRes.profile.name}.`);
+        transitionTimerRef.current = setTimeout(() => {
+          transitionTimerRef.current = null;
+          if (!isMountedRef.current) return;
+          if (!isCoherentAuthorizedLoginResult(sbRes, sbRes.authUser)) {
+            setErrorMsg("Session Supabase interrompue ou non autorisée avant l'ouverture de l'espace de travail.");
+            return;
+          }
+          onSuccess(sbRes.profile, sbRes.isSuperAdmin, {
+            provider: "supabase",
+            emailVerified: sbRes.emailConfirmed,
+            authUser: sbRes.authUser,
+          });
+        }, 600);
+        return;
+      }
+
       const res = await loginWithEmailAndPasswordSecure(loginEmail, loginPassword);
       if (!isMountedRef.current) return;
       if (!isCoherentAuthorizedLoginResult(res, auth.currentUser)) {
@@ -253,7 +298,10 @@ export default function PdiAuthPage({
           setErrorMsg("Session interrompue ou non autorisée avant l'ouverture de l'espace de travail.");
           return;
         }
-        onSuccess(res.profile, res.isSuperAdmin);
+        onSuccess(res.profile, res.isSuperAdmin, {
+          provider: "firebase",
+          emailVerified: auth.currentUser?.emailVerified === true,
+        });
       }, 1500);
     } catch (err: any) {
       if (!isMountedRef.current) return;
@@ -480,7 +528,11 @@ export default function PdiAuthPage({
     isSubmittingRef.current = true;
     setLoading(true);
     try {
-      await sendResetPasswordEmail(resetEmail);
+      if (loginProvider === "supabase" && supabaseAvailable) {
+        await sendSupabasePasswordResetEmail(resetEmail);
+      } else {
+        await sendResetPasswordEmail(resetEmail);
+      }
       if (!isMountedRef.current) return;
       setSuccessMsg(`Un email de réinitialisation sécurisé a été envoyé à ${resetEmail}. Vérifiez votre boîte de réception.`);
       setShowResetForm(false);
@@ -806,12 +858,61 @@ export default function PdiAuthPage({
         {/* TAB 1: LOGIN */}
         {tab === "login" && !showResetForm && (
           <form onSubmit={handleLoginSubmit}>
+            {supabaseAvailable && (
+              <div
+                data-testid="pdi-auth-provider-switch"
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "1fr 1fr",
+                  gap: 6,
+                  padding: 4,
+                  marginBottom: 14,
+                  borderRadius: 10,
+                  background: "rgba(9, 14, 23, 0.9)",
+                  border: "1px solid rgba(56, 189, 248, 0.25)",
+                }}
+              >
+                <button
+                  type="button"
+                  onClick={() => { setLoginProvider("supabase"); setErrorMsg(null); setSuccessMsg(null); }}
+                  style={{
+                    border: 0,
+                    borderRadius: 8,
+                    padding: "7px 8px",
+                    fontSize: 11,
+                    fontWeight: 800,
+                    cursor: "pointer",
+                    background: loginProvider === "supabase" ? "linear-gradient(135deg, #059669, #10B981)" : "transparent",
+                    color: loginProvider === "supabase" ? "#FFFFFF" : "#94A3B8",
+                  }}
+                >
+                  Supabase Auth (Vérifié serveur)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setLoginProvider("firebase"); setErrorMsg(null); setSuccessMsg(null); }}
+                  style={{
+                    border: 0,
+                    borderRadius: 8,
+                    padding: "7px 8px",
+                    fontSize: 11,
+                    fontWeight: 800,
+                    cursor: "pointer",
+                    background: loginProvider === "firebase" ? "linear-gradient(135deg, #0284C7, #0EA5E9)" : "transparent",
+                    color: loginProvider === "firebase" ? "#FFFFFF" : "#94A3B8",
+                  }}
+                >
+                  Firebase Auth (Hérité)
+                </button>
+              </div>
+            )}
+
             <div className="pdi-form-group">
               <label>Adresse Email ou Identifiant</label>
               <input
                 type="email"
                 required
-                placeholder="nom@entreprise.com ou boudjada.youcef@gmail.com"
+                placeholder={loginProvider === "supabase" ? "orthognaleng@gmail.com ou nom@entreprise.com" : "nom@entreprise.com ou boudjada.youcef@gmail.com"}
                 value={loginEmail}
                 onChange={(e) => setLoginEmail(e.target.value)}
                 autoComplete="email"
@@ -843,7 +944,11 @@ export default function PdiAuthPage({
             </div>
 
             <button type="submit" className="pdi-btn-submit" disabled={loading}>
-              {loading ? "Vérification en cours..." : "Se connecter à PD&I →"}
+              {loading
+                ? "Vérification serveur en cours..."
+                : loginProvider === "supabase" && supabaseAvailable
+                  ? "Se connecter via Supabase Auth →"
+                  : "Se connecter à PD&I →"}
             </button>
 
             <div className="pdi-divider">OU</div>

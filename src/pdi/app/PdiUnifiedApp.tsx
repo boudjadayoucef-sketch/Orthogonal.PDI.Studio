@@ -81,6 +81,7 @@ import { pdiAlert } from "../ui/PdiNotice";
 // PATCH 017K2
 import { PdiCompanyPanel } from "../ui/PdiCompanyPanel";
 import { PdiSuperAdminConsole } from "../superadmin/PdiSuperAdminConsole";
+import { PdiSupabaseSuperAdminPanel } from "../superadmin/PdiSupabaseSuperAdminPanel";
 import { PdiFeedbackModal } from "../feedback/PdiFeedbackModal";
 import { PdiNewProjectModal } from "../modals/PdiNewProjectModal";
 import { onIdTokenChanged } from "firebase/auth";
@@ -94,6 +95,12 @@ import {
   type WorkspaceSessionResolution,
   type PdiUserProfile
 } from "../../lib/firebase";
+import {
+  attachSupabaseAuthMonitor,
+  logoutSupabase,
+  updateSupabaseUserPassword,
+  type SupabaseClientAuthUser,
+} from "../../lib/supabaseAuth";
 import { attachSuperAdminTokenMonitor, isRestrictedAdminView, getAuthorizedView } from "../../security/clientAuthorization";
 import { projectsApi } from "../../lib/pdiApiClient";
 import {
@@ -678,6 +685,13 @@ export default function PdiUnifiedApp() {
     };
   });
   const verifiedSessionRef = React.useRef<WorkspaceSessionResolution | null>(verifiedSession);
+  const [authProvider, setAuthProvider] = useState<"firebase" | "supabase" | "sandbox" | null>(() =>
+    sandboxActive ? "sandbox" : null
+  );
+  const authProviderRef = React.useRef<"firebase" | "supabase" | "sandbox" | null>(
+    sandboxActive ? "sandbox" : null
+  );
+  const supabaseAuthUserRef = React.useRef<SupabaseClientAuthUser | null>(null);
 
   // BLOC C1 : Ne jamais accorder un mode actif ("client", "demo", "admin", "super_admin") depuis localStorage
   // avant que Firebase Auth et le profil Firestore n'aient été vérifiés (hors Sandbox locale isolée C1/C3).
@@ -785,7 +799,11 @@ export default function PdiUnifiedApp() {
 
     try {
       setIsSubmittingPasswordChange(true);
-      await changeUserProfilePassword(pdiUserProfile.email, oldPassword, newPassword);
+      if (authProviderRef.current === "supabase") {
+        await updateSupabaseUserPassword(pdiUserProfile.email, oldPassword, newPassword);
+      } else {
+        await changeUserProfilePassword(pdiUserProfile.email, oldPassword, newPassword);
+      }
       setPasswordChangeSuccess("Votre mot de passe a été modifié avec succès !");
       setOldPassword("");
       setNewPassword("");
@@ -912,6 +930,9 @@ export default function PdiUnifiedApp() {
   const getEffectiveAuthUser = React.useCallback(() => {
     if (isStagingSandboxMode()) {
       return getSandboxSyntheticAuthUser();
+    }
+    if (authProviderRef.current === "supabase" && supabaseAuthUserRef.current) {
+      return supabaseAuthUserRef.current;
     }
     return auth.currentUser;
   }, []);
@@ -1071,9 +1092,13 @@ export default function PdiUnifiedApp() {
     }
   }, [tryEnterWorkspace]);
 
-  // BLOC A4 : Déconnexion vérifiée ne masquant jamais les erreurs de signOut tout en bloquant immédiatement le workspace
+  // BLOC A4 & MIG-04-AUTH-01 : Déconnexion complète (Supabase + Firebase) verrouillant immédiatement le workspace
   const handleLogoutToHome = React.useCallback(async () => {
+    const previousProvider = authProviderRef.current;
     verifiedSessionRef.current = null;
+    supabaseAuthUserRef.current = null;
+    authProviderRef.current = null;
+    setAuthProvider(null);
     setVerifiedSession(null);
     purgeLocalAuthCaches();
     setAuthMode("guest");
@@ -1084,13 +1109,21 @@ export default function PdiUnifiedApp() {
     setAccountMenuOpen(false);
 
     try {
-      await logoutFirebase();
+      await logoutSupabase();
     } catch (err: any) {
-      console.error("Erreur lors de la déconnexion Firebase :", err);
-      void pdiAlert(
-        err?.message ||
-          "La déconnexion Firebase a rencontré une erreur. L'accès à l'espace de travail a été verrouillé localement."
-      );
+      console.error("Erreur lors de la déconnexion Supabase :", err?.message || err);
+    }
+
+    if (previousProvider === "firebase" || auth.currentUser) {
+      try {
+        await logoutFirebase();
+      } catch (err: any) {
+        console.error("Erreur lors de la déconnexion Firebase :", err);
+        void pdiAlert(
+          err?.message ||
+            "La déconnexion Firebase a rencontré une erreur. L'accès à l'espace de travail a été verrouillé localement."
+        );
+      }
     }
   }, []);
 
@@ -1162,6 +1195,11 @@ export default function PdiUnifiedApp() {
           const seq = ++resolutionSeq;
 
           if (!fbUser) {
+            if (authProviderRef.current === "supabase" && supabaseAuthUserRef.current) {
+              // Session Supabase active : ne pas écraser l'état Supabase quand Firebase n'est pas connecté
+              monitorCallback(null);
+              return;
+            }
             verifiedSessionRef.current = null;
             setVerifiedSession(null);
             authReadyRef.current = true;
@@ -1193,6 +1231,8 @@ export default function PdiUnifiedApp() {
             if (seq !== resolutionSeq) return;
             if (auth.currentUser && auth.currentUser.uid !== fbUser.uid) return;
 
+            authProviderRef.current = "firebase";
+            setAuthProvider("firebase");
             verifiedSessionRef.current = res;
             setVerifiedSession(res);
             authReadyRef.current = true;
@@ -1233,6 +1273,9 @@ export default function PdiUnifiedApp() {
         }),
       setAuthMode: (updater) =>
         setAuthMode((prev) => {
+          if (authProviderRef.current === "supabase" && supabaseAuthUserRef.current) {
+            return prev;
+          }
           const next = updater(prev);
           const session = verifiedSessionRef.current;
           const isActiveSession =
@@ -1250,6 +1293,9 @@ export default function PdiUnifiedApp() {
           return next as typeof authMode;
         }),
       onAdminRevoked: () => {
+        if (authProviderRef.current === "supabase" && supabaseAuthUserRef.current) {
+          return;
+        }
         setActiveModule((prev) => {
           if (isRestrictedAdminView(prev)) {
             try {
@@ -1259,6 +1305,68 @@ export default function PdiUnifiedApp() {
           }
           return prev;
         });
+      },
+    });
+  }, []);
+
+  // MIG-04-AUTH-01 : Surveillance de session & renouvellement de token Supabase Auth (vérifié côté serveur)
+  useEffect(() => {
+    if (isStagingSandboxMode()) {
+      return () => {};
+    }
+
+    return attachSupabaseAuthMonitor({
+      onSessionVerified: (verified) => {
+        authProviderRef.current = "supabase";
+        setAuthProvider("supabase");
+        supabaseAuthUserRef.current = verified.authUser;
+        verifiedSessionRef.current = verified.sessionResolution;
+        setVerifiedSession(verified.sessionResolution);
+        authReadyRef.current = true;
+        setAuthReady(true);
+
+        const nextMode = verified.sessionResolution.authMode;
+        setAuthMode(nextMode);
+        setSavedUserProfile({
+          name: verified.profile.name,
+          email: verified.profile.email,
+          role: nextMode,
+          company: verified.profile.company || "Orthogonal PD&I",
+          country: verified.profile.country || "—",
+          plan: verified.profile.accountType.toUpperCase(),
+          emailStatus: verified.emailConfirmed ? "vérifié (Supabase)" : "non confirmé",
+          createdAt: verified.profile.createdAt,
+        });
+        setActiveModule((prev) =>
+          getAuthorizedView(prev, verified.isSuperAdmin, "isometric") as PdiModule
+        );
+      },
+      onSessionRevokedOrSignedOut: (reason) => {
+        if (authProviderRef.current !== "supabase" && !supabaseAuthUserRef.current) {
+          return;
+        }
+        supabaseAuthUserRef.current = null;
+        authProviderRef.current = null;
+        setAuthProvider(null);
+        verifiedSessionRef.current = null;
+        setVerifiedSession(null);
+        authReadyRef.current = true;
+        setAuthReady(true);
+        purgeLocalAuthCaches();
+        setAuthMode("guest");
+        setAuthPageTab("login");
+        setActiveModule("home");
+
+        if (stageRef.current === "app") {
+          setStage("auth");
+          try {
+            window.sessionStorage.removeItem(resolveScopedStorageKey(PDI_STAGE_KEY));
+            window.location.hash = "auth";
+          } catch {}
+          if (reason.event === "SERVER_DENIED" && reason.message) {
+            void pdiAlert(reason.message);
+          }
+        }
       },
     });
   }, []);
@@ -1319,7 +1427,12 @@ export default function PdiUnifiedApp() {
           detail: { activeModule },
         })
       );
-      if (!isStagingSandboxMode() && activeModule && (authMode === "client" || authMode === "super_admin")) {
+      if (
+        !isStagingSandboxMode() &&
+        authProviderRef.current !== "supabase" &&
+        activeModule &&
+        (authMode === "client" || authMode === "super_admin")
+      ) {
         void recordSubscriberUsage({
           userId: pdiUserProfile.email,
           userEmail: pdiUserProfile.email,
@@ -1342,7 +1455,26 @@ export default function PdiUnifiedApp() {
   };
   const moduleTitle = useMemo(() => navItems.find((x) => x.id === activeModule)?.title || "PD&I", [activeModule]);
 
-  const handleAuthSuccess = React.useCallback((profile: PdiUserProfile, isSuper: boolean) => {
+  const handleAuthSuccess = React.useCallback((
+    profile: PdiUserProfile,
+    isSuper: boolean,
+    meta?: { provider: "firebase" | "supabase"; emailVerified: boolean; authUser?: SupabaseClientAuthUser }
+  ) => {
+    if (meta?.provider === "supabase") {
+      authProviderRef.current = "supabase";
+      setAuthProvider("supabase");
+      supabaseAuthUserRef.current = meta.authUser ?? {
+        uid: profile.uid,
+        email: profile.email,
+        emailVerified: meta.emailVerified === true,
+        provider: "supabase",
+      };
+    } else if (!isStagingSandboxMode()) {
+      authProviderRef.current = "firebase";
+      setAuthProvider("firebase");
+      supabaseAuthUserRef.current = null;
+    }
+
     const currentAuth = getEffectiveAuthUser();
     if (!profile || profile.status !== "active" || !currentAuth || currentAuth.uid !== profile.uid) {
       setAuthMode("guest");
@@ -1351,7 +1483,7 @@ export default function PdiUnifiedApp() {
       return;
     }
 
-    // Règle SEC-01-FIX-03 : L'autorité Super Admin vient UNIQUEMENT du claim vérifié (isSuper) + emailVerified
+    // Règle SEC-01-FIX-03 & MIG-04-AUTH-01 : L'autorité Super Admin vient UNIQUEMENT de la vérification serveur + emailVerified
     const verifiedSuper = isSuper === true && currentAuth.emailVerified === true;
     const role: "super_admin" | "client" = verifiedSuper ? "super_admin" : "client";
     const resolvedSession: WorkspaceSessionResolution = {
@@ -1367,7 +1499,16 @@ export default function PdiUnifiedApp() {
     setVerifiedSession(resolvedSession);
     authReadyRef.current = true;
     setAuthReady(true);
-    setSavedUserProfile({ ...profile, role });
+    setSavedUserProfile({
+      name: profile.name,
+      email: profile.email,
+      role,
+      company: profile.company || "Orthogonal PD&I",
+      country: profile.country || "—",
+      plan: profile.accountType.toUpperCase(),
+      emailStatus: currentAuth.emailVerified ? (meta?.provider === "supabase" ? "vérifié (Supabase)" : "vérifié") : "non confirmé",
+      createdAt: profile.createdAt,
+    });
     try {
       window.localStorage.setItem(resolveScopedStorageKey("pdi.user.profile.v1"), JSON.stringify({ ...profile, role }));
     } catch {}
@@ -2297,7 +2438,14 @@ export default function PdiUnifiedApp() {
         {activeModule === "super_admin_console" && (
           authMode === "super_admin" ? (
             <div style={{ minHeight: "calc(100vh - 128px)" }}>
-              <PdiSuperAdminConsole />
+              {authProvider === "supabase" ? (
+                <PdiSupabaseSuperAdminPanel
+                  currentUserEmail={pdiUserProfile.email}
+                  onSwitchModule={(mod) => tryEnterWorkspace(mod)}
+                />
+              ) : (
+                <PdiSuperAdminConsole />
+              )}
             </div>
           ) : (
             <ComingSoonPanel title="Accès non autorisé">

@@ -5,6 +5,7 @@
  */
 
 import { auth } from './firebase.ts';
+import { getSupabaseAccessToken } from './supabaseAuth.ts';
 
 export class ApiError extends Error {
   status: number;
@@ -18,18 +19,21 @@ export class ApiError extends Error {
 }
 
 /**
- * Retrieves the current user's Firebase ID token.
+ * Retrieves the current user's active Bearer token (Firebase ID token or Supabase JWT).
  * Forces token refresh if requested or expired.
  */
 export async function getAuthToken(forceRefresh = false): Promise<string | null> {
   const currentUser = auth.currentUser;
-  if (!currentUser) return null;
-  try {
-    return await currentUser.getIdToken(forceRefresh);
-  } catch (err) {
-    console.error('Failed to retrieve Firebase ID token:', err);
-    return null;
+  if (currentUser) {
+    try {
+      return await currentUser.getIdToken(forceRefresh);
+    } catch (err) {
+      console.error('Failed to retrieve Firebase ID token:', err);
+      return null;
+    }
   }
+
+  return getSupabaseAccessToken(forceRefresh);
 }
 
 /**

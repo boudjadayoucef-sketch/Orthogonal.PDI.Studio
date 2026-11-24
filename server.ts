@@ -58,11 +58,20 @@ import {
   saveDriveFileRecord 
 } from "./src/db/projects.ts";
 import { getOrCreateUser } from "./src/db/users.ts";
+import {
+  createRequireSupabaseAuth,
+  requireSupabaseSuperAdmin,
+  resolveSupabaseServerAuthGateway,
+  verifySupabaseSessionFromBearerToken,
+  type SupabaseAuthRequest,
+  type SupabaseServerAuthGateway,
+} from "./src/server/supabaseAuth.ts";
 
 export interface PdiServerDependencies {
   requireAuthMiddleware?: express.RequestHandler;
   getAdminAuth?: typeof getServerAdminAuth;
   getAdminDb?: typeof getServerAdminDb;
+  supabaseAuthGateway?: SupabaseServerAuthGateway;
   getUserProjects?: typeof getUserProjects;
   createOrUpdateProject?: typeof createOrUpdateProject;
   deleteUserProject?: typeof deleteUserProject;
@@ -205,13 +214,89 @@ export function createPdiExpressApp(options: CreatePdiExpressAppOptions = {}): e
   const sandboxGuard = createRejectInStagingSandboxMode(runtimeEnv);
   const resolveAdminAuth = deps.getAdminAuth ?? getServerAdminAuth;
   const resolveAdminDb = deps.getAdminDb ?? getServerAdminDb;
+
+  let cachedSupabaseGateway: ReturnType<typeof resolveSupabaseServerAuthGateway> = null;
+  const getSupabaseGateway = () => {
+    if (!cachedSupabaseGateway) {
+      cachedSupabaseGateway = resolveSupabaseServerAuthGateway(
+        runtimeEnv,
+        deps.supabaseAuthGateway
+      );
+    }
+    return cachedSupabaseGateway;
+  };
+
+  const supabaseAuthMiddleware = createRequireSupabaseAuth(runtimeEnv, {
+    gateway: deps.supabaseAuthGateway,
+  });
+
   const authMiddleware =
     deps.requireAuthMiddleware ??
-    createRequireAuth(runtimeEnv, { getAdminAuth: resolveAdminAuth });
+    createRequireAuth(runtimeEnv, {
+      getAdminAuth: resolveAdminAuth,
+      expectedSupabaseUrl: runtimeEnv.SUPABASE_URL || runtimeEnv.VITE_SUPABASE_URL,
+      verifySupabaseToken: async (token) => {
+        const resolved = getSupabaseGateway();
+        if (!resolved) {
+          return null;
+        }
+        return verifySupabaseSessionFromBearerToken(token, {
+          gateway: resolved.gateway,
+          expectedSupabaseUrl: resolved.expectedSupabaseUrl,
+        });
+      },
+    });
   const fetchProjects = deps.getUserProjects ?? getUserProjects;
   const upsertProject = deps.createOrUpdateProject ?? createOrUpdateProject;
   const removeProject = deps.deleteUserProject ?? deleteUserProject;
   const syncUser = deps.getOrCreateUser ?? getOrCreateUser;
+
+  // =========================================================================
+  // MIG-04-AUTH-01 : Routes sécurisées Supabase Auth & Console Super Admin
+  // =========================================================================
+  app.get(
+    "/api/auth/supabase/session",
+    sandboxGuard,
+    supabaseAuthMiddleware,
+    (req: SupabaseAuthRequest, res) => {
+      res.setHeader("Cache-Control", "no-store");
+      return res.json({
+        ok: true,
+        session: req.supabaseSession,
+      });
+    }
+  );
+
+  app.get(
+    "/api/admin/supabase/overview",
+    sandboxGuard,
+    supabaseAuthMiddleware,
+    requireSupabaseSuperAdmin,
+    async (req: SupabaseAuthRequest, res) => {
+      res.setHeader("Cache-Control", "no-store");
+      try {
+        const session = req.supabaseSession;
+        const resolved = getSupabaseGateway();
+        if (!session || !resolved || !resolved.gateway.getSuperAdminOverview) {
+          return res.status(503).json({
+            error: "Service Unavailable: Supabase Super Admin overview gateway is not configured.",
+            code: "server/supabase-auth-unconfigured",
+          });
+        }
+        const overview = await resolved.gateway.getSuperAdminOverview(session);
+        return res.json({
+          ok: true,
+          overview,
+        });
+      } catch (err: any) {
+        console.error("Error loading Supabase Super Admin overview:", err?.message || "unknown");
+        return res.status(500).json({
+          error: "Internal server error while loading Supabase Super Admin overview.",
+          code: "server/supabase-admin-overview-failed",
+        });
+      }
+    }
+  );
 
   // Cloud SQL User Sync & Projects Endpoints (Protected by C2 sandboxGuard bound to runtimeEnv)
   app.post("/api/auth/sync-user", sandboxGuard, authMiddleware, async (req: AuthRequest, res) => {
@@ -236,6 +321,12 @@ export function createPdiExpressApp(options: CreatePdiExpressAppOptions = {}): e
   // Admin: Assign Custom Claims (Role) securely via Firebase Admin SDK (Section A3 & Protection C2)
   app.post("/api/admin/set-user-role", sandboxGuard, authMiddleware, requireSuperAdmin, requireEmailVerified, async (req: AuthRequest, res) => {
     try {
+      if (req.supabaseSession) {
+        return res.status(403).json({
+          error: "Cette route concerne uniquement les Custom Claims Firebase hérités.",
+          code: "auth/firebase-only-route",
+        });
+      }
       const { targetUid, role } = req.body;
       if (!targetUid || typeof targetUid !== "string" || targetUid.trim().length === 0 || targetUid.length > 128) {
         return res.status(400).json({ error: "Paramètre targetUid valide requis." });

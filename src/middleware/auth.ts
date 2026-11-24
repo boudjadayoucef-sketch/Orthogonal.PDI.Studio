@@ -6,9 +6,15 @@ import {
   isSyntheticSandboxToken,
   isSyntheticSandboxUid,
 } from '../lib/stagingSandbox.ts';
+import {
+  isLikelySupabaseAccessToken,
+  type SupabaseSessionVerificationResult,
+  type SupabaseVerifiedSession,
+} from '../server/supabaseAuth.ts';
 
 export interface AuthRequest extends Request {
   user?: DecodedIdToken;
+  supabaseSession?: SupabaseVerifiedSession;
 }
 
 /**
@@ -57,6 +63,8 @@ export const rejectInStagingSandboxMode = createRejectInStagingSandboxMode();
 
 export interface CreateRequireAuthOptions {
   getAdminAuth?: typeof getServerAdminAuth;
+  verifySupabaseToken?: (token: string) => Promise<SupabaseSessionVerificationResult | null>;
+  expectedSupabaseUrl?: string;
 }
 
 export function createRequireAuth(
@@ -98,12 +106,46 @@ export function createRequireAuth(
       });
     }
 
-    // STAGING-00-B3-R1 (Partie B): In Sandbox mode, Firebase Admin authentication is disabled on the server
+    // STAGING-00-B3-R1 (Partie B): In Sandbox mode, server authentication is disabled
     if (isStagingSandboxMode(effectiveEnv)) {
       return res.status(403).json({
         error: 'Forbidden: Firebase Admin authentication is disabled in Sandbox mode.',
         code: 'sandbox/server-auth-disabled',
       });
+    }
+
+    // MIG-04-AUTH-01: Vérification autoritative des JWT Supabase lorsque le token est émis par Supabase Auth
+    if (
+      options.verifySupabaseToken &&
+      isLikelySupabaseAccessToken(token, options.expectedSupabaseUrl)
+    ) {
+      const supabaseResult = await options.verifySupabaseToken(token);
+      if (!supabaseResult) {
+        return res.status(503).json({
+          error: 'Service Unavailable: Supabase server authentication is not configured.',
+          code: 'server/supabase-auth-unconfigured',
+        });
+      }
+      if ('code' in supabaseResult) {
+        return res.status(supabaseResult.httpStatus).json({
+          error: supabaseResult.error,
+          code: supabaseResult.code,
+          ...(supabaseResult.profileStatus ? { profileStatus: supabaseResult.profileStatus } : {}),
+        });
+      }
+
+      const session = supabaseResult.session;
+      req.supabaseSession = session;
+      req.user = {
+        uid: session.userId,
+        sub: session.userId,
+        email: session.email,
+        email_verified: session.emailConfirmed,
+        role: session.role,
+        name: session.profile.name,
+        auth_provider: 'supabase',
+      } as unknown as DecodedIdToken;
+      return next();
     }
 
     try {
