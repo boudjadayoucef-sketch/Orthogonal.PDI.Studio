@@ -27,7 +27,7 @@ const SAMPLE_OVERVIEW: SupabaseAdminOverviewData = {
   generatedAt: "2026-11-24T10:15:00.000Z",
   verifiedSuperAdmin: {
     userId: "11111111-1111-4111-8111-111111111111",
-    email: "orthognaleng@gmail.com",
+    email: "orthogonaleng@gmail.com",
     emailConfirmedAt: "2026-11-20T08:00:00.000Z",
   },
   counts: {
@@ -41,7 +41,7 @@ const SAMPLE_OVERVIEW: SupabaseAdminOverviewData = {
   profiles: [
     {
       id: "11111111-1111-4111-8111-111111111111",
-      email: "orthognaleng@gmail.com",
+      email: "orthogonaleng@gmail.com",
       name: "Orthogonal Super Admin",
       role: "super_admin",
       status: "active",
@@ -105,7 +105,7 @@ describe("MIG-04-AUTH-01-FIX-01 — PdiSupabaseSuperAdminPanel", () => {
   it("1. affiche l'état de chargement initial sans aucune donnée administrative fictive", () => {
     const html = renderToStaticMarkup(
       React.createElement(PdiSupabaseSuperAdminPanel, {
-        currentUserEmail: "orthognaleng@gmail.com",
+        currentUserEmail: "orthogonaleng@gmail.com",
         onSwitchModule: vi.fn(),
         fetchOverview: () => new Promise<SupabaseAdminOverviewData>(() => {}),
       })
@@ -150,7 +150,7 @@ describe("MIG-04-AUTH-01-FIX-01 — PdiSupabaseSuperAdminPanel", () => {
     const html = renderToStaticMarkup(
       React.createElement(PdiSupabaseSuperAdminPanelView, {
         state,
-        currentUserEmail: "orthognaleng@gmail.com",
+        currentUserEmail: "orthogonaleng@gmail.com",
         onRefresh: vi.fn(),
         onSwitchModule: vi.fn(),
       })
@@ -158,7 +158,7 @@ describe("MIG-04-AUTH-01-FIX-01 — PdiSupabaseSuperAdminPanel", () => {
 
     // Identité du Super Admin vérifié
     expect(html).toContain('data-testid="supabase-admin-identity"');
-    expect(html).toContain("orthognaleng@gmail.com");
+    expect(html).toContain("orthogonaleng@gmail.com");
     expect(html).toContain("11111111-1111-4111-8111-111111111111");
 
     // Compteurs réels : profils, profils actifs, Super Admin, projets, clés de licence, journaux d'audit
@@ -208,7 +208,7 @@ describe("MIG-04-AUTH-01-FIX-01 — PdiSupabaseSuperAdminPanel", () => {
     const html = renderToStaticMarkup(
       React.createElement(PdiSupabaseSuperAdminPanelView, {
         state,
-        currentUserEmail: "orthognaleng@gmail.com",
+        currentUserEmail: "orthogonaleng@gmail.com",
         onRefresh: vi.fn(),
         onSwitchModule: vi.fn(),
       })
@@ -222,7 +222,7 @@ describe("MIG-04-AUTH-01-FIX-01 — PdiSupabaseSuperAdminPanel", () => {
     expect(html).not.toContain('data-testid="supabase-admin-profiles"');
     expect(html).not.toContain('data-testid="supabase-admin-audit-logs"');
     expect(html).not.toContain('data-testid="supabase-admin-identity"');
-    expect(html).not.toContain("orthognaleng@gmail.com");
+    expect(html).not.toContain("orthogonaleng@gmail.com");
   });
 
   it("4. gère un refus HTTP 401 (session expirée / non authentifiée) en mode fail-closed", async () => {
@@ -254,7 +254,7 @@ describe("MIG-04-AUTH-01-FIX-01 — PdiSupabaseSuperAdminPanel", () => {
     const html = renderToStaticMarkup(
       React.createElement(PdiSupabaseSuperAdminPanelView, {
         state,
-        currentUserEmail: "orthognaleng@gmail.com",
+        currentUserEmail: "orthogonaleng@gmail.com",
         onRefresh: vi.fn(),
       })
     );
@@ -371,7 +371,7 @@ describe("MIG-04-AUTH-01-FIX-01 — PdiSupabaseSuperAdminPanel", () => {
     // Vérification TypeScript + exécution du contrat de propriétés attendu par PdiUnifiedApp.tsx
     const onSwitchModule = vi.fn();
     const compatibleProps: PdiSupabaseSuperAdminPanelProps = {
-      currentUserEmail: "orthognaleng@gmail.com",
+      currentUserEmail: "orthogonaleng@gmail.com",
       onSwitchModule: (mod: string) => onSwitchModule(mod),
     };
 

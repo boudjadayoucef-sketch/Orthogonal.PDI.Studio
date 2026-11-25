@@ -511,6 +511,24 @@ export async function sendSupabasePasswordResetEmail(
   email: string,
   deps: SupabaseAuthDependencies = {}
 ): Promise<void> {
+  const inSandbox = deps.isSandbox ? deps.isSandbox() : isStagingSandboxMode();
+  if (inSandbox) {
+    throw new PdiSupabaseAuthError(
+      "La réinitialisation du mot de passe Supabase est désactivée en mode Sandbox.",
+      "sandbox/server-auth-disabled",
+      403
+    );
+  }
+
+  const configured = deps.isConfigured ? deps.isConfigured() : isSupabaseBrowserConfigured();
+  if (!configured) {
+    throw new PdiSupabaseAuthError(
+      "Supabase Auth n'est pas configuré dans cet environnement navigateur. Réinitialisation impossible sans bascule Firebase.",
+      "client/supabase-unconfigured",
+      503
+    );
+  }
+
   const cleanedEmail = (email ?? "").trim();
   if (!cleanedEmail) {
     throw new PdiSupabaseAuthError(
@@ -540,6 +558,24 @@ export async function updateSupabaseUserPassword(
   newPassword: string,
   deps: SupabaseAuthDependencies = {}
 ): Promise<void> {
+  const inSandbox = deps.isSandbox ? deps.isSandbox() : isStagingSandboxMode();
+  if (inSandbox) {
+    throw new PdiSupabaseAuthError(
+      "Le changement de mot de passe Supabase est désactivé en mode Sandbox.",
+      "sandbox/server-auth-disabled",
+      403
+    );
+  }
+
+  const configured = deps.isConfigured ? deps.isConfigured() : isSupabaseBrowserConfigured();
+  if (!configured) {
+    throw new PdiSupabaseAuthError(
+      "Supabase Auth n'est pas configuré dans cet environnement navigateur.",
+      "client/supabase-unconfigured",
+      503
+    );
+  }
+
   const client = deps.getClient ? deps.getClient() : getSupabaseBrowserClient();
   const reauth = await client.auth.signInWithPassword({
     email: email.trim(),
@@ -647,6 +683,7 @@ export function attachSupabaseAuthMonitor(options: AttachSupabaseAuthMonitorOpti
 
   const configured = deps.isConfigured ? deps.isConfigured() : isSupabaseBrowserConfigured();
   if (!configured) {
+    options.onNoInitialSession?.();
     return () => {};
   }
 

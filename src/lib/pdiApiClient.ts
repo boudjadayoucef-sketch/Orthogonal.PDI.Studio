@@ -19,21 +19,26 @@ export class ApiError extends Error {
 }
 
 /**
- * Retrieves the current user's active Bearer token (Firebase ID token or Supabase JWT).
+ * Retrieves the current user's active Bearer token (Supabase JWT prioritized; legacy Firebase fallback only if no Supabase session).
  * Forces token refresh if requested or expired.
  */
 export async function getAuthToken(forceRefresh = false): Promise<string | null> {
+  const supabaseToken = await getSupabaseAccessToken(forceRefresh);
+  if (supabaseToken) {
+    return supabaseToken;
+  }
+
   const currentUser = auth.currentUser;
   if (currentUser) {
     try {
       return await currentUser.getIdToken(forceRefresh);
     } catch (err) {
-      console.error('Failed to retrieve Firebase ID token:', err);
+      console.error('Failed to retrieve legacy Firebase ID token:', err);
       return null;
     }
   }
 
-  return getSupabaseAccessToken(forceRefresh);
+  return null;
 }
 
 /**

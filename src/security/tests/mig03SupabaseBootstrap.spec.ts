@@ -5,7 +5,7 @@
  * ============================================================================
  *
  * Couvre les 10 exigences obligatoires de MIG-03-BOOTSTRAP-01 :
- *  1. Seul `orthognaleng@gmail.com` est accepté.
+ *  1. Seul `orthogonaleng@gmail.com` est accepté.
  *  2. Tout autre email est rejeté (`UNAUTHORIZED_EMAIL`).
  *  3. La réexécution ne crée pas de doublon, préserve le profil existant et bloque un 2e super_admin.
  *  4. Aucune requête navigateur ne peut attribuer `super_admin` (couche TS + RLS PostgreSQL réelle).
@@ -441,17 +441,17 @@ describe("MIG-03-BOOTSTRAP-01 — Création sécurisée du premier super adminis
     });
   });
 
-  describe("1 & 2. Restriction exclusive à orthognaleng@gmail.com et rejet de tout autre email", () => {
+  describe("1 & 2. Restriction exclusive à orthogonaleng@gmail.com et rejet de tout autre email", () => {
     beforeAll(async () => {
       await resetTestDb(sharedDb);
     });
 
-    it("1. accepte uniquement orthognaleng@gmail.com (insensible à la casse/espaces)", async () => {
+    it("1. accepte uniquement orthogonaleng@gmail.com (insensible à la casse/espaces)", async () => {
       const gateway = createPGliteBootstrapGateway(sharedDb);
       const dryRunResult = await bootstrapSupabaseSuperAdmin({
         gateway,
         env: ENABLED_ENV,
-        targetEmail: "  ORTHOGNALENG@GMAIL.COM  ",
+        targetEmail: "  ORTHOGONALENG@GMAIL.COM  ",
         dryRun: true,
         requestContext: { source: "server_cli" },
       });
@@ -466,9 +466,9 @@ describe("MIG-03-BOOTSTRAP-01 — Création sécurisée du premier super adminis
       const gateway = createPGliteBootstrapGateway(sharedDb);
       const unauthorizedEmails = [
         "admin@orthogonal-pdi.com",
-        "orthogonaleng@gmail.com", // orthographe proche mais différente
+        "orthognaleng@gmail.com", // ancienne faute de frappe désormais rejetée
         "attacker@gmail.com",
-        "orthognaleng@gmail.com.evil.test",
+        "orthogonaleng@gmail.com.evil.test",
         "",
       ];
 
@@ -814,7 +814,7 @@ describe("MIG-03-BOOTSTRAP-01 — Création sécurisée du premier super adminis
       );
     });
 
-    it("4b. en PostgreSQL réel (RLS + trigger), un utilisateur authentifié (même orthognaleng@gmail.com) ne peut PAS s'auto-attribuer super_admin", async () => {
+    it("4b. en PostgreSQL réel (RLS + trigger), un utilisateur authentifié (même orthogonaleng@gmail.com) ne peut PAS s'auto-attribuer super_admin", async () => {
       await resetTestDb(sharedDb);
       const uid = crypto.randomUUID();
       await sharedDb.query(

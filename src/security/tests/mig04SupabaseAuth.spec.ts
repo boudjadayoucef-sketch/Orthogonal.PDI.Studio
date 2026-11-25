@@ -341,7 +341,7 @@ describe("MIG-04-AUTH-01 — Intégration Supabase Auth & autorisation serveur",
   };
 
   describe("1. Validation JWT serveur & autorisation autoritative depuis public.profiles", () => {
-    it("valide un JWT Super Admin confirmé (orthognaleng@gmail.com) et accorde isSuperAdmin=true depuis public.profiles", async () => {
+    it("valide un JWT Super Admin confirmé (orthogonaleng@gmail.com) et accorde isSuperAdmin=true depuis public.profiles", async () => {
       const token = makeValidJwtFor(SUPER_ADMIN_ID, AUTHORIZED_SUPABASE_SUPER_ADMIN_EMAIL);
       expect(isLikelySupabaseAccessToken(token, TEST_SUPABASE_URL)).toBe(true);
 
@@ -531,7 +531,7 @@ describe("MIG-04-AUTH-01 — Intégration Supabase Auth & autorisation serveur",
       }
     });
 
-    it("GET /api/auth/supabase/session retourne 200 avec le profil serveur pour orthognaleng@gmail.com et 401 sans token", async () => {
+    it("GET /api/auth/supabase/session retourne 200 avec le profil serveur pour orthogonaleng@gmail.com et 401 sans token", async () => {
       const unauth = await fetch(`${baseUrl}/api/auth/supabase/session`);
       expect(unauth.status).toBe(401);
 

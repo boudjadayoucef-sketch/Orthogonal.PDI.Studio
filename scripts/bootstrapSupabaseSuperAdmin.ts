@@ -5,7 +5,7 @@
  * Script serveur CLI : création sécurisée du premier super_admin Supabase
  * ============================================================================
  *
- * Compte unique autorisé : orthognaleng@gmail.com
+ * Compte unique autorisé : orthogonaleng@gmail.com
  *
  * Usage :
  *   # 1. Simulation sans écriture (défaut) :

@@ -80,17 +80,10 @@ import { pdiConfirm } from "../ui/PdiConfirm";
 import { pdiAlert } from "../ui/PdiNotice";
 // PATCH 017K2
 import { PdiCompanyPanel } from "../ui/PdiCompanyPanel";
-import { PdiSuperAdminConsole } from "../superadmin/PdiSuperAdminConsole";
 import { PdiSupabaseSuperAdminPanel } from "../superadmin/PdiSupabaseSuperAdminPanel";
 import { PdiFeedbackModal } from "../feedback/PdiFeedbackModal";
 import { PdiNewProjectModal } from "../modals/PdiNewProjectModal";
-import { onIdTokenChanged } from "firebase/auth";
 import {
-  recordSubscriberUsage,
-  changeUserProfilePassword,
-  auth,
-  logoutFirebase,
-  resolveAuthoritativeWorkspaceSession,
   purgeLocalAuthCaches,
   type WorkspaceSessionResolution,
   type PdiUserProfile
@@ -101,7 +94,7 @@ import {
   updateSupabaseUserPassword,
   type SupabaseClientAuthUser,
 } from "../../lib/supabaseAuth";
-import { attachSuperAdminTokenMonitor, isRestrictedAdminView, getAuthorizedView } from "../../security/clientAuthorization";
+import { isRestrictedAdminView, getAuthorizedView } from "../../security/clientAuthorization";
 import { projectsApi } from "../../lib/pdiApiClient";
 import {
   SANDBOX_BANNER_LINES,
@@ -685,16 +678,16 @@ export default function PdiUnifiedApp() {
     };
   });
   const verifiedSessionRef = React.useRef<WorkspaceSessionResolution | null>(verifiedSession);
-  const [authProvider, setAuthProvider] = useState<"firebase" | "supabase" | "sandbox" | null>(() =>
+  const [authProvider, setAuthProvider] = useState<"supabase" | "sandbox" | null>(() =>
     sandboxActive ? "sandbox" : null
   );
-  const authProviderRef = React.useRef<"firebase" | "supabase" | "sandbox" | null>(
+  const authProviderRef = React.useRef<"supabase" | "sandbox" | null>(
     sandboxActive ? "sandbox" : null
   );
   const supabaseAuthUserRef = React.useRef<SupabaseClientAuthUser | null>(null);
 
-  // BLOC C1 : Ne jamais accorder un mode actif ("client", "demo", "admin", "super_admin") depuis localStorage
-  // avant que Firebase Auth et le profil Firestore n'aient été vérifiés (hors Sandbox locale isolée C1/C3).
+  // BLOC C1 & MIG-04-AUTH-01-FIX-02 : Ne jamais accorder un mode actif ("client", "demo", "admin", "super_admin") depuis localStorage
+  // avant que Supabase Auth et le profil serveur public.profiles n'aient été vérifiés (hors Sandbox locale isolée C1/C3).
   const [authMode, setAuthMode] = useState<"guest" | "demo" | "pending_email" | "client" | "admin" | "super_admin">(() => {
     if (sandboxActive) {
       return "client";
@@ -799,12 +792,13 @@ export default function PdiUnifiedApp() {
 
     try {
       setIsSubmittingPasswordChange(true);
-      if (authProviderRef.current === "supabase") {
-        await updateSupabaseUserPassword(pdiUserProfile.email, oldPassword, newPassword);
-      } else {
-        await changeUserProfilePassword(pdiUserProfile.email, oldPassword, newPassword);
+      if (!supabaseAuthUserRef.current || authProviderRef.current !== "supabase") {
+        throw new Error(
+          "Session Supabase active requise pour modifier le mot de passe."
+        );
       }
-      setPasswordChangeSuccess("Votre mot de passe a été modifié avec succès !");
+      await updateSupabaseUserPassword(pdiUserProfile.email, oldPassword, newPassword);
+      setPasswordChangeSuccess("Votre mot de passe Supabase a été modifié avec succès !");
       setOldPassword("");
       setNewPassword("");
       setConfirmPassword("");
@@ -931,10 +925,7 @@ export default function PdiUnifiedApp() {
     if (isStagingSandboxMode()) {
       return getSandboxSyntheticAuthUser();
     }
-    if (authProviderRef.current === "supabase" && supabaseAuthUserRef.current) {
-      return supabaseAuthUserRef.current;
-    }
-    return auth.currentUser;
+    return supabaseAuthUserRef.current;
   }, []);
 
   // BLOC C1 : Fonction centrale unique d'entrée et de navigation dans le workspace
@@ -1072,9 +1063,10 @@ export default function PdiUnifiedApp() {
         if (hash === "#landing" || hash === "#commercial") {
           setStage("landing");
         } else if (hash === "#auth" || hash === "#login" || hash === "#connexion") {
+          const effectiveUser = getEffectiveAuthUser();
           const isPending =
             verifiedSessionRef.current?.status === "pending_activation" &&
-            verifiedSessionRef.current?.profile?.uid === auth.currentUser?.uid;
+            verifiedSessionRef.current?.profile?.uid === effectiveUser?.uid;
           setAuthPageTab(isPending ? "activation" : "login");
           setStage("auth");
         } else if (hash === "#app") {
@@ -1084,7 +1076,7 @@ export default function PdiUnifiedApp() {
     };
     window.addEventListener("hashchange", handleHashChange);
     return () => window.removeEventListener("hashchange", handleHashChange);
-  }, [tryEnterWorkspace]);
+  }, [getEffectiveAuthUser, tryEnterWorkspace]);
 
   const enterApp = React.useCallback((target?: string) => {
     if (tryEnterWorkspace(target)) {
@@ -1092,9 +1084,8 @@ export default function PdiUnifiedApp() {
     }
   }, [tryEnterWorkspace]);
 
-  // BLOC A4 & MIG-04-AUTH-01 : Déconnexion complète (Supabase + Firebase) verrouillant immédiatement le workspace
+  // BLOC A4 & MIG-04-AUTH-01-FIX-02 : Déconnexion exclusive Supabase Auth verrouillant immédiatement le workspace
   const handleLogoutToHome = React.useCallback(async () => {
-    const previousProvider = authProviderRef.current;
     verifiedSessionRef.current = null;
     supabaseAuthUserRef.current = null;
     authProviderRef.current = null;
@@ -1113,18 +1104,6 @@ export default function PdiUnifiedApp() {
     } catch (err: any) {
       console.error("Erreur lors de la déconnexion Supabase :", err?.message || err);
     }
-
-    if (previousProvider === "firebase" || auth.currentUser) {
-      try {
-        await logoutFirebase();
-      } catch (err: any) {
-        console.error("Erreur lors de la déconnexion Firebase :", err);
-        void pdiAlert(
-          err?.message ||
-            "La déconnexion Firebase a rencontré une erreur. L'accès à l'espace de travail a été verrouillé localement."
-        );
-      }
-    }
   }, []);
 
   useEffect(() => {
@@ -1136,9 +1115,10 @@ export default function PdiUnifiedApp() {
         return;
       }
       if (detail === "auth" || detail === "login") {
+        const effectiveUser = getEffectiveAuthUser();
         const isPending =
           verifiedSessionRef.current?.status === "pending_activation" &&
-          verifiedSessionRef.current?.profile?.uid === auth.currentUser?.uid;
+          verifiedSessionRef.current?.profile?.uid === effectiveUser?.uid;
         setAuthPageTab(isPending ? "activation" : "login");
         setStage("auth");
         try { window.location.hash = "auth"; } catch {}
@@ -1152,10 +1132,10 @@ export default function PdiUnifiedApp() {
     };
     window.addEventListener("pdi:navigate", onNavigate as EventListener);
     return () => window.removeEventListener("pdi:navigate", onNavigate as EventListener);
-  }, [handleLogoutToHome, tryEnterWorkspace]);
+  }, [getEffectiveAuthUser, handleLogoutToHome, tryEnterWorkspace]);
 
-  // BLOC C1 / C2 & SEC-01-FIX-03-R2 & Protection C1 (STAGING-00-B3) :
-  // En mode Sandbox, ne jamais appeler onIdTokenChanged(auth) ni contacter Firebase Production.
+  // MIG-04-AUTH-01-FIX-02 : Surveillance exclusive de session Supabase Auth (aucun listener Firebase Auth)
+  // En mode Sandbox (STAGING-00-B3), initialise uniquement la session synthétique locale isolée.
   useEffect(() => {
     if (isStagingSandboxMode()) {
       seedSandboxDefaultProjectIfEmpty();
@@ -1186,134 +1166,30 @@ export default function PdiUnifiedApp() {
       return () => {};
     }
 
-    let resolutionSeq = 0;
+    const clearToGuestUnauthenticated = (alertMessage?: string) => {
+      supabaseAuthUserRef.current = null;
+      authProviderRef.current = null;
+      setAuthProvider(null);
+      verifiedSessionRef.current = null;
+      setVerifiedSession(null);
+      authReadyRef.current = true;
+      setAuthReady(true);
+      purgeLocalAuthCaches();
+      setAuthMode("guest");
+      setAuthPageTab("login");
+      setActiveModule("home");
 
-    return attachSuperAdminTokenMonitor({
-      auth,
-      subscribeIdTokenChanged: (monitorCallback) =>
-        onIdTokenChanged(auth, (fbUser) => {
-          const seq = ++resolutionSeq;
-
-          if (!fbUser) {
-            if (authProviderRef.current === "supabase" && supabaseAuthUserRef.current) {
-              // Session Supabase active : ne pas écraser l'état Supabase quand Firebase n'est pas connecté
-              monitorCallback(null);
-              return;
-            }
-            verifiedSessionRef.current = null;
-            setVerifiedSession(null);
-            authReadyRef.current = true;
-            setAuthReady(true);
-            monitorCallback(null);
-            if (stageRef.current === "app") {
-              setAuthPageTab("login");
-              setStage("auth");
-              setActiveModule("home");
-              try {
-                window.sessionStorage.removeItem(resolveScopedStorageKey(PDI_STAGE_KEY));
-                window.location.hash = "auth";
-              } catch {}
-            }
-            return;
-          }
-
-          // Si changement de compte ou chargement initial, verrouiller authReady jusqu'à vérification complète du profil
-          if (verifiedSessionRef.current?.profile?.uid !== fbUser.uid) {
-            verifiedSessionRef.current = null;
-            setVerifiedSession(null);
-            authReadyRef.current = false;
-            setAuthReady(false);
-          }
-
-          monitorCallback(fbUser);
-
-          void resolveAuthoritativeWorkspaceSession(fbUser, { forceRefreshToken: false }).then((res) => {
-            if (seq !== resolutionSeq) return;
-            if (auth.currentUser && auth.currentUser.uid !== fbUser.uid) return;
-
-            authProviderRef.current = "firebase";
-            setAuthProvider("firebase");
-            verifiedSessionRef.current = res;
-            setVerifiedSession(res);
-            authReadyRef.current = true;
-            setAuthReady(true);
-
-            if (res.status === "active" && res.canAccessWorkspace && res.profile) {
-              setAuthMode(res.authMode);
-              setSavedUserProfile({ ...res.profile, role: res.authMode });
-              try {
-                window.localStorage.setItem(resolveScopedStorageKey(PDI_AUTH_KEY), res.authMode);
-                window.localStorage.setItem(resolveScopedStorageKey("pdi.user.profile.v1"), JSON.stringify({ ...res.profile, role: res.authMode }));
-              } catch {}
-              setActiveModule((prev) => getAuthorizedView(prev, res.isSuperAdmin, "isometric") as PdiModule);
-            } else if (res.status === "pending_activation") {
-              setAuthMode("pending_email");
-              setAuthPageTab("activation");
-              if (stageRef.current === "app") {
-                setStage("auth");
-                setActiveModule("home");
-                try {
-                  window.sessionStorage.removeItem(resolveScopedStorageKey(PDI_STAGE_KEY));
-                  window.location.hash = "auth";
-                } catch {}
-              }
-            } else {
-              setAuthMode("guest");
-              setAuthPageTab("login");
-              if (stageRef.current === "app") {
-                setStage("auth");
-                setActiveModule("home");
-                try {
-                  window.sessionStorage.removeItem(resolveScopedStorageKey(PDI_STAGE_KEY));
-                  window.location.hash = "auth";
-                } catch {}
-              }
-            }
-          });
-        }),
-      setAuthMode: (updater) =>
-        setAuthMode((prev) => {
-          if (authProviderRef.current === "supabase" && supabaseAuthUserRef.current) {
-            return prev;
-          }
-          const next = updater(prev);
-          const session = verifiedSessionRef.current;
-          const isActiveSession =
-            session?.status === "active" &&
-            session?.canAccessWorkspace === true &&
-            session?.profile?.uid === auth.currentUser?.uid &&
-            session?.profile?.status === "active";
-
-          if (next === "super_admin") {
-            return isActiveSession && session?.isSuperAdmin ? "super_admin" : isActiveSession ? "client" : "guest";
-          }
-          if (next === "client") {
-            return isActiveSession ? "client" : session?.status === "pending_activation" ? "pending_email" : "guest";
-          }
-          return next as typeof authMode;
-        }),
-      onAdminRevoked: () => {
-        if (authProviderRef.current === "supabase" && supabaseAuthUserRef.current) {
-          return;
+      if (stageRef.current === "app") {
+        setStage("auth");
+        try {
+          window.sessionStorage.removeItem(resolveScopedStorageKey(PDI_STAGE_KEY));
+          window.location.hash = "auth";
+        } catch {}
+        if (alertMessage) {
+          void pdiAlert(alertMessage);
         }
-        setActiveModule((prev) => {
-          if (isRestrictedAdminView(prev)) {
-            try {
-              window.localStorage.setItem(resolveScopedStorageKey("pdi.activeModule.v1"), "isometric");
-            } catch {}
-            return "isometric";
-          }
-          return prev;
-        });
-      },
-    });
-  }, []);
-
-  // MIG-04-AUTH-01 : Surveillance de session & renouvellement de token Supabase Auth (vérifié côté serveur)
-  useEffect(() => {
-    if (isStagingSandboxMode()) {
-      return () => {};
-    }
+      }
+    };
 
     return attachSupabaseAuthMonitor({
       onSessionVerified: (verified) => {
@@ -1341,32 +1217,13 @@ export default function PdiUnifiedApp() {
           getAuthorizedView(prev, verified.isSuperAdmin, "isometric") as PdiModule
         );
       },
+      onNoInitialSession: () => {
+        clearToGuestUnauthenticated();
+      },
       onSessionRevokedOrSignedOut: (reason) => {
-        if (authProviderRef.current !== "supabase" && !supabaseAuthUserRef.current) {
-          return;
-        }
-        supabaseAuthUserRef.current = null;
-        authProviderRef.current = null;
-        setAuthProvider(null);
-        verifiedSessionRef.current = null;
-        setVerifiedSession(null);
-        authReadyRef.current = true;
-        setAuthReady(true);
-        purgeLocalAuthCaches();
-        setAuthMode("guest");
-        setAuthPageTab("login");
-        setActiveModule("home");
-
-        if (stageRef.current === "app") {
-          setStage("auth");
-          try {
-            window.sessionStorage.removeItem(resolveScopedStorageKey(PDI_STAGE_KEY));
-            window.location.hash = "auth";
-          } catch {}
-          if (reason.event === "SERVER_DENIED" && reason.message) {
-            void pdiAlert(reason.message);
-          }
-        }
+        clearToGuestUnauthenticated(
+          reason.event === "SERVER_DENIED" ? reason.message : undefined
+        );
       },
     });
   }, []);
@@ -1427,19 +1284,6 @@ export default function PdiUnifiedApp() {
           detail: { activeModule },
         })
       );
-      if (
-        !isStagingSandboxMode() &&
-        authProviderRef.current !== "supabase" &&
-        activeModule &&
-        (authMode === "client" || authMode === "super_admin")
-      ) {
-        void recordSubscriberUsage({
-          userId: pdiUserProfile.email,
-          userEmail: pdiUserProfile.email,
-          module: activeModule,
-          action: "open_module",
-        });
-      }
     } catch {} 
   }, [activeModule, authMode, pdiUserProfile.email]);
   useEffect(() => { const tab = workspaceTabs.find(t=>t.id===activeTabId); if(tab && activeModule === "home") setActiveModule(tab.module); }, []);
@@ -1458,9 +1302,15 @@ export default function PdiUnifiedApp() {
   const handleAuthSuccess = React.useCallback((
     profile: PdiUserProfile,
     isSuper: boolean,
-    meta?: { provider: "firebase" | "supabase"; emailVerified: boolean; authUser?: SupabaseClientAuthUser }
+    meta?: { provider: "supabase"; emailVerified: boolean; authUser: SupabaseClientAuthUser }
   ) => {
-    if (meta?.provider === "supabase") {
+    if (!isStagingSandboxMode()) {
+      if (meta?.provider !== "supabase") {
+        setAuthMode("guest");
+        setAuthPageTab("login");
+        setStage("auth");
+        return;
+      }
       authProviderRef.current = "supabase";
       setAuthProvider("supabase");
       supabaseAuthUserRef.current = meta.authUser ?? {
@@ -1469,10 +1319,6 @@ export default function PdiUnifiedApp() {
         emailVerified: meta.emailVerified === true,
         provider: "supabase",
       };
-    } else if (!isStagingSandboxMode()) {
-      authProviderRef.current = "firebase";
-      setAuthProvider("firebase");
-      supabaseAuthUserRef.current = null;
     }
 
     const currentAuth = getEffectiveAuthUser();
@@ -2436,20 +2282,16 @@ export default function PdiUnifiedApp() {
         {activeModule === "subscription" && <ComingSoonPanel title="Abonnement"><p>Plan actuel : <b>{pdiUserProfile.plan}</b>. Les clés SaaS, paiements et renouvellements seront reliés au Super Admin dans les patchs 011 à 016.</p></ComingSoonPanel>}
 
         {activeModule === "super_admin_console" && (
-          authMode === "super_admin" ? (
+          authMode === "super_admin" && authProvider === "supabase" ? (
             <div style={{ minHeight: "calc(100vh - 128px)" }}>
-              {authProvider === "supabase" ? (
-                <PdiSupabaseSuperAdminPanel
-                  currentUserEmail={pdiUserProfile.email}
-                  onSwitchModule={(mod) => tryEnterWorkspace(mod)}
-                />
-              ) : (
-                <PdiSuperAdminConsole />
-              )}
+              <PdiSupabaseSuperAdminPanel
+                currentUserEmail={pdiUserProfile.email}
+                onSwitchModule={(mod) => tryEnterWorkspace(mod)}
+              />
             </div>
           ) : (
             <ComingSoonPanel title="Accès non autorisé">
-              <p>Cette console est strictement réservée au Super Administrateur authentifié.</p>
+              <p>Cette console est strictement réservée au Super Administrateur Supabase vérifié côté serveur.</p>
             </ComingSoonPanel>
           )
         )}

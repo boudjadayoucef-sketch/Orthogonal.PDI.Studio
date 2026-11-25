@@ -3,13 +3,9 @@ import PdiBrandMark from "../app/PdiBrandMark";
 import { PdiLoginLoadingOverlay } from "./PdiLoginLoadingOverlay";
 import {
   auth,
-  loginWithEmailAndPasswordSecure,
   registerWithEmailAndPasswordSecure,
-  loginWithGoogleSecure,
   activateAccountWithLicenseKey,
-  sendResetPasswordEmail,
   getCountryRestrictionsFromFirebase,
-  PdiAuthAccessError,
   PdiUserProfile
 } from "../../lib/firebase";
 import { PdiCountryConfig, PDI_DEFAULT_COUNTRIES } from "../data/pdiGeoData";
@@ -18,9 +14,20 @@ import { isSupabaseBrowserConfigured } from "../../lib/supabase";
 import {
   loginWithSupabaseEmailPassword,
   sendSupabasePasswordResetEmail,
+  PdiSupabaseAuthError,
   type SupabaseClientAuthUser,
+  type SupabaseVerifiedLoginResult,
 } from "../../lib/supabaseAuth";
 import { isStagingSandboxMode } from "../../lib/stagingSandbox";
+
+export const SUPABASE_UNCONFIGURED_LOGIN_ERROR =
+  "Authentification Supabase indisponible : la configuration Supabase navigateur (VITE_SUPABASE_URL et VITE_SUPABASE_PUBLISHABLE_KEY) est absente ou désactivée. Connexion bloquée (aucune bascule Firebase n'est autorisée).";
+
+export const SUPABASE_UNCONFIGURED_RESET_ERROR =
+  "Réinitialisation du mot de passe indisponible : la configuration Supabase navigateur est absente ou désactivée. Aucune bascule Firebase n'est autorisée.";
+
+export const SUPABASE_GOOGLE_OAUTH_DISABLED_NOTICE =
+  "Connexion Google (OAuth Supabase) non activée sur cet environnement. Utilisez la connexion email / mot de passe Supabase.";
 
 export function isCoherentAuthorizedLoginResult(
   res: { profile: PdiUserProfile; isSuperAdmin: boolean } | null | undefined,
@@ -31,6 +38,68 @@ export function isCoherentAuthorizedLoginResult(
   if (!currentAuthUser || currentAuthUser.uid !== res.profile.uid) return false;
   if (res.isSuperAdmin === true && currentAuthUser.emailVerified !== true) return false;
   return true;
+}
+
+/**
+ * Flux de connexion exclusif Supabase Auth (MIG-04-AUTH-01-FIX-02).
+ * Bloque explicitement si Supabase n'est pas configuré et n'effectue jamais de bascule Firebase.
+ */
+export async function executeSupabaseExclusiveLogin(
+  email: string,
+  password: string,
+  options: {
+    supabaseAvailable: boolean;
+    loginFn?: (email: string, password: string) => Promise<SupabaseVerifiedLoginResult>;
+  }
+): Promise<SupabaseVerifiedLoginResult> {
+  if (!options.supabaseAvailable) {
+    throw new PdiSupabaseAuthError(
+      SUPABASE_UNCONFIGURED_LOGIN_ERROR,
+      "client/supabase-unconfigured",
+      503
+    );
+  }
+  const loginImpl = options.loginFn ?? loginWithSupabaseEmailPassword;
+  const sbRes = await loginImpl(email, password);
+  if (!isCoherentAuthorizedLoginResult(sbRes, sbRes.authUser)) {
+    throw new PdiSupabaseAuthError(
+      "Incohérence de session Supabase détectée : le profil actif ou l'identité vérifiée par le serveur n'est pas valide.",
+      "auth/invalid-claims",
+      403,
+      "invalid_claims"
+    );
+  }
+  return sbRes;
+}
+
+/**
+ * Flux de récupération de mot de passe exclusif Supabase Auth (MIG-04-AUTH-01-FIX-02).
+ * Bloque explicitement si Supabase n'est pas configuré et n'effectue jamais de bascule Firebase.
+ */
+export async function executeSupabaseExclusivePasswordReset(
+  email: string,
+  options: {
+    supabaseAvailable: boolean;
+    resetFn?: (email: string) => Promise<void>;
+  }
+): Promise<void> {
+  if (!options.supabaseAvailable) {
+    throw new PdiSupabaseAuthError(
+      SUPABASE_UNCONFIGURED_RESET_ERROR,
+      "client/supabase-unconfigured",
+      503
+    );
+  }
+  const cleaned = (email ?? "").trim();
+  if (!cleaned) {
+    throw new PdiSupabaseAuthError(
+      "Veuillez saisir votre adresse email.",
+      "auth/missing-credentials",
+      400
+    );
+  }
+  const resetImpl = options.resetFn ?? sendSupabasePasswordResetEmail;
+  await resetImpl(cleaned);
 }
 
 export const PDI_OFFERS = [
@@ -124,29 +193,38 @@ export const PDI_OFFERS = [
 ];
 
 export type PdiAuthSuccessMeta = {
-  provider: "firebase" | "supabase";
+  provider: "supabase";
   emailVerified: boolean;
-  authUser?: SupabaseClientAuthUser;
+  authUser: SupabaseClientAuthUser;
 };
 
 export type PdiAuthPageProps = {
   onSuccess: (profile: PdiUserProfile, isSuperAdmin: boolean, meta?: PdiAuthSuccessMeta) => void;
   onBackToLanding: () => void;
   initialTab?: "login" | "register" | "activation";
+  /** Optionnel (tests) : remplace la détection de configuration Supabase navigateur */
+  supabaseConfiguredOverride?: boolean;
+  /** Optionnel (tests) : injecte le service de connexion Supabase */
+  loginWithSupabaseFn?: (email: string, password: string) => Promise<SupabaseVerifiedLoginResult>;
+  /** Optionnel (tests) : injecte le service de réinitialisation mot de passe Supabase */
+  resetPasswordWithSupabaseFn?: (email: string) => Promise<void>;
 };
 
 export default function PdiAuthPage({
   onSuccess,
   onBackToLanding,
-  initialTab = "login"
+  initialTab = "login",
+  supabaseConfiguredOverride,
+  loginWithSupabaseFn,
+  resetPasswordWithSupabaseFn,
 }: PdiAuthPageProps) {
   const [tab, setTab] = useState<"login" | "register" | "activation">(initialTab);
   const supabaseAvailable = useMemo(
-    () => !isStagingSandboxMode() && isSupabaseBrowserConfigured(),
-    []
-  );
-  const [loginProvider, setLoginProvider] = useState<"supabase" | "firebase">(() =>
-    supabaseAvailable ? "supabase" : "firebase"
+    () =>
+      typeof supabaseConfiguredOverride === "boolean"
+        ? supabaseConfiguredOverride
+        : !isStagingSandboxMode() && isSupabaseBrowserConfigured(),
+    [supabaseConfiguredOverride]
   );
   const isSubmittingRef = useRef(false);
   const isMountedRef = useRef(true);
@@ -228,13 +306,16 @@ export default function PdiAuthPage({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
+  // MIG-04-AUTH-01-FIX-02 : Ne charger les restrictions pays Firestore que sur l'onglet d'inscription,
+  // afin qu'aucun appel Firebase/Firestore ne soit déclenché au chargement de la page de connexion.
   useEffect(() => {
+    if (tab !== "register") return;
     void getCountryRestrictionsFromFirebase().then(res => {
       if (isMountedRef.current && res && res.length > 0) {
         setAllCountries(res);
       }
     });
-  }, []);
+  }, [tab]);
 
   // When country changes, reset city to the first default city of that country
   const handleCountryChange = (newCode: string) => {
@@ -251,106 +332,41 @@ export default function PdiAuthPage({
   const handleLoginSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (isSubmittingRef.current) return;
-    isSubmittingRef.current = true;
     clearTransitionTimer();
     setErrorMsg(null);
     setSuccessMsg(null);
+
+    if (!supabaseAvailable) {
+      setErrorMsg(SUPABASE_UNCONFIGURED_LOGIN_ERROR);
+      return;
+    }
+
+    isSubmittingRef.current = true;
     setLoading(true);
 
     try {
-      if (loginProvider === "supabase" && supabaseAvailable) {
-        const sbRes = await loginWithSupabaseEmailPassword(loginEmail, loginPassword);
+      const sbRes = await executeSupabaseExclusiveLogin(loginEmail, loginPassword, {
+        supabaseAvailable,
+        loginFn: loginWithSupabaseFn,
+      });
+      if (!isMountedRef.current) return;
+      setSuccessMsg(`Connexion Supabase vérifiée ! Bienvenue ${sbRes.profile.name}.`);
+      transitionTimerRef.current = setTimeout(() => {
+        transitionTimerRef.current = null;
         if (!isMountedRef.current) return;
         if (!isCoherentAuthorizedLoginResult(sbRes, sbRes.authUser)) {
-          throw new Error(
-            "Incohérence de session Supabase détectée : le profil actif ou l'identité vérifiée par le serveur n'est pas valide."
-          );
-        }
-        setSuccessMsg(`Connexion Supabase vérifiée ! Bienvenue ${sbRes.profile.name}.`);
-        transitionTimerRef.current = setTimeout(() => {
-          transitionTimerRef.current = null;
-          if (!isMountedRef.current) return;
-          if (!isCoherentAuthorizedLoginResult(sbRes, sbRes.authUser)) {
-            setErrorMsg("Session Supabase interrompue ou non autorisée avant l'ouverture de l'espace de travail.");
-            return;
-          }
-          onSuccess(sbRes.profile, sbRes.isSuperAdmin, {
-            provider: "supabase",
-            emailVerified: sbRes.emailConfirmed,
-            authUser: sbRes.authUser,
-          });
-        }, 600);
-        return;
-      }
-
-      const res = await loginWithEmailAndPasswordSecure(loginEmail, loginPassword);
-      if (!isMountedRef.current) return;
-      if (!isCoherentAuthorizedLoginResult(res, auth.currentUser)) {
-        throw new Error(
-          "Incohérence de session détectée : le profil actif ou l'utilisateur authentifié n'est pas valide."
-        );
-      }
-      setSuccessMsg(`Connexion réussie ! Bienvenue ${res.profile.name}.`);
-      transitionTimerRef.current = setTimeout(() => {
-        transitionTimerRef.current = null;
-        if (!isMountedRef.current) return;
-        if (!isCoherentAuthorizedLoginResult(res, auth.currentUser)) {
-          setErrorMsg("Session interrompue ou non autorisée avant l'ouverture de l'espace de travail.");
+          setErrorMsg("Session Supabase interrompue ou non autorisée avant l'ouverture de l'espace de travail.");
           return;
         }
-        onSuccess(res.profile, res.isSuperAdmin, {
-          provider: "firebase",
-          emailVerified: auth.currentUser?.emailVerified === true,
+        onSuccess(sbRes.profile, sbRes.isSuperAdmin, {
+          provider: "supabase",
+          emailVerified: sbRes.emailConfirmed,
+          authUser: sbRes.authUser,
         });
-      }, 1500);
+      }, 600);
     } catch (err: any) {
       if (!isMountedRef.current) return;
-      if (err instanceof PdiAuthAccessError && err.reason === "pending_activation") {
-        setActEmail(err.pendingProfile?.email || loginEmail || auth.currentUser?.email || "");
-        setTab("activation");
-      }
-      setErrorMsg(err.message || "Erreur de connexion. Vérifiez vos identifiants.");
-    } finally {
-      isSubmittingRef.current = false;
-      if (isMountedRef.current) {
-        setLoading(false);
-      }
-    }
-  };
-
-  const handleGoogleLogin = async () => {
-    if (isSubmittingRef.current) return;
-    isSubmittingRef.current = true;
-    clearTransitionTimer();
-    setErrorMsg(null);
-    setSuccessMsg(null);
-    setLoading(true);
-
-    try {
-      const res = await loginWithGoogleSecure();
-      if (!isMountedRef.current) return;
-      if (!isCoherentAuthorizedLoginResult(res, auth.currentUser)) {
-        throw new Error(
-          "Incohérence de session détectée : le profil actif ou l'utilisateur Google authentifié n'est pas valide."
-        );
-      }
-      setSuccessMsg(`Authentifié avec succès via Google (${res.profile.email}) !`);
-      transitionTimerRef.current = setTimeout(() => {
-        transitionTimerRef.current = null;
-        if (!isMountedRef.current) return;
-        if (!isCoherentAuthorizedLoginResult(res, auth.currentUser)) {
-          setErrorMsg("Session interrompue ou non autorisée avant l'ouverture de l'espace de travail.");
-          return;
-        }
-        onSuccess(res.profile, res.isSuperAdmin);
-      }, 1500);
-    } catch (err: any) {
-      if (!isMountedRef.current) return;
-      if (err instanceof PdiAuthAccessError && err.reason === "pending_activation") {
-        setActEmail(err.pendingProfile?.email || auth.currentUser?.email || "");
-        setTab("activation");
-      }
-      setErrorMsg(err.message || "Impossible de se connecter avec Google.");
+      setErrorMsg(err?.message || "Erreur de connexion Supabase. Vérifiez vos identifiants.");
     } finally {
       isSubmittingRef.current = false;
       if (isMountedRef.current) {
@@ -520,7 +536,12 @@ export default function PdiAuthPage({
     setErrorMsg(null);
     setSuccessMsg(null);
 
-    if (!resetEmail) {
+    if (!supabaseAvailable) {
+      setErrorMsg(SUPABASE_UNCONFIGURED_RESET_ERROR);
+      return;
+    }
+
+    if (!resetEmail.trim()) {
       setErrorMsg("Veuillez saisir votre adresse email.");
       return;
     }
@@ -528,17 +549,16 @@ export default function PdiAuthPage({
     isSubmittingRef.current = true;
     setLoading(true);
     try {
-      if (loginProvider === "supabase" && supabaseAvailable) {
-        await sendSupabasePasswordResetEmail(resetEmail);
-      } else {
-        await sendResetPasswordEmail(resetEmail);
-      }
+      await executeSupabaseExclusivePasswordReset(resetEmail, {
+        supabaseAvailable,
+        resetFn: resetPasswordWithSupabaseFn,
+      });
       if (!isMountedRef.current) return;
-      setSuccessMsg(`Un email de réinitialisation sécurisé a été envoyé à ${resetEmail}. Vérifiez votre boîte de réception.`);
+      setSuccessMsg(`Un email de réinitialisation sécurisé Supabase a été envoyé à ${resetEmail}. Vérifiez votre boîte de réception.`);
       setShowResetForm(false);
     } catch (err: any) {
       if (!isMountedRef.current) return;
-      setErrorMsg(err.message || "Erreur lors de l'envoi de l'email de réinitialisation.");
+      setErrorMsg(err?.message || "Erreur lors de l'envoi de l'email de réinitialisation Supabase.");
     } finally {
       isSubmittingRef.current = false;
       if (isMountedRef.current) {
@@ -855,55 +875,34 @@ export default function PdiAuthPage({
         {errorMsg && <div className="pdi-msg-error">⚠️ {errorMsg}</div>}
         {successMsg && <div className="pdi-msg-success">✓ {successMsg}</div>}
 
-        {/* TAB 1: LOGIN */}
+        {/* TAB 1: LOGIN (SUPABASE AUTH EXCLUSIF — MIG-04-AUTH-01-FIX-02) */}
         {tab === "login" && !showResetForm && (
-          <form onSubmit={handleLoginSubmit}>
-            {supabaseAvailable && (
+          <form onSubmit={handleLoginSubmit} data-testid="pdi-supabase-login-form">
+            {!supabaseAvailable ? (
               <div
-                data-testid="pdi-auth-provider-switch"
+                data-testid="pdi-supabase-unconfigured-banner"
+                role="alert"
+                className="pdi-msg-error"
+                style={{ marginBottom: 14 }}
+              >
+                ⚠️ {SUPABASE_UNCONFIGURED_LOGIN_ERROR}
+              </div>
+            ) : (
+              <div
+                data-testid="pdi-supabase-auth-badge"
                 style={{
-                  display: "grid",
-                  gridTemplateColumns: "1fr 1fr",
-                  gap: 6,
-                  padding: 4,
+                  padding: "8px 12px",
                   marginBottom: 14,
                   borderRadius: 10,
-                  background: "rgba(9, 14, 23, 0.9)",
-                  border: "1px solid rgba(56, 189, 248, 0.25)",
+                  background: "rgba(5, 150, 105, 0.12)",
+                  border: "1px solid rgba(16, 185, 129, 0.35)",
+                  fontSize: 11,
+                  fontWeight: 800,
+                  color: "#6EE7B7",
+                  textAlign: "center",
                 }}
               >
-                <button
-                  type="button"
-                  onClick={() => { setLoginProvider("supabase"); setErrorMsg(null); setSuccessMsg(null); }}
-                  style={{
-                    border: 0,
-                    borderRadius: 8,
-                    padding: "7px 8px",
-                    fontSize: 11,
-                    fontWeight: 800,
-                    cursor: "pointer",
-                    background: loginProvider === "supabase" ? "linear-gradient(135deg, #059669, #10B981)" : "transparent",
-                    color: loginProvider === "supabase" ? "#FFFFFF" : "#94A3B8",
-                  }}
-                >
-                  Supabase Auth (Vérifié serveur)
-                </button>
-                <button
-                  type="button"
-                  onClick={() => { setLoginProvider("firebase"); setErrorMsg(null); setSuccessMsg(null); }}
-                  style={{
-                    border: 0,
-                    borderRadius: 8,
-                    padding: "7px 8px",
-                    fontSize: 11,
-                    fontWeight: 800,
-                    cursor: "pointer",
-                    background: loginProvider === "firebase" ? "linear-gradient(135deg, #0284C7, #0EA5E9)" : "transparent",
-                    color: loginProvider === "firebase" ? "#FFFFFF" : "#94A3B8",
-                  }}
-                >
-                  Firebase Auth (Hérité)
-                </button>
+                Authentification sécurisée Supabase Auth (vérifiée côté serveur)
               </div>
             )}
 
@@ -912,7 +911,8 @@ export default function PdiAuthPage({
               <input
                 type="email"
                 required
-                placeholder={loginProvider === "supabase" ? "orthognaleng@gmail.com ou nom@entreprise.com" : "nom@entreprise.com ou boudjada.youcef@gmail.com"}
+                disabled={!supabaseAvailable || loading}
+                placeholder="orthogonaleng@gmail.com ou nom@entreprise.com"
                 value={loginEmail}
                 onChange={(e) => setLoginEmail(e.target.value)}
                 autoComplete="email"
@@ -927,6 +927,7 @@ export default function PdiAuthPage({
                 <input
                   type={showPassword ? "text" : "password"}
                   required
+                  disabled={!supabaseAvailable || loading}
                   placeholder="Votre mot de passe sécurisé"
                   value={loginPassword}
                   onChange={(e) => setLoginPassword(e.target.value)}
@@ -943,21 +944,29 @@ export default function PdiAuthPage({
               </div>
             </div>
 
-            <button type="submit" className="pdi-btn-submit" disabled={loading}>
+            <button
+              type="submit"
+              data-testid="pdi-supabase-login-submit"
+              className="pdi-btn-submit"
+              disabled={loading || !supabaseAvailable}
+            >
               {loading
-                ? "Vérification serveur en cours..."
-                : loginProvider === "supabase" && supabaseAvailable
-                  ? "Se connecter via Supabase Auth →"
-                  : "Se connecter à PD&I →"}
+                ? "Vérification serveur Supabase en cours..."
+                : !supabaseAvailable
+                  ? "Connexion bloquée (Supabase non configuré)"
+                  : "Se connecter via Supabase Auth →"}
             </button>
 
             <div className="pdi-divider">OU</div>
 
             <button
               type="button"
+              data-testid="pdi-btn-google-disabled"
               className="pdi-btn-google"
-              onClick={handleGoogleLogin}
-              disabled={loading}
+              disabled={true}
+              aria-disabled="true"
+              title={SUPABASE_GOOGLE_OAUTH_DISABLED_NOTICE}
+              style={{ opacity: 0.5, cursor: "not-allowed" }}
             >
               <svg width="18" height="18" viewBox="0 0 24 24">
                 <path fill="#EA4335" d="M12 5c1.6 0 3 .6 4.1 1.7l3.1-3.1C17.3 1.8 14.8 1 12 1 7.5 1 3.7 3.6 1.9 7.3l3.7 2.9C6.5 7.4 9 5 12 5z" />
@@ -965,11 +974,18 @@ export default function PdiAuthPage({
                 <path fill="#FBBC05" d="M5.6 14.8c-.2-.7-.4-1.5-.4-2.3s.2-1.6.4-2.3L1.9 7.3C.7 9.7 0 12 0 12s.7 2.3 1.9 4.7l3.7-2.9z" />
                 <path fill="#34A853" d="M12 23c3.2 0 6-1.1 8-3l-3.7-2.9c-1.1.7-2.5 1.2-4.3 1.2-3 0-5.5-2.4-6.4-5.2L1.9 16c1.8 3.7 5.6 7 10.1 7z" />
               </svg>
-              Continuer avec Google (Gmail / Workspace)
+              Google OAuth (indisponible — non activé sur Supabase)
             </button>
+            <div
+              data-testid="pdi-google-disabled-notice"
+              style={{ fontSize: 11, color: "#94A3B8", textAlign: "center", marginTop: 6, lineHeight: 1.4 }}
+            >
+              {SUPABASE_GOOGLE_OAUTH_DISABLED_NOTICE}
+            </div>
 
             <button
               type="button"
+              data-testid="pdi-open-reset-form-btn"
               className="pdi-super-btn-link"
               onClick={() => {
                 setShowResetForm(true);
@@ -978,20 +994,31 @@ export default function PdiAuthPage({
                 setSuccessMsg(null);
               }}
             >
-              🔑 Mot de passe oublié ? Réinitialiser via email
+              🔑 Mot de passe oublié ? Réinitialiser via Supabase Auth
             </button>
           </form>
         )}
 
-        {/* PASSWORD RESET VIEW */}
+        {/* PASSWORD RESET VIEW (SUPABASE AUTH EXCLUSIF) */}
         {tab === "login" && showResetForm && (
-          <form onSubmit={handleResetPasswordSubmit}>
+          <form onSubmit={handleResetPasswordSubmit} data-testid="pdi-supabase-reset-form">
+            {!supabaseAvailable && (
+              <div
+                data-testid="pdi-supabase-reset-unconfigured-banner"
+                role="alert"
+                className="pdi-msg-error"
+                style={{ marginBottom: 14 }}
+              >
+                ⚠️ {SUPABASE_UNCONFIGURED_RESET_ERROR}
+              </div>
+            )}
+
             <div style={{ background: "rgba(14, 165, 233, 0.1)", border: "1px solid rgba(56, 189, 248, 0.3)", borderRadius: 12, padding: 12, marginBottom: 16 }}>
               <div style={{ fontWeight: 900, color: "#38BDF8", fontSize: 12, marginBottom: 4 }}>
-                🔒 Réinitialisation du mot de passe
+                🔒 Réinitialisation du mot de passe (Supabase Auth)
               </div>
               <div style={{ fontSize: 11, color: "#CBD5E1", lineHeight: 1.4 }}>
-                Saisissez votre adresse email enregistrée. Un lien sécurisé vous sera envoyé par Firebase Authentication pour réinitialiser votre mot de passe.
+                Saisissez votre adresse email enregistrée. Un lien sécurisé vous sera envoyé exclusivement par Supabase Auth pour réinitialiser votre mot de passe.
               </div>
             </div>
 
@@ -1000,15 +1027,25 @@ export default function PdiAuthPage({
               <input
                 type="email"
                 required
-                placeholder="nom@entreprise.com"
+                disabled={!supabaseAvailable || loading}
+                placeholder="orthogonaleng@gmail.com ou nom@entreprise.com"
                 value={resetEmail}
                 onChange={(e) => setResetEmail(e.target.value)}
                 autoComplete="email"
               />
             </div>
 
-            <button type="submit" className="pdi-btn-submit" disabled={loading}>
-              {loading ? "Envoi en cours..." : "Envoyer le lien de réinitialisation →"}
+            <button
+              type="submit"
+              data-testid="pdi-supabase-reset-submit"
+              className="pdi-btn-submit"
+              disabled={loading || !supabaseAvailable}
+            >
+              {loading
+                ? "Envoi Supabase en cours..."
+                : !supabaseAvailable
+                  ? "Réinitialisation bloquée (Supabase non configuré)"
+                  : "Envoyer le lien de réinitialisation Supabase →"}
             </button>
 
             <button

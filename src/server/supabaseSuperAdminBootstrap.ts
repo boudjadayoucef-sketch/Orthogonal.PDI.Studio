@@ -6,7 +6,7 @@
  *
  * Garanties de sécurité :
  * 1. Exclusivement serveur (`service_role` / `sb_secret_`), jamais appelable depuis un navigateur.
- * 2. Restreint à un seul email exact autorisé : `orthognaleng@gmail.com`.
+ * 2. Restreint à un seul email exact autorisé : `orthogonaleng@gmail.com`.
  * 3. Activation explicite requise via `SUPABASE_SUPER_ADMIN_BOOTSTRAP_ENABLED=true` (fail-closed par défaut).
  * 4. Interdit en mode Sandbox (`PDI_ENV=sandbox`).
  * 5. Deux phases strictes :
@@ -28,7 +28,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { isStagingSandboxMode } from "../lib/stagingSandbox.ts";
 import { sanitizeSupabaseAdminError } from "./supabaseAdmin.ts";
 
-export const AUTHORIZED_SUPABASE_SUPER_ADMIN_EMAIL = "orthognaleng@gmail.com" as const;
+export const AUTHORIZED_SUPABASE_SUPER_ADMIN_EMAIL = "orthogonaleng@gmail.com" as const;
 export const SUPABASE_SUPER_ADMIN_BOOTSTRAP_ENV_FLAG =
   "SUPABASE_SUPER_ADMIN_BOOTSTRAP_ENABLED" as const;
 export const DEFAULT_SUPER_ADMIN_DISPLAY_NAME = "Orthogonal Super Admin" as const;
@@ -381,7 +381,7 @@ export async function bootstrapSupabaseSuperAdmin(
     );
   }
 
-  // 4. Restriction exclusive à orthognaleng@gmail.com
+  // 4. Restriction exclusive à orthogonaleng@gmail.com
   const targetEmail = assertAuthorizedBootstrapEmail(
     options.targetEmail ?? AUTHORIZED_SUPABASE_SUPER_ADMIN_EMAIL
   );
@@ -444,7 +444,7 @@ export async function bootstrapSupabaseSuperAdmin(
   if (authUser && profileById && normalizeBootstrapEmail(profileById.email) !== targetEmail) {
     throw new SupabaseBootstrapError(
       "EMAIL_MISMATCH_INTEGRITY_ERROR",
-      "Incohérence critique : le profil associé à cet UUID porte un email différent de orthognaleng@gmail.com."
+      "Incohérence critique : le profil associé à cet UUID porte un email différent de orthogonaleng@gmail.com."
     );
   }
 
@@ -474,7 +474,7 @@ export async function bootstrapSupabaseSuperAdmin(
         privilegesEffective: false,
         auditLogId: null,
         actions: [
-          "dry_run: would invite orthognaleng@gmail.com via Supabase Auth Admin API",
+          "dry_run: would invite orthogonaleng@gmail.com via Supabase Auth Admin API",
           "dry_run: would create unprivileged profile (role=client, status=pending_activation)",
           "dry_run: would record audit log supabase.super_admin.bootstrap.invited",
         ],
@@ -502,7 +502,7 @@ export async function bootstrapSupabaseSuperAdmin(
           "dry_run: super_admin promotion blocked until real email confirmation",
         ],
         nextStep:
-          "Ouvrir l'email de confirmation envoyé à orthognaleng@gmail.com, confirmer le compte, puis relancer avec --execute.",
+          "Ouvrir l'email de confirmation envoyé à orthogonaleng@gmail.com, confirmer le compte, puis relancer avec --execute.",
       };
     }
 
@@ -614,7 +614,7 @@ export async function bootstrapSupabaseSuperAdmin(
         auditLogId: auditRecord.id,
         actions,
         nextStep:
-          "Un email d'invitation/confirmation a été envoyé à orthognaleng@gmail.com. Confirmer l'email et définir le mot de passe, puis relancer le bootstrap avec --execute pour activer le rôle super_admin.",
+          "Un email d'invitation/confirmation a été envoyé à orthogonaleng@gmail.com. Confirmer l'email et définir le mot de passe, puis relancer le bootstrap avec --execute pour activer le rôle super_admin.",
       };
     } catch (err) {
       // Rollback compensatoire : ne jamais laisser un utilisateur/profil orphelin ou partiel
@@ -706,7 +706,7 @@ export async function bootstrapSupabaseSuperAdmin(
         auditLogId: auditRecord.id,
         actions,
         nextStep:
-          "L'email orthognaleng@gmail.com n'est pas encore confirmé dans Supabase Auth (email_confirmed_at IS NULL). Confirmer l'email puis relancer avec --execute.",
+          "L'email orthogonaleng@gmail.com n'est pas encore confirmé dans Supabase Auth (email_confirmed_at IS NULL). Confirmer l'email puis relancer avec --execute.",
       };
     } catch (err) {
       if (createdPendingProfile) {
@@ -778,7 +778,7 @@ export async function bootstrapSupabaseSuperAdmin(
       auditLogId: auditRecord.id,
       actions,
       nextStep:
-        "Le compte super_admin orthognaleng@gmail.com est déjà confirmé et actif. Désactiver SUPABASE_SUPER_ADMIN_BOOTSTRAP_ENABLED=false immédiatement.",
+        "Le compte super_admin orthogonaleng@gmail.com est déjà confirmé et actif. Désactiver SUPABASE_SUPER_ADMIN_BOOTSTRAP_ENABLED=false immédiatement.",
     };
   }
 
@@ -861,7 +861,7 @@ export async function bootstrapSupabaseSuperAdmin(
       auditLogId: auditRecord.id,
       actions,
       nextStep:
-        "Le premier super_admin orthognaleng@gmail.com est activé. Désactiver immédiatement SUPABASE_SUPER_ADMIN_BOOTSTRAP_ENABLED=false dans l'environnement serveur.",
+        "Le premier super_admin orthogonaleng@gmail.com est activé. Désactiver immédiatement SUPABASE_SUPER_ADMIN_BOOTSTRAP_ENABLED=false dans l'environnement serveur.",
     };
   } catch (err) {
     // Rollback compensatoire : ne jamais laisser un profil partiellement promu sans vérification + audit
