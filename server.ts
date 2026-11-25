@@ -12,7 +12,7 @@ import type { AddressInfo } from "net";
 import path from "path";
 // PATCH 017G : inspection reelle du dossier dist/assets.
 import fs from "fs";
-import { createServer as createViteServer } from "vite";
+import type { createServer as CreateViteServerFn } from "vite";
 import {
   createRequireAuth,
   requireSuperAdmin,
@@ -76,12 +76,13 @@ export interface PdiServerDependencies {
   createOrUpdateProject?: typeof createOrUpdateProject;
   deleteUserProject?: typeof deleteUserProject;
   getOrCreateUser?: typeof getOrCreateUser;
-  createViteServer?: typeof createViteServer;
+  createViteServer?: typeof CreateViteServerFn;
 }
 
 export interface CreatePdiExpressAppOptions {
   env?: NodeJS.ProcessEnv;
   mountErrorHandler?: boolean;
+  mountApiNotFoundHandler?: boolean;
   dependencies?: PdiServerDependencies;
 }
 
@@ -105,6 +106,20 @@ export interface StartedPdiServer {
 // Keep unused DB helpers explicitly referenced without invoking PostgreSQL
 void getDriveFiles;
 void saveDriveFileRecord;
+
+/**
+ * VERCEL-API-01 :
+ * Garantit qu'une route `/api/*` inconnue retourne toujours un JSON 404 strict
+ * (jamais de HTML frontend ni de chemin réfléchi).
+ */
+export function createApiNotFoundHandler(): express.RequestHandler {
+  return (_req, res) => {
+    res.status(404).json({
+      error: "Not Found: Unknown API endpoint",
+      code: "api/not-found",
+    });
+  };
+}
 
 /**
  * STAGING-00-B4-C :
@@ -488,6 +503,12 @@ export function createPdiExpressApp(options: CreatePdiExpressAppOptions = {}): e
     });
   });
 
+  const shouldMountApiNotFound =
+    options.mountApiNotFoundHandler ?? options.mountErrorHandler !== false;
+  if (shouldMountApiNotFound) {
+    app.use("/api", createApiNotFoundHandler());
+  }
+
   if (options.mountErrorHandler !== false) {
     app.use(createGlobalExpressErrorHandler());
   }
@@ -505,14 +526,17 @@ export async function startServer(options: StartServerOptions = {}): Promise<Sta
   const app = createPdiExpressApp({
     env: runtimeEnv,
     mountErrorHandler: false,
+    mountApiNotFoundHandler: false,
     dependencies: options.dependencies,
   });
 
   const deliveryMode = resolveServerDeliveryMode(runtimeEnv);
-  const viteServerFactory = options.dependencies?.createViteServer ?? createViteServer;
 
   if (attachFrontend) {
     if (!deliveryMode.serveStaticDist) {
+      app.use("/api", createApiNotFoundHandler());
+      const viteServerFactory =
+        options.dependencies?.createViteServer ?? (await import("vite")).createServer;
       const vite = await viteServerFactory({
         server: { middlewareMode: true },
         appType: "spa",
@@ -613,6 +637,9 @@ export async function startServer(options: StartServerOptions = {}): Promise<Sta
         }
       });
 
+      // VERCEL-API-01 : aucune route /api/* inconnue ne doit tomber dans le fallback HTML SPA
+      app.use("/api", createApiNotFoundHandler());
+
       app.get("*", (req, res) => {
         // PATCH 017G : ne jamais renvoyer index.html a la place d un asset.
         // C est ce fallback qui masquait l absence du bundle CSS : le navigateur
@@ -624,6 +651,8 @@ export async function startServer(options: StartServerOptions = {}): Promise<Sta
         return sendRuntimeConfiguredIndexHtml(req, res);
       });
     }
+  } else {
+    app.use("/api", createApiNotFoundHandler());
   }
 
   // Middleware global de gestion des erreurs de parsing (400 / 413) et d'erreurs internes (500) en fin de chaîne (SEC-01-FIX-07-R1 D2.4 & D3)
@@ -655,7 +684,11 @@ export async function startServer(options: StartServerOptions = {}): Promise<Sta
 }
 
 function isDirectServerExecution(): boolean {
-  if (process.env.PDI_SERVER_NO_AUTOSTART === "1") {
+  if (
+    process.env.PDI_SERVER_NO_AUTOSTART === "1" ||
+    process.env.VERCEL === "1" ||
+    process.env.VERCEL === "true"
+  ) {
     return false;
   }
   if (typeof require !== "undefined" && typeof module !== "undefined" && require.main === module) {
