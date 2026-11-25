@@ -14,9 +14,13 @@ import { isSupabaseBrowserConfigured } from "../../lib/supabase";
 import {
   loginWithSupabaseEmailPassword,
   sendSupabasePasswordResetEmail,
+  completeSupabasePasswordRecovery,
+  validateSupabaseRecoveryPassword,
+  sanitizeSupabaseAuthErrorText,
   PdiSupabaseAuthError,
   type SupabaseClientAuthUser,
   type SupabaseVerifiedLoginResult,
+  type SupabasePasswordRecoveryResult,
 } from "../../lib/supabaseAuth";
 import { isStagingSandboxMode } from "../../lib/stagingSandbox";
 
@@ -101,6 +105,41 @@ export async function executeSupabaseExclusivePasswordReset(
   const resetImpl = options.resetFn ?? sendSupabasePasswordResetEmail;
   await resetImpl(cleaned);
 }
+
+/**
+ * Flux de finalisation de récupération de mot de passe exclusif Supabase Auth (MIG-04-AUTH-02).
+ * Valide la correspondance et la conformité des mots de passe, vérifie la configuration Supabase,
+ * met à jour le mot de passe sans ancien mot de passe et sans jamais basculer sur Firebase.
+ */
+export async function executeSupabaseExclusivePasswordRecoveryUpdate(
+  newPassword: string,
+  confirmPassword: string,
+  options: {
+    supabaseAvailable: boolean;
+    completeRecoveryFn?: (
+      newPassword: string,
+      confirmPassword: string
+    ) => Promise<SupabasePasswordRecoveryResult>;
+  }
+): Promise<SupabasePasswordRecoveryResult> {
+  if (!options.supabaseAvailable) {
+    throw new PdiSupabaseAuthError(
+      SUPABASE_UNCONFIGURED_RESET_ERROR,
+      "client/supabase-unconfigured",
+      503
+    );
+  }
+
+  const validation = validateSupabaseRecoveryPassword(newPassword, confirmPassword);
+  if ("code" in validation) {
+    throw new PdiSupabaseAuthError(validation.message, validation.code, 400);
+  }
+
+  const completeImpl = options.completeRecoveryFn ?? completeSupabasePasswordRecovery;
+  return await completeImpl(newPassword, confirmPassword);
+}
+
+export const LOGIN_EMAIL_PLACEHOLDER = "Adresse e-mail" as const;
 
 export const PDI_OFFERS = [
   {
@@ -208,6 +247,21 @@ export type PdiAuthPageProps = {
   loginWithSupabaseFn?: (email: string, password: string) => Promise<SupabaseVerifiedLoginResult>;
   /** Optionnel (tests) : injecte le service de réinitialisation mot de passe Supabase */
   resetPasswordWithSupabaseFn?: (email: string) => Promise<void>;
+  /** MIG-04-AUTH-02 : active l'écran dédié de définition du nouveau mot de passe (session recovery validée uniquement) */
+  passwordRecoveryMode?: boolean;
+  /** MIG-04-AUTH-02 : adresse e-mail informative associée à la session de récupération vérifiée */
+  passwordRecoveryEmail?: string | null;
+  /** MIG-04-AUTH-02 : erreur contrôlée lorsque le lien ou la session de récupération est absent, invalide ou expiré */
+  passwordRecoveryError?: string | null;
+  /** MIG-04-AUTH-02 : état initial de confirmation réussie (utile pour les tests de rendu) */
+  initialRecoveryCompleted?: boolean;
+  /** MIG-04-AUTH-02 : callback appelé lorsque l'utilisateur revient à la connexion normale */
+  onExitPasswordRecovery?: () => void;
+  /** Optionnel (tests) : injecte le service de finalisation de récupération Supabase */
+  completePasswordRecoveryFn?: (
+    newPassword: string,
+    confirmPassword: string
+  ) => Promise<SupabasePasswordRecoveryResult>;
 };
 
 export default function PdiAuthPage({
@@ -217,6 +271,12 @@ export default function PdiAuthPage({
   supabaseConfiguredOverride,
   loginWithSupabaseFn,
   resetPasswordWithSupabaseFn,
+  passwordRecoveryMode = false,
+  passwordRecoveryEmail = null,
+  passwordRecoveryError = null,
+  initialRecoveryCompleted = false,
+  onExitPasswordRecovery,
+  completePasswordRecoveryFn,
 }: PdiAuthPageProps) {
   const [tab, setTab] = useState<"login" | "register" | "activation">(initialTab);
   const supabaseAvailable = useMemo(
@@ -297,14 +357,39 @@ export default function PdiAuthPage({
   const [actEmail, setActEmail] = useState("");
   const [actKey, setActKey] = useState("");
 
-  // Reset password state
+  // Reset password request state
   const [resetEmail, setResetEmail] = useState("");
   const [showResetForm, setShowResetForm] = useState(false);
 
+  // MIG-04-AUTH-02 : Password recovery completion state (nouveau mot de passe uniquement)
+  const [recoveryNewPassword, setRecoveryNewPassword] = useState("");
+  const [recoveryConfirmPassword, setRecoveryConfirmPassword] = useState("");
+  const [showRecoveryPassword, setShowRecoveryPassword] = useState(false);
+  const [recoveryCompleted, setRecoveryCompleted] = useState(initialRecoveryCompleted);
+
   // UI status states
   const [loading, setLoading] = useState(false);
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(
+    passwordRecoveryError ? sanitizeSupabaseAuthErrorText(passwordRecoveryError) : null
+  );
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (passwordRecoveryError) {
+      setErrorMsg(sanitizeSupabaseAuthErrorText(passwordRecoveryError));
+      setSuccessMsg(null);
+    }
+  }, [passwordRecoveryError]);
+
+  useEffect(() => {
+    if (passwordRecoveryMode) {
+      setTab("login");
+      setShowResetForm(false);
+      setRecoveryCompleted(false);
+      setErrorMsg(null);
+      setSuccessMsg(null);
+    }
+  }, [passwordRecoveryMode]);
 
   // MIG-04-AUTH-01-FIX-02 : Ne charger les restrictions pays Firestore que sur l'onglet d'inscription,
   // afin qu'aucun appel Firebase/Firestore ne soit déclenché au chargement de la page de connexion.
@@ -565,6 +650,71 @@ export default function PdiAuthPage({
         setLoading(false);
       }
     }
+  };
+
+  const handleCompletePasswordRecoverySubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (isSubmittingRef.current) return;
+    setErrorMsg(null);
+    setSuccessMsg(null);
+
+    if (!supabaseAvailable) {
+      setErrorMsg(SUPABASE_UNCONFIGURED_RESET_ERROR);
+      return;
+    }
+
+    const validation = validateSupabaseRecoveryPassword(
+      recoveryNewPassword,
+      recoveryConfirmPassword
+    );
+    if ("code" in validation) {
+      setErrorMsg(validation.message);
+      return;
+    }
+
+    isSubmittingRef.current = true;
+    setLoading(true);
+    try {
+      await executeSupabaseExclusivePasswordRecoveryUpdate(
+        recoveryNewPassword,
+        recoveryConfirmPassword,
+        {
+          supabaseAvailable,
+          completeRecoveryFn: completePasswordRecoveryFn,
+        }
+      );
+      if (!isMountedRef.current) return;
+      setRecoveryNewPassword("");
+      setRecoveryConfirmPassword("");
+      setRecoveryCompleted(true);
+      setSuccessMsg(
+        "Votre nouveau mot de passe a été enregistré avec succès. Vous pouvez maintenant vous connecter normalement."
+      );
+    } catch (err: any) {
+      if (!isMountedRef.current) return;
+      const safeErrMsg =
+        sanitizeSupabaseAuthErrorText(err?.message) ||
+        "Impossible d'enregistrer le nouveau mot de passe Supabase.";
+      setErrorMsg(safeErrMsg);
+    } finally {
+      isSubmittingRef.current = false;
+      if (isMountedRef.current) {
+        setLoading(false);
+      }
+    }
+  };
+
+  const handleReturnToNormalLoginFromRecovery = () => {
+    setRecoveryNewPassword("");
+    setRecoveryConfirmPassword("");
+    setRecoveryCompleted(false);
+    setShowResetForm(false);
+    setLoginEmail("");
+    setLoginPassword("");
+    setErrorMsg(null);
+    setSuccessMsg(null);
+    setTab("login");
+    onExitPasswordRecovery?.();
   };
 
   return (
@@ -846,37 +996,163 @@ export default function PdiAuthPage({
           </p>
         </div>
 
-        {/* Navigation Tabs */}
-        <div className="pdi-auth-tabs">
-          <button
-            type="button"
-            className={`pdi-auth-tab-btn ${tab === "login" ? "active" : ""}`}
-            onClick={() => { setTab("login"); setErrorMsg(null); setSuccessMsg(null); }}
-          >
-            Connexion
-          </button>
-          <button
-            type="button"
-            className={`pdi-auth-tab-btn ${tab === "register" ? "active" : ""}`}
-            onClick={() => { setTab("register"); setErrorMsg(null); setSuccessMsg(null); }}
-          >
-            Créer un compte
-          </button>
-          <button
-            type="button"
-            className={`pdi-auth-tab-btn ${tab === "activation" ? "active" : ""}`}
-            onClick={() => { setTab("activation"); setErrorMsg(null); setSuccessMsg(null); }}
-          >
-            Activer licence
-          </button>
-        </div>
+        {/* Navigation Tabs (masqués pendant la finalisation de récupération de mot de passe) */}
+        {!passwordRecoveryMode && (
+          <div className="pdi-auth-tabs">
+            <button
+              type="button"
+              className={`pdi-auth-tab-btn ${tab === "login" ? "active" : ""}`}
+              onClick={() => { setTab("login"); setErrorMsg(null); setSuccessMsg(null); }}
+            >
+              Connexion
+            </button>
+            <button
+              type="button"
+              className={`pdi-auth-tab-btn ${tab === "register" ? "active" : ""}`}
+              onClick={() => { setTab("register"); setErrorMsg(null); setSuccessMsg(null); }}
+            >
+              Créer un compte
+            </button>
+            <button
+              type="button"
+              className={`pdi-auth-tab-btn ${tab === "activation" ? "active" : ""}`}
+              onClick={() => { setTab("activation"); setErrorMsg(null); setSuccessMsg(null); }}
+            >
+              Activer licence
+            </button>
+          </div>
+        )}
 
         {/* Error / Success Notifications */}
-        {errorMsg && <div className="pdi-msg-error">⚠️ {errorMsg}</div>}
-        {successMsg && <div className="pdi-msg-success">✓ {successMsg}</div>}
+        {errorMsg && <div className="pdi-msg-error" data-testid="pdi-auth-error-banner" role="alert">⚠️ {errorMsg}</div>}
+        {successMsg && <div className="pdi-msg-success" data-testid="pdi-auth-success-banner" role="status">✓ {successMsg}</div>}
 
-        {/* TAB 1: LOGIN (SUPABASE AUTH EXCLUSIF — MIG-04-AUTH-01-FIX-02) */}
-        {tab === "login" && !showResetForm && (
+        {/* PASSWORD RECOVERY COMPLETION VIEW (MIG-04-AUTH-02 : session Supabase recovery validée uniquement) */}
+        {passwordRecoveryMode && !recoveryCompleted && (
+          <form
+            onSubmit={handleCompletePasswordRecoverySubmit}
+            data-testid="pdi-supabase-recovery-update-form"
+          >
+            <div
+              style={{
+                background: "rgba(14, 165, 233, 0.1)",
+                border: "1px solid rgba(56, 189, 248, 0.35)",
+                borderRadius: 12,
+                padding: 12,
+                margin: "12px 0 16px",
+              }}
+            >
+              <div style={{ fontWeight: 900, color: "#38BDF8", fontSize: 12, marginBottom: 4 }}>
+                🔐 Définition du nouveau mot de passe (Supabase Auth)
+              </div>
+              <div style={{ fontSize: 11, color: "#CBD5E1", lineHeight: 1.45 }}>
+                Votre session de récupération Supabase est active. Choisissez un nouveau mot de passe d&apos;au moins 6 caractères puis confirmez-le.
+                {passwordRecoveryEmail ? (
+                  <div style={{ marginTop: 6, color: "#94A3B8", fontWeight: 700 }}>
+                    Compte concerné : <span style={{ color: "#E2E8F0" }}>{passwordRecoveryEmail}</span>
+                  </div>
+                ) : null}
+              </div>
+            </div>
+
+            <div className="pdi-form-group">
+              <label htmlFor="pdi-recovery-new-password">Nouveau mot de passe</label>
+              <div className="pdi-input-pwd-wrap">
+                <input
+                  id="pdi-recovery-new-password"
+                  data-testid="pdi-recovery-new-password-input"
+                  type={showRecoveryPassword ? "text" : "password"}
+                  required
+                  minLength={6}
+                  maxLength={128}
+                  disabled={!supabaseAvailable || loading}
+                  placeholder="Nouveau mot de passe (min. 6 caractères)"
+                  value={recoveryNewPassword}
+                  onChange={(e) => setRecoveryNewPassword(e.target.value)}
+                  autoComplete="new-password"
+                />
+                <button
+                  type="button"
+                  className="pdi-pwd-toggle"
+                  onClick={() => setShowRecoveryPassword(!showRecoveryPassword)}
+                  tabIndex={-1}
+                >
+                  {showRecoveryPassword ? "🙈" : "👁️"}
+                </button>
+              </div>
+            </div>
+
+            <div className="pdi-form-group">
+              <label htmlFor="pdi-recovery-confirm-password">Confirmation du nouveau mot de passe</label>
+              <input
+                id="pdi-recovery-confirm-password"
+                data-testid="pdi-recovery-confirm-password-input"
+                type={showRecoveryPassword ? "text" : "password"}
+                required
+                minLength={6}
+                maxLength={128}
+                disabled={!supabaseAvailable || loading}
+                placeholder="Confirmez votre nouveau mot de passe"
+                value={recoveryConfirmPassword}
+                onChange={(e) => setRecoveryConfirmPassword(e.target.value)}
+                autoComplete="new-password"
+              />
+            </div>
+
+            <button
+              type="submit"
+              data-testid="pdi-recovery-submit-btn"
+              className="pdi-btn-submit"
+              disabled={loading || !supabaseAvailable}
+            >
+              {loading
+                ? "Enregistrement du nouveau mot de passe..."
+                : "Enregistrer le nouveau mot de passe"}
+            </button>
+
+            <button
+              type="button"
+              data-testid="pdi-recovery-cancel-btn"
+              className="pdi-super-btn-link"
+              onClick={handleReturnToNormalLoginFromRecovery}
+            >
+              Annuler et revenir à la connexion normale
+            </button>
+          </form>
+        )}
+
+        {/* PASSWORD RECOVERY SUCCESS CONFIRMATION VIEW (MIG-04-AUTH-02) */}
+        {passwordRecoveryMode && recoveryCompleted && (
+          <div
+            data-testid="pdi-supabase-recovery-success"
+            style={{
+              background: "rgba(16, 185, 129, 0.1)",
+              border: "1px solid rgba(52, 211, 153, 0.35)",
+              borderRadius: 12,
+              padding: 16,
+              margin: "12px 0 10px",
+              textAlign: "center",
+            }}
+          >
+            <div style={{ fontWeight: 900, color: "#6EE7B7", fontSize: 13.5, marginBottom: 6 }}>
+              ✓ Mot de passe mis à jour avec succès
+            </div>
+            <p style={{ fontSize: 11.5, color: "#CBD5E1", margin: "0 0 14px", lineHeight: 1.5 }}>
+              Votre nouveau mot de passe a été enregistré par Supabase Auth. Vous pouvez désormais revenir à l&apos;écran de connexion normale.
+            </p>
+            <button
+              type="button"
+              data-testid="pdi-recovery-back-to-login-btn"
+              className="pdi-btn-submit"
+              onClick={handleReturnToNormalLoginFromRecovery}
+            >
+              Revenir à la connexion normale →
+            </button>
+          </div>
+        )}
+
+        {/* TAB 1: LOGIN (SUPABASE AUTH EXCLUSIF — MIG-04-AUTH-01-FIX-02 & MIG-04-AUTH-02) */}
+        {!passwordRecoveryMode && tab === "login" && !showResetForm && (
           <form onSubmit={handleLoginSubmit} data-testid="pdi-supabase-login-form">
             {!supabaseAvailable ? (
               <div
@@ -910,9 +1186,10 @@ export default function PdiAuthPage({
               <label>Adresse Email ou Identifiant</label>
               <input
                 type="email"
+                data-testid="pdi-login-email-input"
                 required
                 disabled={!supabaseAvailable || loading}
-                placeholder="orthogonaleng@gmail.com ou nom@entreprise.com"
+                placeholder={LOGIN_EMAIL_PLACEHOLDER}
                 value={loginEmail}
                 onChange={(e) => setLoginEmail(e.target.value)}
                 autoComplete="email"
@@ -926,6 +1203,7 @@ export default function PdiAuthPage({
               <div className="pdi-input-pwd-wrap">
                 <input
                   type={showPassword ? "text" : "password"}
+                  data-testid="pdi-login-password-input"
                   required
                   disabled={!supabaseAvailable || loading}
                   placeholder="Votre mot de passe sécurisé"
@@ -1000,7 +1278,7 @@ export default function PdiAuthPage({
         )}
 
         {/* PASSWORD RESET VIEW (SUPABASE AUTH EXCLUSIF) */}
-        {tab === "login" && showResetForm && (
+        {!passwordRecoveryMode && tab === "login" && showResetForm && (
           <form onSubmit={handleResetPasswordSubmit} data-testid="pdi-supabase-reset-form">
             {!supabaseAvailable && (
               <div
@@ -1026,9 +1304,10 @@ export default function PdiAuthPage({
               <label>Adresse email du compte</label>
               <input
                 type="email"
+                data-testid="pdi-reset-email-input"
                 required
                 disabled={!supabaseAvailable || loading}
-                placeholder="orthogonaleng@gmail.com ou nom@entreprise.com"
+                placeholder={LOGIN_EMAIL_PLACEHOLDER}
                 value={resetEmail}
                 onChange={(e) => setResetEmail(e.target.value)}
                 autoComplete="email"
@@ -1059,7 +1338,7 @@ export default function PdiAuthPage({
         )}
 
         {/* TAB 2: REGISTER */}
-        {tab === "register" && (
+        {!passwordRecoveryMode && tab === "register" && (
           <form onSubmit={handleRegisterSubmit}>
             <div className="pdi-form-group">
               <label>Nom complet &amp; Prénom</label>
@@ -1608,7 +1887,7 @@ export default function PdiAuthPage({
         )}
 
         {/* TAB 3: ACTIVATION */}
-        {tab === "activation" && (
+        {!passwordRecoveryMode && tab === "activation" && (
           <form onSubmit={handleActivationSubmit}>
             <div style={{ background: "rgba(14, 165, 233, 0.08)", border: "1px solid rgba(14, 165, 233, 0.25)", borderRadius: 12, padding: 12, marginBottom: 16 }}>
               <div style={{ fontWeight: 800, color: "#67E8F9", fontSize: 12, marginBottom: 4 }}>

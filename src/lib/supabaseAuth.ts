@@ -142,7 +142,49 @@ export interface SupabaseAuthDependencies {
   fetchImpl?: typeof fetch;
   isConfigured?: () => boolean;
   isSandbox?: () => boolean;
+  locationLike?: { search?: string; hash?: string; pathname?: string };
 }
+
+export interface SupabasePasswordRecoveryContext {
+  userId: string;
+  email: string;
+  expiresAt: number | null;
+}
+
+export type SupabaseRecoverySessionValidationResult =
+  | {
+      valid: true;
+      userId: string;
+      email: string;
+      expiresAt: number | null;
+    }
+  | {
+      valid: false;
+      code:
+        | "sandbox/server-auth-disabled"
+        | "client/supabase-unconfigured"
+        | "auth/recovery-session-missing"
+        | "auth/recovery-session-expired"
+        | "auth/recovery-session-invalid";
+      status: number;
+      message: string;
+    };
+
+export interface SupabasePasswordRecoveryResult {
+  updated: true;
+  userId: string;
+  email: string;
+}
+
+export interface SupabaseRecoveryUrlHint {
+  hasRecoveryParam: boolean;
+  hasError: boolean;
+  errorCode?: string;
+  userMessage?: string;
+}
+
+export const SUPABASE_RECOVERY_MIN_PASSWORD_LENGTH = 6 as const;
+export const SUPABASE_RECOVERY_MAX_PASSWORD_LENGTH = 128 as const;
 
 const VALID_ACCOUNT_TYPES = new Set<PdiAccountType>(["basic", "pro", "team", "enterprise"]);
 const VALID_SUBSCRIPTION_PLANS = new Set<PdiSubscriptionPlan>([
@@ -600,6 +642,412 @@ export async function updateSupabaseUserPassword(
 }
 
 /**
+ * Masque tout jeton JWT ou secret potentiellement présent dans un message d'erreur brut
+ * avant affichage ou remontée vers l'interface (MIG-04-AUTH-02).
+ */
+export function sanitizeSupabaseAuthErrorText(rawMessage: unknown): string {
+  if (typeof rawMessage !== "string" || !rawMessage.trim()) {
+    return "";
+  }
+  return rawMessage
+    .replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[REDACTED_TOKEN]")
+    .replace(/Bearer\s+[A-Za-z0-9._~+/-]+=*/gi, "Bearer [REDACTED_TOKEN]")
+    .replace(
+      /((?:access_token|refresh_token|provider_token|token_hash|token|code)\s*[=:]\s*)[^\s&;,"']+/gi,
+      "$1[REDACTED]"
+    )
+    .replace(/sb_secret_[0-9a-zA-Z_-]+/g, "[REDACTED_SECRET]")
+    .replace(/sbp_[0-9a-zA-Z_-]+/g, "[REDACTED_SECRET]");
+}
+
+/**
+ * Valide le nouveau mot de passe et sa confirmation selon les règles existantes du projet.
+ */
+export function validateSupabaseRecoveryPassword(
+  newPassword: string,
+  confirmPassword: string
+): { valid: true } | { valid: false; code: string; message: string } {
+  if (typeof newPassword !== "string" || newPassword.length === 0) {
+    return {
+      valid: false,
+      code: "auth/missing-password",
+      message: "Veuillez saisir un nouveau mot de passe.",
+    };
+  }
+  if (typeof confirmPassword !== "string" || confirmPassword.length === 0) {
+    return {
+      valid: false,
+      code: "auth/missing-password-confirmation",
+      message: "Veuillez confirmer le nouveau mot de passe.",
+    };
+  }
+  if (newPassword.trim().length === 0) {
+    return {
+      valid: false,
+      code: "auth/weak-password",
+      message: "Le nouveau mot de passe ne peut pas être composé uniquement d'espaces.",
+    };
+  }
+  if (newPassword.length < SUPABASE_RECOVERY_MIN_PASSWORD_LENGTH) {
+    return {
+      valid: false,
+      code: "auth/weak-password",
+      message: `Le nouveau mot de passe doit contenir au minimum ${SUPABASE_RECOVERY_MIN_PASSWORD_LENGTH} caractères.`,
+    };
+  }
+  if (newPassword.length > SUPABASE_RECOVERY_MAX_PASSWORD_LENGTH) {
+    return {
+      valid: false,
+      code: "auth/weak-password",
+      message: `Le nouveau mot de passe ne doit pas dépasser ${SUPABASE_RECOVERY_MAX_PASSWORD_LENGTH} caractères.`,
+    };
+  }
+  if (newPassword !== confirmPassword) {
+    return {
+      valid: false,
+      code: "auth/password-mismatch",
+      message: "Les deux mots de passe ne correspondent pas.",
+    };
+  }
+  return { valid: true };
+}
+
+/**
+ * Inspecte les paramètres d'URL uniquement pour détecter un retour d'erreur Supabase
+ * (ex. `error_code=otp_expired`) ou la présence d'un indice `type=recovery`.
+ *
+ * IMPORTANT : un paramètre d'URL ne constitue JAMAIS une preuve d'identité ni
+ * d'authentification ; seule une session Supabase réellement validée est acceptée.
+ */
+export function inspectSupabaseRecoveryUrlHint(
+  locationLike?: { search?: string; hash?: string }
+): SupabaseRecoveryUrlHint {
+  const loc =
+    locationLike ??
+    (typeof window !== "undefined" && window.location ? window.location : undefined);
+
+  if (!loc) {
+    return { hasRecoveryParam: false, hasError: false };
+  }
+
+  const rawSearch = typeof loc.search === "string" ? loc.search.replace(/^\?/, "") : "";
+  const rawHash = typeof loc.hash === "string" ? loc.hash.replace(/^#/, "") : "";
+
+  const searchParams = new URLSearchParams(rawSearch);
+  const hashParams = new URLSearchParams(rawHash);
+
+  const typeParam = (hashParams.get("type") ?? searchParams.get("type") ?? "").trim().toLowerCase();
+  const hasRecoveryParam = typeParam === "recovery";
+
+  const rawError = (hashParams.get("error") ?? searchParams.get("error") ?? "").trim().toLowerCase();
+  const rawErrorCode = (
+    hashParams.get("error_code") ??
+    searchParams.get("error_code") ??
+    ""
+  )
+    .trim()
+    .toLowerCase();
+  const rawErrorDesc = (
+    hashParams.get("error_description") ??
+    searchParams.get("error_description") ??
+    ""
+  )
+    .trim()
+    .toLowerCase();
+
+  if (rawError || rawErrorCode) {
+    const isExpiredOrInvalidOtp =
+      rawErrorCode === "otp_expired" ||
+      rawErrorCode === "flow_state_expired" ||
+      rawErrorCode === "flow_state_not_found" ||
+      rawErrorDesc.includes("expired") ||
+      rawErrorDesc.includes("invalid");
+
+    if (hasRecoveryParam || isExpiredOrInvalidOtp || rawError === "access_denied") {
+      return {
+        hasRecoveryParam,
+        hasError: true,
+        errorCode: rawErrorCode || rawError || "auth/recovery-link-invalid",
+        userMessage:
+          "Le lien de récupération de mot de passe est invalide ou expiré. Veuillez demander un nouveau lien depuis la page de connexion.",
+      };
+    }
+  }
+
+  return {
+    hasRecoveryParam,
+    hasError: false,
+  };
+}
+
+/**
+ * Supprime les fragments/paramètres d'authentification sensibles de la barre d'adresse
+ * une fois que Supabase les a consommés (sans jamais recharger la page).
+ */
+export function clearSensitiveAuthParamsFromUrl(
+  windowLike?: Pick<Window, "location" | "history">
+): void {
+  const win = windowLike ?? (typeof window !== "undefined" ? window : undefined);
+  if (!win || !win.location || !win.history || typeof win.history.replaceState !== "function") {
+    return;
+  }
+
+  try {
+    const pathname = win.location.pathname || "/";
+    const currentSearch = win.location.search || "";
+    const currentHash = win.location.hash || "";
+
+    const sensitivePattern =
+      /(access_token|refresh_token|provider_token|token_hash|type=recovery|error_code=|error_description=|code=)/i;
+
+    if (!sensitivePattern.test(currentSearch) && !sensitivePattern.test(currentHash)) {
+      return;
+    }
+
+    const cleanSearchParams = new URLSearchParams(currentSearch.replace(/^\?/, ""));
+    for (const key of [
+      "code",
+      "token_hash",
+      "type",
+      "access_token",
+      "refresh_token",
+      "error",
+      "error_code",
+      "error_description",
+    ]) {
+      cleanSearchParams.delete(key);
+    }
+
+    const nextSearch = cleanSearchParams.toString();
+    const nextUrl = `${pathname}${nextSearch ? `?${nextSearch}` : ""}#auth`;
+    win.history.replaceState(null, "", nextUrl);
+  } catch {
+    // Ignore history API restrictions in constrained environments
+  }
+}
+
+/**
+ * Vérifie qu'une session de récupération Supabase est réellement présente, non expirée
+ * et confirmée par Supabase Auth (`getUser()`). Ne renvoie jamais aucun token.
+ */
+export async function validateActiveSupabaseRecoverySession(
+  deps: SupabaseAuthDependencies = {}
+): Promise<SupabaseRecoverySessionValidationResult> {
+  const inSandbox = deps.isSandbox ? deps.isSandbox() : isStagingSandboxMode();
+  if (inSandbox) {
+    return {
+      valid: false,
+      code: "sandbox/server-auth-disabled",
+      status: 403,
+      message: "La récupération du mot de passe Supabase est désactivée en mode Sandbox.",
+    };
+  }
+
+  const configured = deps.isConfigured ? deps.isConfigured() : isSupabaseBrowserConfigured();
+  if (!configured) {
+    return {
+      valid: false,
+      code: "client/supabase-unconfigured",
+      status: 503,
+      message:
+        "Récupération du mot de passe indisponible : la configuration Supabase navigateur est absente ou désactivée. Aucune bascule Firebase n'est autorisée.",
+    };
+  }
+
+  try {
+    const client = deps.getClient ? deps.getClient() : getSupabaseBrowserClient();
+    const { data, error } = await client.auth.getSession();
+    if (error || !data?.session || !data.session.access_token) {
+      return {
+        valid: false,
+        code: "auth/recovery-session-missing",
+        status: 401,
+        message:
+          "Aucune session de récupération Supabase active. Veuillez ouvrir un lien de récupération valide reçu par e-mail.",
+      };
+    }
+
+    const session = data.session;
+    const nowSec = Math.floor(Date.now() / 1000);
+    const expiresAt = typeof session.expires_at === "number" ? session.expires_at : null;
+    if (expiresAt !== null && expiresAt > 0 && expiresAt <= nowSec) {
+      return {
+        valid: false,
+        code: "auth/recovery-session-expired",
+        status: 401,
+        message:
+          "Votre session de récupération a expiré. Veuillez demander un nouveau lien de réinitialisation.",
+      };
+    }
+
+    // Vérification auprès de Supabase Auth (ne jamais se fier à un simple paramètre URL ou cache local)
+    let verifiedUser = session.user ?? null;
+    if (typeof client.auth.getUser === "function") {
+      const userCheck = await client.auth.getUser();
+      if (userCheck.error || !userCheck.data?.user?.id) {
+        return {
+          valid: false,
+          code: "auth/recovery-session-invalid",
+          status: 401,
+          message:
+            "La session de récupération est invalide ou expirée. Veuillez demander un nouveau lien de réinitialisation.",
+        };
+      }
+      if (session.user?.id && userCheck.data.user.id !== session.user.id) {
+        return {
+          valid: false,
+          code: "auth/recovery-session-invalid",
+          status: 401,
+          message: "Incohérence détectée sur la session de récupération Supabase.",
+        };
+      }
+      verifiedUser = userCheck.data.user;
+    }
+
+    if (!verifiedUser || !verifiedUser.id) {
+      return {
+        valid: false,
+        code: "auth/recovery-session-invalid",
+        status: 401,
+        message:
+          "Impossible de vérifier l'identité associée à cette session de récupération Supabase.",
+      };
+    }
+
+    return {
+      valid: true,
+      userId: verifiedUser.id,
+      email: typeof verifiedUser.email === "string" ? verifiedUser.email : "",
+      expiresAt,
+    };
+  } catch {
+    return {
+      valid: false,
+      code: "auth/recovery-session-invalid",
+      status: 503,
+      message:
+        "Impossible de vérifier la session de récupération Supabase (erreur réseau ou session invalide).",
+    };
+  }
+}
+
+/**
+ * Finalise la récupération du mot de passe à partir d'une session de récupération Supabase
+ * réellement valide (`supabase.auth.updateUser({ password: newPassword })`).
+ *
+ * Garanties MIG-04-AUTH-02 :
+ * - N'exige jamais l'ancien mot de passe.
+ * - Refuse toute session absente, expirée ou invalide.
+ * - Ne modifie jamais le rôle, le statut, l'UUID ni `public.profiles`.
+ * - Ne déconnecte jamais la session de récupération avant le succès confirmé de `updateUser`.
+ * - N'expose jamais aucun token dans les erreurs ni dans la console.
+ * - Aucune bascule Firebase.
+ */
+export async function completeSupabasePasswordRecovery(
+  newPassword: string,
+  confirmPassword: string,
+  deps: SupabaseAuthDependencies = {}
+): Promise<SupabasePasswordRecoveryResult> {
+  const inSandbox = deps.isSandbox ? deps.isSandbox() : isStagingSandboxMode();
+  if (inSandbox) {
+    throw new PdiSupabaseAuthError(
+      "La récupération du mot de passe Supabase est désactivée en mode Sandbox.",
+      "sandbox/server-auth-disabled",
+      403
+    );
+  }
+
+  const configured = deps.isConfigured ? deps.isConfigured() : isSupabaseBrowserConfigured();
+  if (!configured) {
+    throw new PdiSupabaseAuthError(
+      "Récupération du mot de passe indisponible : la configuration Supabase navigateur est absente ou désactivée. Aucune bascule Firebase n'est autorisée.",
+      "client/supabase-unconfigured",
+      503
+    );
+  }
+
+  const pwdValidation = validateSupabaseRecoveryPassword(newPassword, confirmPassword);
+  if ("code" in pwdValidation) {
+    throw new PdiSupabaseAuthError(pwdValidation.message, pwdValidation.code, 400);
+  }
+
+  const sessionCheck = await validateActiveSupabaseRecoverySession(deps);
+  if ("code" in sessionCheck) {
+    throw new PdiSupabaseAuthError(
+      sessionCheck.message,
+      sessionCheck.code,
+      sessionCheck.status
+    );
+  }
+
+  const client = deps.getClient ? deps.getClient() : getSupabaseBrowserClient();
+  let updateResult: Awaited<ReturnType<typeof client.auth.updateUser>>;
+  try {
+    // Met à jour STRICTEMENT le mot de passe (jamais de metadata, rôle, statut ou profil)
+    updateResult = await client.auth.updateUser({ password: newPassword });
+  } catch {
+    throw new PdiSupabaseAuthError(
+      "Erreur réseau lors de l'enregistrement du nouveau mot de passe Supabase. Réessayez.",
+      "auth/network-error",
+      503
+    );
+  }
+
+  if (updateResult.error) {
+    const safeRaw = sanitizeSupabaseAuthErrorText(updateResult.error.message || "").toLowerCase();
+    if (safeRaw.includes("same password") || safeRaw.includes("different from the old password")) {
+      throw new PdiSupabaseAuthError(
+        "Le nouveau mot de passe doit être différent de l'ancien mot de passe.",
+        "auth/same-password",
+        400
+      );
+    }
+    if (safeRaw.includes("expired") || safeRaw.includes("invalid jwt") || safeRaw.includes("session")) {
+      throw new PdiSupabaseAuthError(
+        "Votre session de récupération a expiré ou n'est plus valide. Veuillez demander un nouveau lien.",
+        "auth/recovery-session-expired",
+        401
+      );
+    }
+    if (safeRaw.includes("weak") || safeRaw.includes("at least") || safeRaw.includes("characters")) {
+      throw new PdiSupabaseAuthError(
+        "Le mot de passe ne respecte pas la politique de sécurité Supabase. Choisissez un mot de passe plus robuste.",
+        "auth/weak-password",
+        400
+      );
+    }
+    throw new PdiSupabaseAuthError(
+      "Impossible d'enregistrer le nouveau mot de passe Supabase. Veuillez réessayer ou demander un nouveau lien.",
+      "auth/password-update-failed",
+      400
+    );
+  }
+
+  const updatedUser = updateResult.data?.user;
+  if (updatedUser && updatedUser.id && updatedUser.id !== sessionCheck.userId) {
+    throw new PdiSupabaseAuthError(
+      "Incohérence d'identité détectée lors de la mise à jour du mot de passe.",
+      "auth/invalid-claims",
+      403
+    );
+  }
+
+  // Déconnexion propre de la session temporaire de récupération APRÈS confirmation de la mise à jour,
+  // afin que l'utilisateur revienne à une connexion normale avec son nouveau mot de passe.
+  try {
+    await logoutSupabase(deps);
+  } catch {
+    // La mise à jour du mot de passe est confirmée même si la fermeture locale échoue
+  }
+
+  return {
+    updated: true,
+    userId: sessionCheck.userId,
+    email: updatedUser?.email || sessionCheck.email,
+  };
+}
+
+/**
  * Récupère les données réelles d'administration Supabase (`GET /api/admin/supabase/overview`).
  * Protégé côté serveur par `requireSupabaseAuth` + `requireSupabaseSuperAdmin`.
  */
@@ -668,11 +1116,15 @@ export interface AttachSupabaseAuthMonitorOptions {
     message?: string;
   }) => void;
   onNoInitialSession?: () => void;
+  /** Déclenché uniquement lorsqu'une session de récupération Supabase est validée (MIG-04-AUTH-02) */
+  onPasswordRecovery?: (context: SupabasePasswordRecoveryContext) => void;
+  /** Déclenché lorsqu'un retour de récupération échoue (session absente, invalide ou expirée) */
+  onPasswordRecoveryInvalid?: (reason: { code: string; message: string }) => void;
 }
 
 /**
- * Surveille les événements de session Supabase (`INITIAL_SESSION`, `SIGNED_IN`, `TOKEN_REFRESHED`,
- * `SIGNED_OUT`, `USER_UPDATED`) et revalide systématiquement chaque session/token côté serveur.
+ * Surveille les événements de session Supabase (`INITIAL_SESSION`, `PASSWORD_RECOVERY`, `SIGNED_IN`,
+ * `TOKEN_REFRESHED`, `SIGNED_OUT`, `USER_UPDATED`) et revalide systématiquement chaque session/token côté serveur.
  */
 export function attachSupabaseAuthMonitor(options: AttachSupabaseAuthMonitorOptions): () => void {
   const deps = options.deps ?? {};
@@ -688,18 +1140,155 @@ export function attachSupabaseAuthMonitor(options: AttachSupabaseAuthMonitorOpti
   }
 
   const client = deps.getClient ? deps.getClient() : getSupabaseBrowserClient();
+  const initialUrlHint = inspectSupabaseRecoveryUrlHint(deps.locationLike);
   let active = true;
   let seq = 0;
+  let inRecoveryFlow = false;
+
+  const validateRecoveryEventSession = async (session: Session | null) => {
+    if (!session || !session.access_token) {
+      return {
+        valid: false as const,
+        code: "auth/recovery-session-missing",
+        message:
+          "Aucune session de récupération Supabase active. Veuillez ouvrir un lien de récupération valide.",
+      };
+    }
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const expiresAt = typeof session.expires_at === "number" ? session.expires_at : null;
+    if (expiresAt !== null && expiresAt > 0 && expiresAt <= nowSec) {
+      return {
+        valid: false as const,
+        code: "auth/recovery-session-expired",
+        message:
+          "Votre session de récupération a expiré. Veuillez demander un nouveau lien de réinitialisation.",
+      };
+    }
+
+    let verifiedUser = session.user ?? null;
+    if (typeof client.auth.getUser === "function") {
+      try {
+        const userCheck = await client.auth.getUser();
+        if (userCheck.error || !userCheck.data?.user?.id) {
+          return {
+            valid: false as const,
+            code: "auth/recovery-session-invalid",
+            message:
+              "La session de récupération est invalide ou expirée. Veuillez demander un nouveau lien de réinitialisation.",
+          };
+        }
+        if (session.user?.id && userCheck.data.user.id !== session.user.id) {
+          return {
+            valid: false as const,
+            code: "auth/recovery-session-invalid",
+            message: "Incohérence détectée sur la session de récupération Supabase.",
+          };
+        }
+        verifiedUser = userCheck.data.user;
+      } catch {
+        return {
+          valid: false as const,
+          code: "auth/recovery-session-invalid",
+          message:
+            "Impossible de vérifier la session de récupération Supabase. Veuillez demander un nouveau lien.",
+        };
+      }
+    }
+
+    if (!verifiedUser || !verifiedUser.id) {
+      return {
+        valid: false as const,
+        code: "auth/recovery-session-invalid",
+        message: "La session de récupération Supabase est incomplète ou invalide.",
+      };
+    }
+
+    return {
+      valid: true as const,
+      context: {
+        userId: verifiedUser.id,
+        email: typeof verifiedUser.email === "string" ? verifiedUser.email : "",
+        expiresAt,
+      },
+    };
+  };
 
   const verifyAndDispatch = async (event: AuthChangeEvent, session: Session | null) => {
     const currentSeq = ++seq;
+
+    // MIG-04-AUTH-02 : Parcours dédié de récupération de mot de passe Supabase
+    // Ne déconnecte JAMAIS prématurément la session et ne fait jamais confiance à l'URL seule.
+    if (event === "PASSWORD_RECOVERY") {
+      const check = await validateRecoveryEventSession(session);
+      if (!active || currentSeq !== seq) return;
+      if ("code" in check) {
+        inRecoveryFlow = false;
+        options.onPasswordRecoveryInvalid?.({
+          code: check.code,
+          message: check.message,
+        });
+        return;
+      }
+      inRecoveryFlow = true;
+      options.onPasswordRecovery?.(check.context);
+      return;
+    }
+
+    // Pendant la finalisation de la récupération (ex. USER_UPDATED émis par updateUser),
+    // ne pas court-circuiter l'écran de confirmation ni basculer dans l'espace de travail.
+    if (inRecoveryFlow && (event === "USER_UPDATED" || event === "TOKEN_REFRESHED")) {
+      return;
+    }
+
+    if (event === "SIGNED_OUT") {
+      inRecoveryFlow = false;
+      if (!active || currentSeq !== seq) return;
+      options.onSessionRevokedOrSignedOut({ event });
+      return;
+    }
+
     if (!session || !session.access_token) {
       if (!active || currentSeq !== seq) return;
       if (event === "INITIAL_SESSION") {
+        if (initialUrlHint.hasError && initialUrlHint.userMessage) {
+          options.onPasswordRecoveryInvalid?.({
+            code: initialUrlHint.errorCode || "auth/recovery-link-invalid",
+            message: initialUrlHint.userMessage,
+          });
+          return;
+        }
+        if (initialUrlHint.hasRecoveryParam) {
+          // URL contenant type=recovery sans aucune session Supabase valide -> refus explicite
+          options.onPasswordRecoveryInvalid?.({
+            code: "auth/recovery-session-missing",
+            message:
+              "Le lien de récupération ne contient pas de session Supabase valide ou a expiré. Demandez un nouveau lien.",
+          });
+          return;
+        }
         options.onNoInitialSession?.();
       } else {
         options.onSessionRevokedOrSignedOut({ event });
       }
+      return;
+    }
+
+    // Si GoTrue émet INITIAL_SESSION juste avant PASSWORD_RECOVERY lors d'un retour de lien recovery,
+    // valider la session de récupération au lieu d'entrer directement dans le workspace.
+    if (event === "INITIAL_SESSION" && initialUrlHint.hasRecoveryParam && options.onPasswordRecovery) {
+      const check = await validateRecoveryEventSession(session);
+      if (!active || currentSeq !== seq) return;
+      if ("code" in check) {
+        inRecoveryFlow = false;
+        options.onPasswordRecoveryInvalid?.({
+          code: check.code,
+          message: check.message,
+        });
+        return;
+      }
+      inRecoveryFlow = true;
+      options.onPasswordRecovery(check.context);
       return;
     }
 

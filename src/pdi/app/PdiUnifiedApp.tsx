@@ -90,6 +90,7 @@ import {
 } from "../../lib/firebase";
 import {
   attachSupabaseAuthMonitor,
+  clearSensitiveAuthParamsFromUrl,
   logoutSupabase,
   updateSupabaseUserPassword,
   type SupabaseClientAuthUser,
@@ -920,6 +921,14 @@ export default function PdiUnifiedApp() {
   }, [stage]);
 
   const [authPageTab, setAuthPageTab] = useState<"login" | "register" | "activation">("login");
+  // MIG-04-AUTH-02 : État dédié à la récupération de mot de passe Supabase (uniquement sur session validée)
+  const [passwordRecoveryActive, setPasswordRecoveryActive] = useState(false);
+  const [passwordRecoveryEmail, setPasswordRecoveryEmail] = useState<string | null>(null);
+  const [passwordRecoveryError, setPasswordRecoveryError] = useState<string | null>(null);
+  const passwordRecoveryActiveRef = React.useRef(false);
+  useEffect(() => {
+    passwordRecoveryActiveRef.current = passwordRecoveryActive;
+  }, [passwordRecoveryActive]);
 
   const getEffectiveAuthUser = React.useCallback(() => {
     if (isStagingSandboxMode()) {
@@ -1192,7 +1201,32 @@ export default function PdiUnifiedApp() {
     };
 
     return attachSupabaseAuthMonitor({
+      onPasswordRecovery: (recoveryCtx) => {
+        passwordRecoveryActiveRef.current = true;
+        setPasswordRecoveryActive(true);
+        setPasswordRecoveryEmail(recoveryCtx.email || null);
+        setPasswordRecoveryError(null);
+        authReadyRef.current = true;
+        setAuthReady(true);
+        setAuthPageTab("login");
+        setStage("auth");
+        clearSensitiveAuthParamsFromUrl();
+      },
+      onPasswordRecoveryInvalid: (reason) => {
+        passwordRecoveryActiveRef.current = false;
+        setPasswordRecoveryActive(false);
+        setPasswordRecoveryEmail(null);
+        setPasswordRecoveryError(reason.message);
+        authReadyRef.current = true;
+        setAuthReady(true);
+        setAuthPageTab("login");
+        setStage("auth");
+        clearSensitiveAuthParamsFromUrl();
+      },
       onSessionVerified: (verified) => {
+        if (passwordRecoveryActiveRef.current) {
+          return;
+        }
         authProviderRef.current = "supabase";
         setAuthProvider("supabase");
         supabaseAuthUserRef.current = verified.authUser;
@@ -1221,6 +1255,10 @@ export default function PdiUnifiedApp() {
         clearToGuestUnauthenticated();
       },
       onSessionRevokedOrSignedOut: (reason) => {
+        if (passwordRecoveryActiveRef.current && reason.event === "SIGNED_OUT") {
+          // Conserve l'écran de confirmation jusqu'au clic de retour vers la connexion normale
+          return;
+        }
         clearToGuestUnauthenticated(
           reason.event === "SERVER_DENIED" ? reason.message : undefined
         );
@@ -1423,6 +1461,16 @@ export default function PdiUnifiedApp() {
     );
   }
 
+  const handleExitPasswordRecovery = () => {
+    passwordRecoveryActiveRef.current = false;
+    setPasswordRecoveryActive(false);
+    setPasswordRecoveryEmail(null);
+    setPasswordRecoveryError(null);
+    setAuthPageTab("login");
+    setStage("auth");
+    void logoutSupabase().catch(() => {});
+  };
+
   // STAGE 2 : PAGE CONNEXION / AUTHENTIFICATION
   if (stage === "auth") {
     return (
@@ -1430,7 +1478,14 @@ export default function PdiUnifiedApp() {
         {sandboxBannerNode}
         <PdiAuthPage
           initialTab={authPageTab}
+          passwordRecoveryMode={passwordRecoveryActive}
+          passwordRecoveryEmail={passwordRecoveryEmail}
+          passwordRecoveryError={passwordRecoveryError}
+          onExitPasswordRecovery={handleExitPasswordRecovery}
           onBackToLanding={() => {
+            if (passwordRecoveryActive) {
+              handleExitPasswordRecovery();
+            }
             setStage("landing");
             try { window.location.hash = "landing"; } catch {}
           }}
@@ -1440,7 +1495,7 @@ export default function PdiUnifiedApp() {
     );
   }
 
-  // BLOC C2 : Tant que Firebase Auth et le profil Firestore ne sont pas résolus, afficher l'écran de chargement
+  // BLOC C2 : Tant que la session Supabase n'est pas résolue, afficher l'écran de chargement
   if (!authReady) {
     return (
       <>
@@ -1458,7 +1513,14 @@ export default function PdiUnifiedApp() {
         {sandboxBannerNode}
         <PdiAuthPage
           initialTab={renderGuard.authPageTab}
+          passwordRecoveryMode={passwordRecoveryActive}
+          passwordRecoveryEmail={passwordRecoveryEmail}
+          passwordRecoveryError={passwordRecoveryError}
+          onExitPasswordRecovery={handleExitPasswordRecovery}
           onBackToLanding={() => {
+            if (passwordRecoveryActive) {
+              handleExitPasswordRecovery();
+            }
             setStage("landing");
             try { window.location.hash = "landing"; } catch {}
           }}

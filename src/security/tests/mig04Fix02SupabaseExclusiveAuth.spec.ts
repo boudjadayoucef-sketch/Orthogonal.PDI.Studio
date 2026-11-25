@@ -899,7 +899,7 @@ describe("MIG-04-AUTH-01-FIX-02 — Supabase Auth Exclusif & Correction Identit�
     expect(unifiedAppSource).not.toContain("changeUserProfilePassword");
     expect(unifiedAppSource).not.toContain("resolveAuthoritativeWorkspaceSession");
 
-    // 6b. Chargement de PdiAuthPage (tab='login') avec Supabase configuré -> 0 erreur, placeholder corrigé, 0 switch Firebase
+    // 6b. Chargement de PdiAuthPage (tab='login') avec Supabase configuré -> 0 erreur, placeholder neutre "Adresse e-mail", aucune adresse personnelle préremplie, 0 switch Firebase (MIG-04-AUTH-02)
     const loginPageHtml = renderToStaticMarkup(
       React.createElement(PdiAuthPage, {
         onSuccess: vi.fn(),
@@ -908,7 +908,9 @@ describe("MIG-04-AUTH-01-FIX-02 — Supabase Auth Exclusif & Correction Identit�
       })
     );
     expect(loginPageHtml).toContain('data-testid="pdi-supabase-auth-badge"');
-    expect(loginPageHtml).toContain("orthogonaleng@gmail.com");
+    expect(loginPageHtml).toContain('placeholder="Adresse e-mail"');
+    expect(loginPageHtml).toContain('value=""');
+    expect(loginPageHtml).not.toContain("orthogonaleng@gmail.com");
     expect(loginPageHtml).not.toContain("orthognaleng@gmail.com");
     expect(loginPageHtml).not.toContain("pdi-auth-provider-switch");
 
