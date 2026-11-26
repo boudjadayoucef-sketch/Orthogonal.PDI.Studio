@@ -555,8 +555,9 @@ export async function startServer(options: StartServerOptions = {}): Promise<Sta
   if (attachFrontend) {
     if (!deliveryMode.serveStaticDist) {
       app.use("/api", createApiNotFoundHandler());
+      const viteModuleName = "vite";
       const viteServerFactory =
-        options.dependencies?.createViteServer ?? (await import("vite")).createServer;
+        options.dependencies?.createViteServer ?? (await import(viteModuleName)).createServer;
       const vite = await viteServerFactory({
         server: { middlewareMode: true },
         appType: "spa",

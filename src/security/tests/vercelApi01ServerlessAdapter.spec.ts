@@ -774,13 +774,36 @@ describe("VERCEL-API-01 — Raccordement du serveur Express à Vercel Serverless
       }
     };
 
-    walkServerGraph(path.join(rootDir, "api", "index.ts"));
+    walkServerGraph(path.join(rootDir, "src", "server", "vercelHandler.ts"));
 
     // Aucun import relatif .ts ou sans extension ne doit subsister (sinon ERR_MODULE_NOT_FOUND sur Vercel ESM)
     expect(violations).toEqual([]);
     // Le graphe serveur ne doit jamais référencer le SDK navigateur client src/lib/firebase.ts
     const relVisited = Array.from(visited).map((f) => path.relative(rootDir, f));
     expect(relVisited).not.toContain("src/lib/firebase.ts");
+
+    // Vérifier la présence de api/tsconfig.json (NodeNext, noEmit: false) et du pre-bundle Vercel
+    const apiTsconfig = JSON.parse(
+      fs.readFileSync(path.join(rootDir, "api", "tsconfig.json"), "utf-8")
+    );
+    expect(apiTsconfig.compilerOptions.moduleResolution).toBe("NodeNext");
+    expect(apiTsconfig.compilerOptions.noEmit).toBe(false);
+
+    const vercelConfig = JSON.parse(
+      fs.readFileSync(path.join(rootDir, "vercel.json"), "utf-8")
+    );
+    expect(vercelConfig.buildCommand).toContain("build:vercel-api");
+    expect(vercelConfig.functions?.["api/index.ts"]?.includeFiles).toContain(
+      "api/_vercelBundle.mjs"
+    );
+
+    // Vérifier l'invocation HTTP réelle du handler par défaut exporté par api/index.ts
+    const { baseUrl } = await mountServerlessHandlerForTest((req, res) => {
+      void vercelDefaultHandler(req, res);
+    });
+    const entryHealthRes = await fetch(`${baseUrl}/api/health`);
+    expect(entryHealthRes.status).toBe(200);
+    expect((await entryHealthRes.json()).status).toBe("ok");
 
     // Vérifier que verifySupabaseSessionWithServer distingue un HTTP 500 non-JSON (ex: crash serverless)
     // d'un refus d'authentification 401 (auth/invalid-token)
