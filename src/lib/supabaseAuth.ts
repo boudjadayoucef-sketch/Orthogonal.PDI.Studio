@@ -142,7 +142,8 @@ export interface SupabaseAuthDependencies {
   fetchImpl?: typeof fetch;
   isConfigured?: () => boolean;
   isSandbox?: () => boolean;
-  locationLike?: { search?: string; hash?: string; pathname?: string };
+  locationLike?: { search?: string; hash?: string; pathname?: string; origin?: string };
+  redirectTo?: string;
 }
 
 export interface SupabasePasswordRecoveryContext {
@@ -178,10 +179,14 @@ export interface SupabasePasswordRecoveryResult {
 
 export interface SupabaseRecoveryUrlHint {
   hasRecoveryParam: boolean;
+  hasTokenHash?: boolean;
+  hasPkceCode?: boolean;
   hasError: boolean;
   errorCode?: string;
   userMessage?: string;
 }
+
+export const SUPABASE_PASSWORD_RESET_ROUTE = "/auth/reset-password" as const;
 
 export const SUPABASE_RECOVERY_MIN_PASSWORD_LENGTH = 6 as const;
 export const SUPABASE_RECOVERY_MAX_PASSWORD_LENGTH = 128 as const;
@@ -523,10 +528,23 @@ export async function loginWithSupabaseEmailPassword(
   }
 }
 
+// Marqueur mémoire éphémère de flux de récupération (ne stocke AUCUN token, n'accorde AUCUNE auth).
+// Permet de survivre au double-montage React StrictMode ou au nettoyage immédiat du hash par GoTrue.
+let pendingSupabaseRecoveryHint = false;
+
+export function clearPendingSupabaseRecoveryHint(): void {
+  pendingSupabaseRecoveryHint = false;
+}
+
+export function hasPendingSupabaseRecoveryHint(): boolean {
+  return pendingSupabaseRecoveryHint;
+}
+
 /**
  * Déconnexion complète Supabase Auth + purge de la clé de stockage dédiée.
  */
 export async function logoutSupabase(deps: SupabaseAuthDependencies = {}): Promise<void> {
+  pendingSupabaseRecoveryHint = false;
   const configured = deps.isConfigured ? deps.isConfigured() : isSupabaseBrowserConfigured();
   if (configured) {
     try {
@@ -547,7 +565,66 @@ export async function logoutSupabase(deps: SupabaseAuthDependencies = {}): Promi
 }
 
 /**
- * Envoie un email officiel de réinitialisation de mot de passe via Supabase Auth.
+ * Construit et valide strictement l'URL de redirection (`redirectTo`) pour le lien
+ * de récupération de mot de passe Supabase Auth (`/auth/reset-password`).
+ *
+ * Garanties sécurité :
+ * - Autorise uniquement `https://` en production (ou `http://localhost` / `http://127.0.0.1` en dev local).
+ * - Refuse toute URL malformée, identifiants embarqués, caractères de contrôle ou schémas dangereux (`javascript:`, `data:`).
+ * - Retourne `undefined` hors contexte navigateur si aucune URL explicite n'est fournie.
+ */
+export function resolveSupabasePasswordResetRedirectUrl(options?: {
+  redirectTo?: string;
+  locationLike?: { origin?: string };
+}): string | undefined {
+  const validateSafeUrl = (raw: string): string | undefined => {
+    const trimmed = raw.trim();
+    if (!trimmed || /[\x00-\x1f\x7f\s'"\\]/.test(trimmed)) {
+      return undefined;
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(trimmed);
+    } catch {
+      return undefined;
+    }
+    if (parsed.username || parsed.password) {
+      return undefined;
+    }
+    const hostname = parsed.hostname.toLowerCase();
+    const isLocalhost = hostname === "localhost" || hostname === "127.0.0.1";
+    const protocolAllowed =
+      parsed.protocol === "https:" || (parsed.protocol === "http:" && isLocalhost);
+    if (!protocolAllowed) {
+      return undefined;
+    }
+    return parsed.toString();
+  };
+
+  if (typeof options?.redirectTo === "string" && options.redirectTo.trim().length > 0) {
+    return validateSafeUrl(options.redirectTo);
+  }
+
+  const candidateOrigin =
+    options?.locationLike?.origin ??
+    (typeof window !== "undefined" &&
+    window.location &&
+    typeof window.location.origin === "string" &&
+    window.location.origin !== "null"
+      ? window.location.origin
+      : undefined);
+
+  if (!candidateOrigin) {
+    return undefined;
+  }
+
+  const normalizedOrigin = candidateOrigin.trim().replace(/\/+$/, "");
+  return validateSafeUrl(`${normalizedOrigin}${SUPABASE_PASSWORD_RESET_ROUTE}`);
+}
+
+/**
+ * Envoie un email officiel de réinitialisation de mot de passe via Supabase Auth,
+ * avec une URL de redirection HTTPS explicite (`/auth/reset-password`) en contexte navigateur.
  */
 export async function sendSupabasePasswordResetEmail(
   email: string,
@@ -579,9 +656,25 @@ export async function sendSupabasePasswordResetEmail(
       400
     );
   }
+
+  const redirectTo = resolveSupabasePasswordResetRedirectUrl({
+    redirectTo: deps.redirectTo,
+    locationLike: deps.locationLike,
+  });
+
   const client = deps.getClient ? deps.getClient() : getSupabaseBrowserClient();
-  const { error } = await client.auth.resetPasswordForEmail(cleanedEmail);
+  const { error } = redirectTo
+    ? await client.auth.resetPasswordForEmail(cleanedEmail, { redirectTo })
+    : await client.auth.resetPasswordForEmail(cleanedEmail);
   if (error) {
+    const safeMsg = sanitizeSupabaseAuthErrorText(error.message || "").toLowerCase();
+    if (safeMsg.includes("rate limit") || safeMsg.includes("too many") || (error as any)?.status === 429) {
+      throw new PdiSupabaseAuthError(
+        "Trop de demandes de réinitialisation ont été envoyées récemment. Veuillez patienter quelques instants avant de réessayer.",
+        "auth/rate-limit",
+        429
+      );
+    }
     throw new PdiSupabaseAuthError(
       "Impossible d'envoyer l'email de réinitialisation Supabase.",
       "auth/reset-password-failed",
@@ -712,32 +805,81 @@ export function validateSupabaseRecoveryPassword(
   return { valid: true };
 }
 
+function isPasswordResetPathnameOrHash(pathname: string, rawHash: string): boolean {
+  const normalizedPath = pathname.trim().replace(/\/+$/, "").toLowerCase();
+  const normalizedHash = rawHash.trim().toLowerCase();
+  return (
+    normalizedPath === SUPABASE_PASSWORD_RESET_ROUTE ||
+    normalizedPath === "/reset-password" ||
+    normalizedHash === "reset-password" ||
+    normalizedHash === "auth/reset-password"
+  );
+}
+
+/**
+ * Extrait uniquement en interne les paramètres d'échange OTP (`token_hash`) ou PKCE (`code`)
+ * présents dans l'URL au retour d'un email Supabase. Ne jamais exposer ce résultat à l'UI ou aux logs.
+ */
+function extractInternalRecoveryExchangeParams(
+  locationLike?: { search?: string; hash?: string; pathname?: string }
+): { tokenHash: string | null; pkceCode: string | null; typeParam: string; isResetRoute: boolean } {
+  const loc =
+    locationLike ??
+    (typeof window !== "undefined" && window.location ? window.location : undefined);
+
+  if (!loc) {
+    return { tokenHash: null, pkceCode: null, typeParam: "", isResetRoute: false };
+  }
+
+  const rawSearch = typeof loc.search === "string" ? loc.search.replace(/^\?/, "") : "";
+  const rawHash = typeof loc.hash === "string" ? loc.hash.replace(/^#/, "") : "";
+  const rawPathname = typeof loc.pathname === "string" ? loc.pathname : "";
+
+  const searchParams = new URLSearchParams(rawSearch);
+  const hashParams = new URLSearchParams(rawHash);
+
+  const typeParam = (hashParams.get("type") ?? searchParams.get("type") ?? "").trim().toLowerCase();
+  const tokenHash = (searchParams.get("token_hash") ?? hashParams.get("token_hash") ?? "").trim() || null;
+  const pkceCode = (searchParams.get("code") ?? "").trim() || null;
+  const isResetRoute = isPasswordResetPathnameOrHash(rawPathname, rawHash);
+
+  return { tokenHash, pkceCode, typeParam, isResetRoute };
+}
+
 /**
  * Inspecte les paramètres d'URL uniquement pour détecter un retour d'erreur Supabase
- * (ex. `error_code=otp_expired`) ou la présence d'un indice `type=recovery`.
+ * (ex. `error_code=otp_expired`) ou la présence d'un indice de récupération (`type=recovery`,
+ * route `/auth/reset-password`, `token_hash` ou `code`).
  *
  * IMPORTANT : un paramètre d'URL ne constitue JAMAIS une preuve d'identité ni
  * d'authentification ; seule une session Supabase réellement validée est acceptée.
+ * Aucun jeton brut n'est jamais retourné par cette fonction.
  */
 export function inspectSupabaseRecoveryUrlHint(
-  locationLike?: { search?: string; hash?: string }
+  locationLike?: { search?: string; hash?: string; pathname?: string }
 ): SupabaseRecoveryUrlHint {
   const loc =
     locationLike ??
     (typeof window !== "undefined" && window.location ? window.location : undefined);
 
   if (!loc) {
-    return { hasRecoveryParam: false, hasError: false };
+    return { hasRecoveryParam: false, hasTokenHash: false, hasPkceCode: false, hasError: false };
   }
 
   const rawSearch = typeof loc.search === "string" ? loc.search.replace(/^\?/, "") : "";
   const rawHash = typeof loc.hash === "string" ? loc.hash.replace(/^#/, "") : "";
+  const rawPathname = typeof loc.pathname === "string" ? loc.pathname : "";
 
   const searchParams = new URLSearchParams(rawSearch);
   const hashParams = new URLSearchParams(rawHash);
 
   const typeParam = (hashParams.get("type") ?? searchParams.get("type") ?? "").trim().toLowerCase();
-  const hasRecoveryParam = typeParam === "recovery";
+  const isResetRoute = isPasswordResetPathnameOrHash(rawPathname, rawHash);
+  const hasRecoveryParam = typeParam === "recovery" || isResetRoute;
+  const hasTokenHash = Boolean(
+    (searchParams.get("token_hash") ?? hashParams.get("token_hash") ?? "").trim()
+  );
+  const hasPkceCode = Boolean((searchParams.get("code") ?? "").trim());
 
   const rawError = (hashParams.get("error") ?? searchParams.get("error") ?? "").trim().toLowerCase();
   const rawErrorCode = (
@@ -766,6 +908,8 @@ export function inspectSupabaseRecoveryUrlHint(
     if (hasRecoveryParam || isExpiredOrInvalidOtp || rawError === "access_denied") {
       return {
         hasRecoveryParam,
+        hasTokenHash,
+        hasPkceCode,
         hasError: true,
         errorCode: rawErrorCode || rawError || "auth/recovery-link-invalid",
         userMessage:
@@ -776,6 +920,8 @@ export function inspectSupabaseRecoveryUrlHint(
 
   return {
     hasRecoveryParam,
+    hasTokenHash,
+    hasPkceCode,
     hasError: false,
   };
 }
@@ -785,7 +931,8 @@ export function inspectSupabaseRecoveryUrlHint(
  * une fois que Supabase les a consommés (sans jamais recharger la page).
  */
 export function clearSensitiveAuthParamsFromUrl(
-  windowLike?: Pick<Window, "location" | "history">
+  windowLike?: Pick<Window, "location" | "history">,
+  options?: { resetToAuthRoot?: boolean }
 ): void {
   const win = windowLike ?? (typeof window !== "undefined" ? window : undefined);
   if (!win || !win.location || !win.history || typeof win.history.replaceState !== "function") {
@@ -793,14 +940,22 @@ export function clearSensitiveAuthParamsFromUrl(
   }
 
   try {
-    const pathname = win.location.pathname || "/";
+    const rawPathname = win.location.pathname || "/";
+    const pathname =
+      options?.resetToAuthRoot && isPasswordResetPathnameOrHash(rawPathname, "")
+        ? "/"
+        : rawPathname;
     const currentSearch = win.location.search || "";
     const currentHash = win.location.hash || "";
 
     const sensitivePattern =
       /(access_token|refresh_token|provider_token|token_hash|type=recovery|error_code=|error_description=|code=)/i;
 
-    if (!sensitivePattern.test(currentSearch) && !sensitivePattern.test(currentHash)) {
+    if (
+      !options?.resetToAuthRoot &&
+      !sensitivePattern.test(currentSearch) &&
+      !sensitivePattern.test(currentHash)
+    ) {
       return;
     }
 
@@ -1125,6 +1280,13 @@ export interface AttachSupabaseAuthMonitorOptions {
 /**
  * Surveille les événements de session Supabase (`INITIAL_SESSION`, `PASSWORD_RECOVERY`, `SIGNED_IN`,
  * `TOKEN_REFRESHED`, `SIGNED_OUT`, `USER_UPDATED`) et revalide systématiquement chaque session/token côté serveur.
+ *
+ * Garanties MIG-05-FIX-02 :
+ * - Immunisé contre la course `PASSWORD_RECOVERY` vs `INITIAL_SESSION` / `SIGNED_IN`.
+ * - Compatible avec les 3 formats de liens Supabase (fragment implicite `#access_token=...&type=recovery`,
+ *   PKCE `?code=...` sur `/auth/reset-password`, et modèle OTP `?token_hash=...&type=recovery`).
+ * - Résilient au double-montage React `<StrictMode>` tout en exigeant systématiquement une session
+ *   réellement validée côté Supabase (`getUser()`).
  */
 export function attachSupabaseAuthMonitor(options: AttachSupabaseAuthMonitorOptions): () => void {
   const deps = options.deps ?? {};
@@ -1141,9 +1303,19 @@ export function attachSupabaseAuthMonitor(options: AttachSupabaseAuthMonitorOpti
 
   const client = deps.getClient ? deps.getClient() : getSupabaseBrowserClient();
   const initialUrlHint = inspectSupabaseRecoveryUrlHint(deps.locationLike);
+  const exchangeParams = extractInternalRecoveryExchangeParams(deps.locationLike);
+
+  if (initialUrlHint.hasRecoveryParam && !initialUrlHint.hasError) {
+    pendingSupabaseRecoveryHint = true;
+  }
+
   let active = true;
   let seq = 0;
   let inRecoveryFlow = false;
+  // Verrou synchrone empêchant INITIAL_SESSION / SIGNED_IN d'annuler une validation PASSWORD_RECOVERY en vol
+  let recoveryValidationInFlight = false;
+  let recoveryDispatched = false;
+  let tokenHashExchangeInFlight = false;
 
   const validateRecoveryEventSession = async (session: Session | null) => {
     if (!session || !session.access_token) {
@@ -1214,35 +1386,103 @@ export function attachSupabaseAuthMonitor(options: AttachSupabaseAuthMonitorOpti
     };
   };
 
-  const verifyAndDispatch = async (event: AuthChangeEvent, session: Session | null) => {
-    const currentSeq = ++seq;
+  const handleValidatedRecoverySession = async (session: Session | null) => {
+    if (recoveryDispatched) return;
+    recoveryValidationInFlight = true;
+    pendingSupabaseRecoveryHint = true;
+    const check = await validateRecoveryEventSession(session);
+    recoveryValidationInFlight = false;
+    if (!active) return;
 
-    // MIG-04-AUTH-02 : Parcours dédié de récupération de mot de passe Supabase
-    // Ne déconnecte JAMAIS prématurément la session et ne fait jamais confiance à l'URL seule.
-    if (event === "PASSWORD_RECOVERY") {
-      const check = await validateRecoveryEventSession(session);
-      if (!active || currentSeq !== seq) return;
-      if ("code" in check) {
-        inRecoveryFlow = false;
-        options.onPasswordRecoveryInvalid?.({
-          code: check.code,
-          message: check.message,
+    if ("code" in check) {
+      inRecoveryFlow = false;
+      pendingSupabaseRecoveryHint = false;
+      options.onPasswordRecoveryInvalid?.({
+        code: check.code,
+        message: check.message,
+      });
+      return;
+    }
+
+    inRecoveryFlow = true;
+    recoveryDispatched = true;
+    options.onPasswordRecovery?.(check.context);
+  };
+
+  // Support explicite des liens email Supabase au format `?token_hash=...&type=recovery`
+  // (non échangés automatiquement par detectSessionInUrl).
+  if (
+    exchangeParams.tokenHash &&
+    initialUrlHint.hasRecoveryParam &&
+    !initialUrlHint.hasError &&
+    typeof client.auth.verifyOtp === "function"
+  ) {
+    tokenHashExchangeInFlight = true;
+    recoveryValidationInFlight = true;
+    void (async () => {
+      try {
+        const otpRes = await client.auth.verifyOtp({
+          token_hash: exchangeParams.tokenHash!,
+          type: "recovery",
         });
+        tokenHashExchangeInFlight = false;
+        if (!active) return;
+        if (otpRes.error || !otpRes.data?.session) {
+          recoveryValidationInFlight = false;
+          inRecoveryFlow = false;
+          pendingSupabaseRecoveryHint = false;
+          options.onPasswordRecoveryInvalid?.({
+            code: "auth/recovery-link-invalid",
+            message:
+              "Le lien de récupération de mot de passe est invalide ou expiré. Veuillez demander un nouveau lien depuis la page de connexion.",
+          });
+          return;
+        }
+        await handleValidatedRecoverySession(otpRes.data.session);
+      } catch {
+        tokenHashExchangeInFlight = false;
+        recoveryValidationInFlight = false;
+        if (!active) return;
+        inRecoveryFlow = false;
+        pendingSupabaseRecoveryHint = false;
+        options.onPasswordRecoveryInvalid?.({
+          code: "auth/recovery-link-invalid",
+          message:
+            "Impossible de valider le lien de récupération de mot de passe. Veuillez demander un nouveau lien.",
+        });
+      }
+    })();
+  }
+
+  const verifyAndDispatch = async (event: AuthChangeEvent, session: Session | null) => {
+    // MIG-04-AUTH-02 & MIG-05-FIX-02 : Parcours dédié de récupération de mot de passe Supabase.
+    // Ne déconnecte JAMAIS prématurément la session et ne laisse aucun événement concurrent
+    // (INITIAL_SESSION / SIGNED_IN) annuler PASSWORD_RECOVERY.
+    if (event === "PASSWORD_RECOVERY") {
+      if (tokenHashExchangeInFlight) {
         return;
       }
-      inRecoveryFlow = true;
-      options.onPasswordRecovery?.(check.context);
+      await handleValidatedRecoverySession(session);
       return;
     }
 
-    // Pendant la finalisation de la récupération (ex. USER_UPDATED émis par updateUser),
-    // ne pas court-circuiter l'écran de confirmation ni basculer dans l'espace de travail.
-    if (inRecoveryFlow && (event === "USER_UPDATED" || event === "TOKEN_REFRESHED")) {
+    // Tant qu'un échange token_hash ou une validation PASSWORD_RECOVERY est en vol,
+    // ou que l'utilisateur est dans l'écran de saisie du nouveau mot de passe,
+    // bloquer toute bascule intempestive vers le workspace ou erreur prématurée.
+    if (
+      (recoveryValidationInFlight || tokenHashExchangeInFlight || inRecoveryFlow) &&
+      event !== "SIGNED_OUT"
+    ) {
       return;
     }
+
+    const currentSeq = ++seq;
 
     if (event === "SIGNED_OUT") {
       inRecoveryFlow = false;
+      recoveryValidationInFlight = false;
+      recoveryDispatched = false;
+      pendingSupabaseRecoveryHint = false;
       if (!active || currentSeq !== seq) return;
       options.onSessionRevokedOrSignedOut({ event });
       return;
@@ -1252,14 +1492,45 @@ export function attachSupabaseAuthMonitor(options: AttachSupabaseAuthMonitorOpti
       if (!active || currentSeq !== seq) return;
       if (event === "INITIAL_SESSION") {
         if (initialUrlHint.hasError && initialUrlHint.userMessage) {
+          pendingSupabaseRecoveryHint = false;
           options.onPasswordRecoveryInvalid?.({
             code: initialUrlHint.errorCode || "auth/recovery-link-invalid",
             message: initialUrlHint.userMessage,
           });
           return;
         }
+        // Si un code PKCE est présent sur la route de récupération et que GoTrue ne l'a pas encore échangé,
+        // tenter l'échange explicite une seule fois avant de conclure à l'absence de session.
+        if (
+          exchangeParams.pkceCode &&
+          initialUrlHint.hasRecoveryParam &&
+          typeof client.auth.exchangeCodeForSession === "function"
+        ) {
+          recoveryValidationInFlight = true;
+          try {
+            const pkceRes = await client.auth.exchangeCodeForSession(exchangeParams.pkceCode);
+            if (!active) return;
+            if (!pkceRes.error && pkceRes.data?.session) {
+              await handleValidatedRecoverySession(pkceRes.data.session);
+              return;
+            }
+          } catch {
+            // Poursuit vers le refus contrôlé
+          } finally {
+            recoveryValidationInFlight = false;
+          }
+          if (!active) return;
+          pendingSupabaseRecoveryHint = false;
+          options.onPasswordRecoveryInvalid?.({
+            code: "auth/recovery-link-invalid",
+            message:
+              "Le lien de récupération de mot de passe est invalide ou expiré. Veuillez demander un nouveau lien depuis la page de connexion.",
+          });
+          return;
+        }
         if (initialUrlHint.hasRecoveryParam) {
-          // URL contenant type=recovery sans aucune session Supabase valide -> refus explicite
+          // URL contenant type=recovery ou /auth/reset-password sans aucune session Supabase valide -> refus explicite
+          pendingSupabaseRecoveryHint = false;
           options.onPasswordRecoveryInvalid?.({
             code: "auth/recovery-session-missing",
             message:
@@ -1267,6 +1538,7 @@ export function attachSupabaseAuthMonitor(options: AttachSupabaseAuthMonitorOpti
           });
           return;
         }
+        pendingSupabaseRecoveryHint = false;
         options.onNoInitialSession?.();
       } else {
         options.onSessionRevokedOrSignedOut({ event });
@@ -1274,30 +1546,24 @@ export function attachSupabaseAuthMonitor(options: AttachSupabaseAuthMonitorOpti
       return;
     }
 
-    // Si GoTrue émet INITIAL_SESSION juste avant PASSWORD_RECOVERY lors d'un retour de lien recovery,
+    // Si GoTrue émet INITIAL_SESSION ou SIGNED_IN lors d'un retour de lien recovery
+    // (ou après double-montage StrictMode quand GoTrue a déjà consommé le hash URL),
     // valider la session de récupération au lieu d'entrer directement dans le workspace.
-    if (event === "INITIAL_SESSION" && initialUrlHint.hasRecoveryParam && options.onPasswordRecovery) {
-      const check = await validateRecoveryEventSession(session);
-      if (!active || currentSeq !== seq) return;
-      if ("code" in check) {
-        inRecoveryFlow = false;
-        options.onPasswordRecoveryInvalid?.({
-          code: check.code,
-          message: check.message,
-        });
-        return;
-      }
-      inRecoveryFlow = true;
-      options.onPasswordRecovery(check.context);
+    if (
+      (event === "INITIAL_SESSION" || event === "SIGNED_IN") &&
+      (initialUrlHint.hasRecoveryParam || pendingSupabaseRecoveryHint) &&
+      options.onPasswordRecovery
+    ) {
+      await handleValidatedRecoverySession(session);
       return;
     }
 
     try {
       const verified = await verifySupabaseSessionWithServer(session.access_token, deps);
-      if (!active || currentSeq !== seq) return;
+      if (!active || currentSeq !== seq || inRecoveryFlow || recoveryValidationInFlight) return;
       options.onSessionVerified(verified, event);
     } catch (err) {
-      if (!active || currentSeq !== seq) return;
+      if (!active || currentSeq !== seq || inRecoveryFlow || recoveryValidationInFlight) return;
       const authErr =
         err instanceof PdiSupabaseAuthError
           ? err

@@ -679,6 +679,25 @@ describe("SEC-01-FIX-01 : Sécurité Atomique Frontend / Serveur / Auth / Webhoo
     it("E6: Décodage malformé rejeté en toute sécurité", () => {
       expect(isSuspiciousRequestPath("/%E0%A4%A")).toBe(true);
     });
+
+    it("E7: /node_modules/.vite/deps/* rejeté par défaut (prod/staging) mais autorisé uniquement en mode dev Vite sans affaiblir les dotfiles ni le path traversal", () => {
+      expect(isSuspiciousRequestPath("/node_modules/.vite/deps/react.js?v=b76aac1c")).toBe(true);
+      expect(
+        isSuspiciousRequestPath("/node_modules/.vite/deps/react.js?v=b76aac1c", {
+          allowViteDevDeps: true,
+        })
+      ).toBe(false);
+      // Même en dev Vite, tout dotfile imbriqué ou path traversal reste strictement bloqué
+      expect(
+        isSuspiciousRequestPath("/node_modules/.vite/.env", { allowViteDevDeps: true })
+      ).toBe(true);
+      expect(
+        isSuspiciousRequestPath("/node_modules/.vite/../../.env", { allowViteDevDeps: true })
+      ).toBe(true);
+      expect(
+        isSuspiciousRequestPath("/.env", { allowViteDevDeps: true })
+      ).toBe(true);
+    });
   });
 
   // =========================================================================

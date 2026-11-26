@@ -71,13 +71,15 @@ export async function executeSupabaseExclusiveLogin(
 }
 
 /**
- * Flux de récupération de mot de passe exclusif Supabase Auth (MIG-04-AUTH-01-FIX-02).
- * Bloque explicitement si Supabase n'est pas configuré et n'effectue jamais de bascule Firebase.
+ * Flux de récupération de mot de passe exclusif Supabase Auth (MIG-04-AUTH-01-FIX-02 & MIG-05-FIX-02).
+ * Transmet une URL de redirection HTTPS explicite (`/auth/reset-password`) en contexte navigateur,
+ * bloque explicitement si Supabase n'est pas configuré et n'effectue jamais de bascule Firebase.
  */
 export async function executeSupabaseExclusivePasswordReset(
   email: string,
   options: {
     supabaseAvailable: boolean;
+    redirectTo?: string;
     resetFn?: (email: string) => Promise<void>;
   }
 ): Promise<void> {
@@ -96,8 +98,14 @@ export async function executeSupabaseExclusivePasswordReset(
       400
     );
   }
-  const resetImpl = options.resetFn ?? sendSupabasePasswordResetEmail;
-  await resetImpl(cleaned);
+  if (options.resetFn) {
+    await options.resetFn(cleaned);
+    return;
+  }
+  await sendSupabasePasswordResetEmail(
+    cleaned,
+    options.redirectTo ? { redirectTo: options.redirectTo } : undefined
+  );
 }
 
 /**

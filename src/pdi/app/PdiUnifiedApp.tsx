@@ -97,7 +97,9 @@ import type {
 } from "../../types/pdiAuthTypes";
 import {
   attachSupabaseAuthMonitor,
+  clearPendingSupabaseRecoveryHint,
   clearSensitiveAuthParamsFromUrl,
+  inspectSupabaseRecoveryUrlHint,
   logoutSupabase,
   updateSupabaseUserPassword,
   type SupabaseClientAuthUser,
@@ -377,9 +379,9 @@ export type WorkspaceAccessDecision = {
 /**
  * BLOC C1 & BLOC B — Garde central unique d'accès au workspace PD&I.
  * Vérifie simultanément les 5 invariants :
- * 1. session Firebase valide (currentAuthUser.uid présent et cohérent)
- * 2. token et claims vérifiés (session.status === "active", session.canAccessWorkspace === true)
- * 3. profil profiles/{uid} existant
+ * 1. session Supabase Auth valide (currentAuthUser.uid présent et cohérent)
+ * 2. token et claims vérifiés côté serveur (session.status === "active", session.canAccessWorkspace === true)
+ * 3. profil public.profiles existant
  * 4. profile.status === "active"
  * 5. module autorisé selon clientAuthorization.ts
  * Isole strictement les comptes en "pending_activation" vers l'écran d'activation uniquement.
@@ -669,7 +671,7 @@ export default function PdiUnifiedApp() {
   const [feedbackModalOpen, setFeedbackModalOpen] = useState(false);
   const sandboxActive = isStagingSandboxMode();
 
-  // BLOC C2 : État de résolution initiale de l'authentification et du profil Firestore
+  // BLOC C2 : État de résolution initiale de l'authentification Supabase et du profil serveur public.profiles
   const [authReady, setAuthReady] = useState<boolean>(() => sandboxActive);
   const authReadyRef = React.useRef<boolean>(sandboxActive);
   const [verifiedSession, setVerifiedSession] = useState<WorkspaceSessionResolution | null>(() => {
@@ -710,6 +712,18 @@ export default function PdiUnifiedApp() {
       return "guest";
     }
   });
+
+  // MIG-05-FIX-02 : Mémorise l'intention de restauration d'une vue admin après F5 SANS jamais la rendre
+  // avant que le serveur n'ait confirmé `verified.isSuperAdmin === true` (SEC-01-FIX-03 préservé).
+  const intendedAdminModuleRef = React.useRef<PdiModule | null>((() => {
+    if (sandboxActive) return null;
+    try {
+      const saved = window.localStorage.getItem(resolveScopedStorageKey("pdi.activeModule.v1")) as PdiModule;
+      return isRestrictedAdminView(saved) ? saved : null;
+    } catch {
+      return null;
+    }
+  })());
 
   const [activeModule, setActiveModule] = useState<PdiModule>(() => {
     try {
@@ -902,14 +916,37 @@ export default function PdiUnifiedApp() {
     else if (renamingTabId && !tabs.some((t) => t.id === renamingTabId)) setRenamingTabId(null);
   };
 
+  // MIG-05-FIX-02 : Détecte un retour de lien de récupération Supabase (route /auth/reset-password, type=recovery, token_hash, code ou erreur OTP)
+  const initialRecoveryCallbackDetected = useMemo(() => {
+    if (sandboxActive) return false;
+    try {
+      const hint = inspectSupabaseRecoveryUrlHint(window.location);
+      return Boolean(hint.hasRecoveryParam || hint.hasError || hint.hasTokenHash);
+    } catch {
+      return false;
+    }
+  }, [sandboxActive]);
+
   // Rechargement : conserve dans le module ISO ou Accueil dans l'application uniquement si session résolue
   const [stage, setStage] = useState<"landing" | "auth" | "app">((): "landing" | "auth" | "app" => {
     if (sandboxActive) {
       return "app";
     }
     try {
+      const recoveryHint = inspectSupabaseRecoveryUrlHint(window.location);
+      if (recoveryHint.hasRecoveryParam || recoveryHint.hasError || recoveryHint.hasTokenHash) {
+        return "auth";
+      }
+      const pathname = window.location.pathname.toLowerCase();
       const hash = window.location.hash.toLowerCase();
       const search = window.location.search.toLowerCase();
+      if (
+        pathname.includes("/auth/reset-password") ||
+        pathname.includes("/reset-password") ||
+        hash.includes("reset-password")
+      ) {
+        return "auth";
+      }
       if (hash.includes("landing") || search.includes("landing") || search.includes("commercial")) {
         return "landing";
       }
@@ -928,7 +965,7 @@ export default function PdiUnifiedApp() {
   }, [stage]);
 
   const [authPageTab, setAuthPageTab] = useState<"login" | "register" | "activation">("login");
-  // MIG-04-AUTH-02 : État dédié à la récupération de mot de passe Supabase (uniquement sur session validée)
+  // MIG-04-AUTH-02 & MIG-05-FIX-02 : État dédié à la récupération de mot de passe Supabase (uniquement sur session validée)
   const [passwordRecoveryActive, setPasswordRecoveryActive] = useState(false);
   const [passwordRecoveryEmail, setPasswordRecoveryEmail] = useState<string | null>(null);
   const [passwordRecoveryError, setPasswordRecoveryError] = useState<string | null>(null);
@@ -992,7 +1029,7 @@ export default function PdiUnifiedApp() {
     [getEffectiveAuthUser]
   );
 
-  // BLOC C1 : Aucune ouverture de session simulée sans authentification Firebase et profil actif
+  // BLOC C1 : Aucune ouverture de session simulée sans authentification Supabase et profil actif
   const startDemoSession = () => {
     tryEnterWorkspace("isometric");
   };
@@ -1230,7 +1267,7 @@ export default function PdiUnifiedApp() {
         setStage("auth");
         clearSensitiveAuthParamsFromUrl();
       },
-      onSessionVerified: (verified) => {
+      onSessionVerified: (verified, event) => {
         if (passwordRecoveryActiveRef.current) {
           return;
         }
@@ -1258,11 +1295,34 @@ export default function PdiUnifiedApp() {
           ...verified.profile,
           role: verified.isSuperAdmin ? "super_admin" : verified.profile.role,
         });
-        setActiveModule((prev) =>
-          getAuthorizedView(prev, verified.isSuperAdmin, "isometric") as PdiModule
-        );
+
+        const intendedAdminModule = intendedAdminModuleRef.current;
+        intendedAdminModuleRef.current = null;
+
+        if (verified.isSuperAdmin && intendedAdminModule) {
+          setActiveModule(intendedAdminModule);
+        } else {
+          setActiveModule((prev) =>
+            getAuthorizedView(prev, verified.isSuperAdmin, "isometric") as PdiModule
+          );
+        }
+
+        // MIG-05-FIX-02 : Si l'utilisateur recharge sur #auth avec une session Supabase déjà valide et vérifiée
+        // (hors flux de récupération de mot de passe), rouvrir directement son espace SaaS autorisé.
+        if (
+          event === "INITIAL_SESSION" &&
+          stageRef.current === "auth" &&
+          !passwordRecoveryActiveRef.current &&
+          verified.sessionResolution.canAccessWorkspace
+        ) {
+          const targetMod = verified.isSuperAdmin
+            ? intendedAdminModule || "super_admin_console"
+            : "home";
+          tryEnterWorkspace(targetMod, verified.sessionResolution);
+        }
       },
       onNoInitialSession: () => {
+        intendedAdminModuleRef.current = null;
         clearToGuestUnauthenticated();
       },
       onSessionRevokedOrSignedOut: (reason) => {
@@ -1270,12 +1330,13 @@ export default function PdiUnifiedApp() {
           // Conserve l'écran de confirmation jusqu'au clic de retour vers la connexion normale
           return;
         }
+        intendedAdminModuleRef.current = null;
         clearToGuestUnauthenticated(
           reason.event === "SERVER_DENIED" ? reason.message : undefined
         );
       },
     });
-  }, []);
+  }, [tryEnterWorkspace]);
 
   // Règle SEC-01-FIX-03 : Gardien permanent des vues administratives restreintes
   useEffect(() => {
@@ -1325,16 +1386,20 @@ export default function PdiUnifiedApp() {
       clearInterval(intervalId);
     };
   }, [stage, handleLogoutToHome]);
-  useEffect(() => { 
-    try { 
-      window.localStorage.setItem(resolveScopedStorageKey("pdi.activeModule.v1"), activeModule);
+  useEffect(() => {
+    try {
+      // MIG-05-FIX-02 : Ne pas écraser pdi.activeModule.v1 avant la vérification initiale de session
+      // afin de préserver la restauration du module Super Admin lors d'un rechargement F5.
+      if (authReady) {
+        window.localStorage.setItem(resolveScopedStorageKey("pdi.activeModule.v1"), activeModule);
+      }
       window.dispatchEvent(
         new CustomEvent("pdi:active-module-changed", {
           detail: { activeModule },
         })
       );
-    } catch {} 
-  }, [activeModule, authMode, pdiUserProfile.email]);
+    } catch {}
+  }, [activeModule, authMode, authReady, pdiUserProfile.email]);
   useEffect(() => { const tab = workspaceTabs.find(t=>t.id===activeTabId); if(tab && activeModule === "home") setActiveModule(tab.module); }, []);
 
   // PATCH 017K : retour reel, alimente par la pile de navigation.
@@ -1472,16 +1537,26 @@ export default function PdiUnifiedApp() {
 
   const handleExitPasswordRecovery = () => {
     passwordRecoveryActiveRef.current = false;
+    clearPendingSupabaseRecoveryHint();
     setPasswordRecoveryActive(false);
     setPasswordRecoveryEmail(null);
     setPasswordRecoveryError(null);
     setAuthPageTab("login");
     setStage("auth");
+    clearSensitiveAuthParamsFromUrl(undefined, { resetToAuthRoot: true });
     void logoutSupabase().catch(() => {});
   };
 
   // STAGE 2 : PAGE CONNEXION / AUTHENTIFICATION
   if (stage === "auth") {
+    if (initialRecoveryCallbackDetected && !authReady && !passwordRecoveryActive && !passwordRecoveryError) {
+      return (
+        <>
+          {sandboxBannerNode}
+          <PdiLoginLoadingOverlay message="Vérification sécurisée du lien de récupération Supabase..." />
+        </>
+      );
+    }
     return (
       <>
         {sandboxBannerNode}
@@ -1528,21 +1603,29 @@ export default function PdiUnifiedApp() {
     return (
       <>
         {sandboxBannerNode}
-        <PdiAuthPage
-          initialTab={renderGuard.authPageTab}
-          passwordRecoveryMode={passwordRecoveryActive}
-          passwordRecoveryEmail={passwordRecoveryEmail}
-          passwordRecoveryError={passwordRecoveryError}
-          onExitPasswordRecovery={handleExitPasswordRecovery}
-          onBackToLanding={() => {
-            if (passwordRecoveryActive) {
-              handleExitPasswordRecovery();
-            }
-            setStage("landing");
-            try { window.location.hash = "landing"; } catch {}
-          }}
-          onSuccess={handleAuthSuccess}
-        />
+        <React.Suspense
+          fallback={
+            <div className="min-h-screen bg-[#070B12] flex items-center justify-center text-cyan-400 font-bold text-xs">
+              Chargement de l&apos;interface de connexion...
+            </div>
+          }
+        >
+          <PdiAuthPage
+            initialTab={renderGuard.authPageTab}
+            passwordRecoveryMode={passwordRecoveryActive}
+            passwordRecoveryEmail={passwordRecoveryEmail}
+            passwordRecoveryError={passwordRecoveryError}
+            onExitPasswordRecovery={handleExitPasswordRecovery}
+            onBackToLanding={() => {
+              if (passwordRecoveryActive) {
+                handleExitPasswordRecovery();
+              }
+              setStage("landing");
+              try { window.location.hash = "landing"; } catch {}
+            }}
+            onSuccess={handleAuthSuccess}
+          />
+        </React.Suspense>
       </>
     );
   }

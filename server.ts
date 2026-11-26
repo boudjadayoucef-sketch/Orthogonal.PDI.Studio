@@ -151,8 +151,15 @@ export function createPdiExpressApp(options: CreatePdiExpressAppOptions = {}): e
   app.disable("x-powered-by");
 
   // Protection Globale contre Path Traversal, Dotfiles et sondes de fichiers sensibles (SEC-01-FIX-02)
+  // En mode serveur de développement Vite (hors mode strict/production/Serverless), autoriser uniquement
+  // les dépendances pré-bundlées `/node_modules/.vite/...` indispensables au chargement de React dans la preview.
+  const allowViteDevDeps =
+    !deliveryMode.serveStaticDist &&
+    !deliveryMode.strictSecurityMode &&
+    runtimeEnv.VERCEL !== "1" &&
+    runtimeEnv.VERCEL !== "true";
   app.use((req, res, next) => {
-    if (isSuspiciousRequestPath(req.originalUrl || req.url)) {
+    if (isSuspiciousRequestPath(req.originalUrl || req.url, { allowViteDevDeps })) {
       return res.status(403).type("text/plain").send("Forbidden: Invalid request path or file probe");
     }
     next();

@@ -423,7 +423,19 @@ export function validateRedirectUrl(
 // 5.B PATH TRAVERSAL, DOTFILES & SENSITIVE FILE PROBE PROTECTION
 // =========================================================================
 
-export function isSuspiciousRequestPath(rawUrl: string | undefined | null): boolean {
+export interface SuspiciousRequestPathOptions {
+  /**
+   * Autorise exclusivement les dépendances pré-bundlées Vite (`/node_modules/.vite/...`)
+   * lorsque le serveur Express sert le middleware Vite en développement local / preview AI Studio.
+   * Défaut : `false` (rejet strict maintenu en production, staging, dist statique et Serverless).
+   */
+  allowViteDevDeps?: boolean;
+}
+
+export function isSuspiciousRequestPath(
+  rawUrl: string | undefined | null,
+  options: SuspiciousRequestPathOptions = {}
+): boolean {
   if (!rawUrl || typeof rawUrl !== "string") return false;
 
   // 1. Rejet immédiat des octets nuls et backslashes
@@ -457,11 +469,20 @@ export function isSuspiciousRequestPath(rawUrl: string | undefined | null): bool
   }
 
   // 4. Rejet des dotfiles et dossiers cachés (/.env, /.git, /.htaccess...), sauf /.well-known/
+  //    et, uniquement en mode dev Vite explicite (`allowViteDevDeps: true`), `/node_modules/.vite/...`.
   const segments = lower.split("/").filter(Boolean);
   for (let i = 0; i < segments.length; i++) {
     const seg = segments[i];
     if (seg.startsWith(".")) {
       if (i === 0 && seg === ".well-known") continue;
+      if (
+        options.allowViteDevDeps === true &&
+        i === 1 &&
+        segments[0] === "node_modules" &&
+        seg === ".vite"
+      ) {
+        continue;
+      }
       return true;
     }
   }
@@ -1047,6 +1068,11 @@ export function resolveCspFrameAncestors(
   // 2. If CSP_FRAME_ANCESTORS is not configured, use safe environment defaults
   if (rawCspAncestors === undefined || rawCspAncestors.trim() === "") {
     if (!isProd) {
+      ancestorsSet.add("https://*.google.com");
+      ancestorsSet.add("https://*.usercontent.goog");
+      if (env.APP_URL && /^https:\/\/ais-dev-[a-z0-9-]+\.[a-z0-9.-]+\.run\.app$/i.test(env.APP_URL.trim())) {
+        ancestorsSet.add(env.APP_URL.trim().replace(/^https:\/\/ais-dev-/i, "https://ais-pre-"));
+      }
       ancestorsSet.add("http://localhost:3000");
       ancestorsSet.add("http://127.0.0.1:3000");
     }

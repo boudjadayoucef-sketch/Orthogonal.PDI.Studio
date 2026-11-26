@@ -363,8 +363,11 @@ export function parseAndValidateSupabaseJwtClaims(
   }
 
   if (options.expectedSupabaseUrl && options.expectedSupabaseUrl.trim()) {
-    const expectedIss = `${options.expectedSupabaseUrl.trim().replace(/\/+$/, "")}/auth/v1`;
-    const actualIss = typeof payload.iss === "string" ? payload.iss.trim().replace(/\/+$/, "") : "";
+    const expectedIss = `${options.expectedSupabaseUrl.trim().replace(/\/+$/, "").toLowerCase()}/auth/v1`;
+    const actualIss =
+      typeof payload.iss === "string"
+        ? payload.iss.trim().replace(/\/+$/, "").toLowerCase()
+        : "";
     if (!actualIss || actualIss !== expectedIss) {
       return {
         ok: false,
