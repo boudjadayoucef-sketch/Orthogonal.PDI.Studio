@@ -7,6 +7,6 @@
  * - Préserve tous les middlewares de sécurité, CORS, rate limiting, Sandbox et fail-closed
  */
 
-import vercelApiHandler from "../src/server/vercelHandler.ts";
+import vercelApiHandler from "../src/server/vercelHandler.js";
 
 export default vercelApiHandler;

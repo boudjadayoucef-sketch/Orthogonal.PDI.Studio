@@ -14,7 +14,7 @@
  */
 
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
-import { containsExposedSupabaseSecretCredential } from "../security/sec01SecurityService.ts";
+import { containsExposedSupabaseSecretCredential } from "../security/sec01SecurityService.js";
 
 export type SupabaseAdminKeyFormat = "sb_secret" | "service_role_jwt";
 

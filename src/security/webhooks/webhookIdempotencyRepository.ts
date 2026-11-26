@@ -19,7 +19,7 @@ import { Timestamp } from "@google-cloud/firestore";
 import {
   deriveWebhookEventDocumentId,
   parseFirestoreTimeMs
-} from "./pendingOrderRepository.ts";
+} from "./pendingOrderRepository.js";
 import {
   PAYMENT_WEBHOOK_EVENTS_COLLECTION,
   type AcquireWebhookEventLeaseInput,
@@ -34,7 +34,7 @@ import {
   type WebhookFirestoreTransaction,
   type WebhookIdempotencyEventRecord,
   type WebhookIdempotencyEventStatus
-} from "./webhookTypes.ts";
+} from "./webhookTypes.js";
 
 export { deriveWebhookEventDocumentId, parseFirestoreTimeMs };
 

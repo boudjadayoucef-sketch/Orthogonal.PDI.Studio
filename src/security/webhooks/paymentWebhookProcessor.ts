@@ -14,28 +14,28 @@
  *   and never activates subscriptions or Custom Claims.
  */
 
-import type { WebhookIdempotencyRegistry } from "../sec01SecurityService.ts";
-import { evaluatePaddleEventPolicy } from "./paddleEventPolicy.ts";
+import type { WebhookIdempotencyRegistry } from "../sec01SecurityService.js";
+import { evaluatePaddleEventPolicy } from "./paddleEventPolicy.js";
 import {
   createPendingOrderRepository,
   isValidInternalOrderIdFormat,
   type PendingOrderRepository
-} from "./pendingOrderRepository.ts";
+} from "./pendingOrderRepository.js";
 import {
   extractPaddleWebhookIdentifiers,
   validateAndAssociatePaddleOrder
-} from "./paymentOrderAssociation.ts";
+} from "./paymentOrderAssociation.js";
 import {
   createWebhookIdempotencyRepository,
   type WebhookIdempotencyRepository
-} from "./webhookIdempotencyRepository.ts";
+} from "./webhookIdempotencyRepository.js";
 import type {
   OrderAssociationErrorCode,
   WebhookAdminAuth,
   WebhookFirestoreCollectionRef,
   WebhookFirestoreDb,
   WebhookFirestoreDocRef
-} from "./webhookTypes.ts";
+} from "./webhookTypes.js";
 
 export type {
   WebhookFirestoreDocRef,

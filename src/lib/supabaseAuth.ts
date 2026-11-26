@@ -253,6 +253,10 @@ function mapErrorCodeToFrenchMessage(code: string, fallbackMessage?: string): st
       return "L'authentification serveur Supabase est désactivée en mode Sandbox.";
     case "server/supabase-auth-unconfigured":
       return "La vérification serveur Supabase n'est pas configurée sur cet environnement.";
+    case "server/configuration-error":
+      return "La configuration de sécurité du serveur est invalide. Vérifiez les variables d'environnement serveur.";
+    case "server/unavailable":
+      return "Le serveur de vérification Supabase est temporairement indisponible (erreur serveur). Veuillez réessayer dans quelques instants.";
     default:
       return fallbackMessage || "Authentification Supabase refusée par le serveur.";
   }
@@ -383,7 +387,8 @@ export async function verifySupabaseSessionWithServer(
   }
 
   if (!response.ok || body.ok !== true || !body.session) {
-    const code = typeof body.code === "string" ? body.code : "auth/invalid-token";
+    const defaultCode = response.status >= 500 ? "server/unavailable" : "auth/invalid-token";
+    const code = typeof body.code === "string" ? body.code : defaultCode;
     const serverMsg = typeof body.error === "string" ? body.error : undefined;
     throw new PdiSupabaseAuthError(
       mapErrorCodeToFrenchMessage(code, serverMsg),

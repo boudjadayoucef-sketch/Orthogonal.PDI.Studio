@@ -15,16 +15,16 @@
  *   7. Recording the authorized association (`recordOrderTransactionAssociation`) with `status: "pending"`.
  */
 
-import { evaluatePaddleEventPolicy } from "./paddleEventPolicy.ts";
+import { evaluatePaddleEventPolicy } from "./paddleEventPolicy.js";
 import {
   isValidInternalOrderIdFormat,
   type PendingOrderRepository
-} from "./pendingOrderRepository.ts";
+} from "./pendingOrderRepository.js";
 import type {
   ExtractedPaddleWebhookIdentifiers,
   OrderAssociationValidationResult,
   WebhookAdminAuth
-} from "./webhookTypes.ts";
+} from "./webhookTypes.js";
 
 export interface PaymentOrderAssociationDeps {
   repository: PendingOrderRepository;

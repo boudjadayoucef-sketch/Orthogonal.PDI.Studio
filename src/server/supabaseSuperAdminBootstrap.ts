@@ -25,8 +25,8 @@
  */
 
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { isStagingSandboxMode } from "../lib/stagingSandbox.ts";
-import { sanitizeSupabaseAdminError } from "./supabaseAdmin.ts";
+import { isStagingSandboxMode } from "../lib/stagingSandbox.js";
+import { sanitizeSupabaseAdminError } from "./supabaseAdmin.js";
 
 export const AUTHORIZED_SUPABASE_SUPER_ADMIN_EMAIL = "orthogonaleng@gmail.com" as const;
 export const SUPABASE_SUPER_ADMIN_BOOTSTRAP_ENV_FLAG =

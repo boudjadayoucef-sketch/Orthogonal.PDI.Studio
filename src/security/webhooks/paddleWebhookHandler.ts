@@ -11,8 +11,8 @@
  */
 
 import type { Request, Response } from "express";
-import { authenticatePaddleWebhookRequest } from "../webhookAuth.ts";
-import type { PaymentWebhookProcessor } from "./paymentWebhookProcessor.ts";
+import { authenticatePaddleWebhookRequest } from "../webhookAuth.js";
+import type { PaymentWebhookProcessor } from "./paymentWebhookProcessor.js";
 
 export interface RawBodyWebhookRequest extends Request {
   rawBody?: string;

@@ -1,16 +1,16 @@
-import { Request, Response, NextFunction } from 'express';
-import { getServerAdminAuth } from '../lib/firebase-admin.ts';
-import { DecodedIdToken } from 'firebase-admin/auth';
+import type { Request, Response, NextFunction } from 'express';
+import { getServerAdminAuth } from '../lib/firebase-admin.js';
+import type { DecodedIdToken } from 'firebase-admin/auth';
 import {
   isStagingSandboxMode,
   isSyntheticSandboxToken,
   isSyntheticSandboxUid,
-} from '../lib/stagingSandbox.ts';
+} from '../lib/stagingSandbox.js';
 import {
   isLikelySupabaseAccessToken,
   type SupabaseSessionVerificationResult,
   type SupabaseVerifiedSession,
-} from '../server/supabaseAuth.ts';
+} from '../server/supabaseAuth.js';
 
 export interface AuthRequest extends Request {
   user?: DecodedIdToken;

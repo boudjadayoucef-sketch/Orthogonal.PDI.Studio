@@ -1,7 +1,7 @@
 import { initializeApp, getApps, getApp } from 'firebase-admin/app';
 import { getAuth } from 'firebase-admin/auth';
 import { Firestore } from '@google-cloud/firestore';
-import { isStagingSandboxMode, resolvePdiEnvironmentMode } from './stagingSandbox.ts';
+import { isStagingSandboxMode, resolvePdiEnvironmentMode } from './stagingSandbox.js';
 
 export const EXPECTED_SERVER_PROJECT_ID = 'graphical-router-x18qq';
 export const EXPECTED_SERVER_DATABASE_ID =
@@ -658,7 +658,33 @@ export function initializeServerFirebaseAdminRuntime(
   };
 }
 
-const activeServerFirebaseRuntime = initializeServerFirebaseAdminRuntime();
+function bootstrapActiveServerFirebaseRuntime(): ServerFirebaseAdminRuntime {
+  const isVercelRuntime =
+    typeof process !== 'undefined' &&
+    (process.env?.VERCEL === '1' || process.env?.VERCEL === 'true');
+  if (!isVercelRuntime) {
+    return initializeServerFirebaseAdminRuntime();
+  }
+  try {
+    return initializeServerFirebaseAdminRuntime();
+  } catch (err) {
+    console.warn(
+      '[VERCEL-API-01] Firebase Admin top-level initialization disabled (fail-closed) on Vercel:',
+      err instanceof Error ? err.message : 'configuration unavailable'
+    );
+    return {
+      sandboxDisabled: false,
+      runtimeDisabled: true,
+      blockReason: 'INCOMPLETE_PDI_ENV',
+      config: null,
+      adminApp: createSandboxDisabledServerProxy<ReturnType<typeof initializeApp>>('adminApp'),
+      adminAuth: createSandboxDisabledServerProxy<ReturnType<typeof getAuth>>('adminAuth'),
+      adminDb: createSandboxDisabledServerProxy<Firestore>('adminDb')
+    };
+  }
+}
+
+const activeServerFirebaseRuntime = bootstrapActiveServerFirebaseRuntime();
 
 export const isServerFirebaseSandboxDisabled = activeServerFirebaseRuntime.sandboxDisabled;
 export const isServerFirebaseRuntimeDisabled = activeServerFirebaseRuntime.runtimeDisabled;

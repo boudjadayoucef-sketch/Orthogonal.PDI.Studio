@@ -13,13 +13,13 @@
  */
 
 import type { Request, Response, NextFunction, RequestHandler } from "express";
-import { getServerAdminAuth } from "../../lib/firebase-admin.ts";
-import type { PdiAccountType, PdiSubscriptionPlan } from "../../lib/firebase.ts";
+import { getServerAdminAuth } from "../../lib/firebase-admin.js";
+import type { PdiAccountType, PdiSubscriptionPlan } from "../../types/pdiAuthTypes.js";
 import {
   getPaymentConfigForCountry,
   type PdiPaymentProvider
-} from "../../pdi/payment/pdiPaymentGateway.ts";
-import type { PendingOrderRepository } from "../webhooks/pendingOrderRepository.ts";
+} from "../../pdi/payment/pdiPaymentGateway.js";
+import type { PendingOrderRepository } from "../webhooks/pendingOrderRepository.js";
 
 export interface VerifiedOrderTokenClaims {
   uid?: string;

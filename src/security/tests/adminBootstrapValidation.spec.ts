@@ -2935,7 +2935,7 @@ describe('AUTH-ADMIN-05-FIX-06 à FIX-10 : Suite de validation unitaire du Boots
       // 3. Vérification statique de l'ordre de chargement dotenv dans server.ts (FIX-02-F)
       const serverSource = fs.readFileSync(resolve(process.cwd(), 'server.ts'), 'utf-8');
       const dotenvImportIndex = serverSource.indexOf('import "dotenv/config";');
-      const firebaseAdminImportIndex = serverSource.indexOf('./src/lib/firebase-admin.ts');
+      const firebaseAdminImportIndex = serverSource.indexOf('./src/lib/firebase-admin');
       expect(dotenvImportIndex).toBeGreaterThanOrEqual(0);
       expect(firebaseAdminImportIndex).toBeGreaterThan(dotenvImportIndex);
       expect(serverSource).not.toContain('dotenv.config()');

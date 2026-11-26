@@ -25,12 +25,12 @@ import {
   isStagingSandboxMode,
   isSyntheticSandboxToken,
   isSyntheticSandboxUid,
-} from "../lib/stagingSandbox.ts";
+} from "../lib/stagingSandbox.js";
 import {
   createSupabaseAdminClient,
   sanitizeSupabaseAdminError,
   SupabaseAdminConfigError,
-} from "./supabaseAdmin.ts";
+} from "./supabaseAdmin.js";
 import {
   BLOCKED_NEGATIVE_PROFILE_STATUSES,
   isEmailConfirmed,
@@ -40,7 +40,7 @@ import {
   type BootstrapProfileRecord,
   type SupabaseProfileRole,
   type SupabaseProfileStatus,
-} from "./supabaseSuperAdminBootstrap.ts";
+} from "./supabaseSuperAdminBootstrap.js";
 
 export interface SupabaseVerifiedProfilePayload {
   id: string;

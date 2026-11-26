@@ -16,7 +16,7 @@
  */
 
 import crypto from "node:crypto";
-import type { PdiPaymentProvider } from "../../pdi/payment/pdiPaymentGateway.ts";
+import type { PdiPaymentProvider } from "../../pdi/payment/pdiPaymentGateway.js";
 import {
   AUTHORITATIVE_PENDING_ORDER_COLLECTION,
   PAYMENT_WEBHOOK_EVENTS_COLLECTION,
@@ -27,7 +27,7 @@ import {
   type RecordOrderAssociationInput,
   type WebhookFirestoreDb,
   type WebhookFirestoreTransaction
-} from "./webhookTypes.ts";
+} from "./webhookTypes.js";
 
 export interface PendingOrderRepository {
   createPendingOrder(input: CreateAuthoritativePendingOrderInput): Promise<AuthoritativePendingOrder>;

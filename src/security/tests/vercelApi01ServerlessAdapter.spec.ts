@@ -745,4 +745,69 @@ describe("VERCEL-API-01 — Raccordement du serveur Express à Vercel Serverless
     });
     expect(mockViteMiddlewares).not.toHaveBeenCalled();
   });
+
+  it("10. Compatibilité stricte Vercel Node ESM (@vercel/node) : zéro import relatif .ts dans le graphe serveur, zéro dépendance client firebase.ts et classification claire des erreurs HTTP 5xx", async () => {
+    const rootDir = process.cwd();
+    const visited = new Set<string>();
+    const violations: string[] = [];
+
+    const walkServerGraph = (filePath: string) => {
+      const abs = path.resolve(filePath);
+      if (visited.has(abs) || !fs.existsSync(abs)) {
+        return;
+      }
+      visited.add(abs);
+      const src = fs.readFileSync(abs, "utf-8");
+      const re = /(?:from|import)\s+['"](\.\.?\/[^'"]+)['"]/g;
+      let match: RegExpExecArray | null;
+      while ((match = re.exec(src)) !== null) {
+        const spec = match[1];
+        const relFile = path.relative(rootDir, abs);
+        if (spec.endsWith(".ts") || !/\.[a-z]+$/i.test(spec)) {
+          violations.push(`${relFile} -> ${spec}`);
+        }
+        let target = path.resolve(path.dirname(abs), spec);
+        if (!fs.existsSync(target) && target.endsWith(".js")) {
+          target = `${target.slice(0, -3)}.ts`;
+        }
+        walkServerGraph(target);
+      }
+    };
+
+    walkServerGraph(path.join(rootDir, "api", "index.ts"));
+
+    // Aucun import relatif .ts ou sans extension ne doit subsister (sinon ERR_MODULE_NOT_FOUND sur Vercel ESM)
+    expect(violations).toEqual([]);
+    // Le graphe serveur ne doit jamais référencer le SDK navigateur client src/lib/firebase.ts
+    const relVisited = Array.from(visited).map((f) => path.relative(rootDir, f));
+    expect(relVisited).not.toContain("src/lib/firebase.ts");
+
+    // Vérifier que verifySupabaseSessionWithServer distingue un HTTP 500 non-JSON (ex: crash serverless)
+    // d'un refus d'authentification 401 (auth/invalid-token)
+    const { verifySupabaseSessionWithServer, PdiSupabaseAuthError } = await import(
+      "../../lib/supabaseAuth.ts"
+    );
+    const mockFetch500 = vi.fn(async () =>
+      new Response("A server error has occurred\nFUNCTION_INVOCATION_FAILED", {
+        status: 500,
+        headers: { "Content-Type": "text/plain" },
+      })
+    );
+    let caughtError: unknown;
+    try {
+      await verifySupabaseSessionWithServer("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.sig", {
+        fetchImpl: mockFetch500 as unknown as typeof fetch,
+      });
+    } catch (err) {
+      caughtError = err;
+    }
+    expect(caughtError).toBeInstanceOf(PdiSupabaseAuthError);
+    expect((caughtError as InstanceType<typeof PdiSupabaseAuthError>).code).toBe(
+      "server/unavailable"
+    );
+    expect((caughtError as InstanceType<typeof PdiSupabaseAuthError>).status).toBe(500);
+    expect((caughtError as InstanceType<typeof PdiSupabaseAuthError>).message).toContain(
+      "indisponible"
+    );
+  });
 });

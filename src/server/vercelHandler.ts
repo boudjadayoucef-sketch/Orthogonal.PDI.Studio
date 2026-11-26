@@ -18,13 +18,13 @@ import type express from "express";
 import {
   createPdiExpressApp,
   type PdiServerDependencies,
-} from "../../server.ts";
-import { validateOriginEntry } from "../security/sec01SecurityService.ts";
+} from "../../server.js";
+import { validateOriginEntry } from "../security/sec01SecurityService.js";
 import {
   SupabaseAdminConfigError,
   validateSupabaseAdminConfig,
   type SupabaseAdminConfigErrorCode,
-} from "./supabaseAdmin.ts";
+} from "./supabaseAdmin.js";
 
 export interface VercelSupabaseServerEnvStatus {
   configured: boolean;

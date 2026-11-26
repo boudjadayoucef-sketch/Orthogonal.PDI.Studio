@@ -9,8 +9,8 @@
  * - Contains zero business logic, zero HTTP logic, and zero Firebase global state.
  */
 
-import type { PdiAccountType, PdiSubscriptionPlan } from "../../lib/firebase.ts";
-import type { PdiPaymentProvider, PdiPaymentTransaction } from "../../pdi/payment/pdiPaymentGateway.ts";
+import type { PdiAccountType, PdiSubscriptionPlan } from "../../types/pdiAuthTypes.js";
+import type { PdiPaymentProvider, PdiPaymentTransaction } from "../../pdi/payment/pdiPaymentGateway.js";
 
 export const AUTHORITATIVE_PENDING_ORDER_COLLECTION = "payment_transactions" as const;
 

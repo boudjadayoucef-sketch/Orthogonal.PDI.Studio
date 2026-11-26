@@ -18,19 +18,19 @@ import {
   requireSuperAdmin,
   requireEmailVerified,
   createRejectInStagingSandboxMode,
-  AuthRequest,
-} from "./src/middleware/auth.ts";
+  type AuthRequest,
+} from "./src/middleware/auth.js";
 import {
   getServerAdminAuth,
   getServerAdminDb,
   isServerFirebaseRuntimeDisabled,
   shouldBlockServerFirebaseInit,
-} from "./src/lib/firebase-admin.ts";
+} from "./src/lib/firebase-admin.js";
 import {
   buildPublicBrowserRuntimeConfig,
   injectPublicRuntimeConfigIntoHtml,
   isStagingSandboxMode,
-} from "./src/lib/stagingSandbox.ts";
+} from "./src/lib/stagingSandbox.js";
 import { 
   createBoundedRateLimiter,
   verifyProductionConfig,
@@ -43,21 +43,21 @@ import {
   createStandardJsonParser,
   createStandardUrlencodedParser,
   createGlobalExpressErrorHandler
-} from "./src/security/sec01SecurityService.ts";
-import { createPendingOrderRepository } from "./src/security/webhooks/pendingOrderRepository.ts";
-import { createWebhookIdempotencyRepository } from "./src/security/webhooks/webhookIdempotencyRepository.ts";
-import { createPaymentWebhookProcessor } from "./src/security/webhooks/paymentWebhookProcessor.ts";
-import { createPaddleWebhookHandler } from "./src/security/webhooks/paddleWebhookHandler.ts";
-import { createSlickPayWebhookHandler } from "./src/security/webhooks/slickPayWebhookHandler.ts";
-import { createPendingOrderRoute } from "./src/security/payments/pendingOrderRoute.ts";
+} from "./src/security/sec01SecurityService.js";
+import { createPendingOrderRepository } from "./src/security/webhooks/pendingOrderRepository.js";
+import { createWebhookIdempotencyRepository } from "./src/security/webhooks/webhookIdempotencyRepository.js";
+import { createPaymentWebhookProcessor } from "./src/security/webhooks/paymentWebhookProcessor.js";
+import { createPaddleWebhookHandler } from "./src/security/webhooks/paddleWebhookHandler.js";
+import { createSlickPayWebhookHandler } from "./src/security/webhooks/slickPayWebhookHandler.js";
+import { createPendingOrderRoute } from "./src/security/payments/pendingOrderRoute.js";
 import { 
   getUserProjects, 
   createOrUpdateProject, 
   deleteUserProject, 
   getDriveFiles, 
   saveDriveFileRecord 
-} from "./src/db/projects.ts";
-import { getOrCreateUser } from "./src/db/users.ts";
+} from "./src/db/projects.js";
+import { getOrCreateUser } from "./src/db/users.js";
 import {
   createRequireSupabaseAuth,
   requireSupabaseSuperAdmin,
@@ -65,7 +65,7 @@ import {
   verifySupabaseSessionFromBearerToken,
   type SupabaseAuthRequest,
   type SupabaseServerAuthGateway,
-} from "./src/server/supabaseAuth.ts";
+} from "./src/server/supabaseAuth.js";
 
 export interface PdiServerDependencies {
   requireAuthMiddleware?: express.RequestHandler;

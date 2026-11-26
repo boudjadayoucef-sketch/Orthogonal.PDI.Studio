@@ -1,4 +1,4 @@
-import type { PdiAccountType, PdiSubscriptionPlan } from "../../types/pdiAuthTypes";
+import type { PdiAccountType, PdiSubscriptionPlan } from "../../types/pdiAuthTypes.js";
 
 export type PdiPaymentProvider = "slickpay_baridimob" | "paddle";
 

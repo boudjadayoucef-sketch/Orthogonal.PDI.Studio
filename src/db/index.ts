@@ -1,7 +1,7 @@
 import { drizzle, type NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { Pool, type PoolConfig } from 'pg';
-import * as schema from './schema.ts';
-import { isStagingSandboxMode, resolvePdiEnvironmentMode } from '../lib/stagingSandbox.ts';
+import * as schema from './schema.js';
+import { isStagingSandboxMode, resolvePdiEnvironmentMode } from '../lib/stagingSandbox.js';
 
 export const SANDBOX_POSTGRES_FORBIDDEN_ERROR =
   'Coupe-circuit Sandbox / Fail-Closed PostgreSQL (STAGING-00-B4-A) : PostgreSQL / Cloud SQL est strictement désactivé en mode Sandbox ou lorsque PDI_ENV / VITE_PDI_ENV est absent, incohérent ou invalide.';

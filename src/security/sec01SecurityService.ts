@@ -17,7 +17,7 @@ import crypto from "node:crypto";
 import net from "node:net";
 import express from "express";
 import type { Request, Response, NextFunction, ErrorRequestHandler } from "express";
-import { resolvePdiEnvironmentMode } from "../lib/stagingSandbox.ts";
+import { resolvePdiEnvironmentMode } from "../lib/stagingSandbox.js";
 
 // =========================================================================
 // 1. BOUNDED IN-MEMORY RATE LIMITER

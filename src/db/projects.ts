@@ -1,5 +1,5 @@
-import { getDb } from './index.ts';
-import { projects, driveFiles } from './schema.ts';
+import { getDb } from './index.js';
+import { projects, driveFiles } from './schema.js';
 import { eq, desc, and } from 'drizzle-orm';
 
 export async function getUserProjects(uid: string) {

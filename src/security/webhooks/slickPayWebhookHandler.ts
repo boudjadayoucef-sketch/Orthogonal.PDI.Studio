@@ -9,7 +9,7 @@
  */
 
 import type { Request, Response } from "express";
-import { authenticateSlickPayWebhookRequest } from "../webhookAuth.ts";
+import { authenticateSlickPayWebhookRequest } from "../webhookAuth.js";
 
 export interface SlickPayWebhookHandlerDeps {
   getSlickPaySecret?: () => string | undefined;

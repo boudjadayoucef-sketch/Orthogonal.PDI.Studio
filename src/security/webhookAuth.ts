@@ -11,7 +11,7 @@
 import {
   verifyPaddleWebhookSignature,
   verifySlickPayWebhook
-} from "./sec01SecurityService.ts";
+} from "./sec01SecurityService.js";
 
 export interface PaddleWebhookAuthInput {
   rawBody: unknown;
