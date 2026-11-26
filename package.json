@@ -6,7 +6,6 @@
   "scripts": {
     "dev": "tsx server.ts",
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
-    "build:vercel-api": "esbuild src/server/vercelHandler.ts --bundle --platform=node --format=esm --packages=external --external:vite --outfile=api/_vercelBundle.mjs",
     "start": "node dist/server.cjs",
     "lint": "tsc --noEmit",
     "test": "vitest run --exclude='**/firestoreRulesEmulator.spec.ts'",

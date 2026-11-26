@@ -1,13 +1,8 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": "vite",
-  "buildCommand": "vite build && npm run build:vercel-api",
+  "buildCommand": "vite build",
   "outputDirectory": "dist",
-  "functions": {
-    "api/index.ts": {
-      "includeFiles": "api/_vercelBundle.mjs"
-    }
-  },
   "rewrites": [
     {
       "source": "/api/(.*)",

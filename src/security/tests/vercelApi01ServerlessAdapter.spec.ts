@@ -774,28 +774,27 @@ describe("VERCEL-API-01 — Raccordement du serveur Express à Vercel Serverless
       }
     };
 
-    walkServerGraph(path.join(rootDir, "src", "server", "vercelHandler.ts"));
+    walkServerGraph(path.join(rootDir, "api", "index.ts"));
 
     // Aucun import relatif .ts ou sans extension ne doit subsister (sinon ERR_MODULE_NOT_FOUND sur Vercel ESM)
     expect(violations).toEqual([]);
     // Le graphe serveur ne doit jamais référencer le SDK navigateur client src/lib/firebase.ts
     const relVisited = Array.from(visited).map((f) => path.relative(rootDir, f));
+    expect(relVisited).toContain("src/server/vercelHandler.ts");
+    expect(relVisited).toContain("server.ts");
     expect(relVisited).not.toContain("src/lib/firebase.ts");
 
-    // Vérifier la présence de api/tsconfig.json (NodeNext, noEmit: false) et du pre-bundle Vercel
+    // Vérifier la présence de api/tsconfig.json (NodeNext, noEmit: false) couvrant le graphe serveur
     const apiTsconfig = JSON.parse(
       fs.readFileSync(path.join(rootDir, "api", "tsconfig.json"), "utf-8")
     );
     expect(apiTsconfig.compilerOptions.moduleResolution).toBe("NodeNext");
     expect(apiTsconfig.compilerOptions.noEmit).toBe(false);
+    expect(apiTsconfig.include).toContain("../server.ts");
 
-    const vercelConfig = JSON.parse(
-      fs.readFileSync(path.join(rootDir, "vercel.json"), "utf-8")
-    );
-    expect(vercelConfig.buildCommand).toContain("build:vercel-api");
-    expect(vercelConfig.functions?.["api/index.ts"]?.includeFiles).toContain(
-      "api/_vercelBundle.mjs"
-    );
+    // Vérifier que api/index.ts importe statiquement ../src/server/vercelHandler.js (tracé nativement par @vercel/nft)
+    const apiEntrySrc = fs.readFileSync(path.join(rootDir, "api", "index.ts"), "utf-8");
+    expect(apiEntrySrc).toContain('from "../src/server/vercelHandler.js"');
 
     // Vérifier l'invocation HTTP réelle du handler par défaut exporté par api/index.ts
     const { baseUrl } = await mountServerlessHandlerForTest((req, res) => {

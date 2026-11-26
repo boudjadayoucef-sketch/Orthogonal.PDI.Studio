@@ -19,8 +19,8 @@
  */
 
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { isStagingSandboxMode } from "../lib/stagingSandbox.ts";
-import { sanitizeSupabaseAdminError } from "./supabaseAdmin.ts";
+import { isStagingSandboxMode } from "../lib/stagingSandbox.js";
+import { sanitizeSupabaseAdminError } from "./supabaseAdmin.js";
 import {
   AUTHORIZED_SUPABASE_SUPER_ADMIN_EMAIL,
   isEmailConfirmed,
@@ -30,7 +30,7 @@ import {
   type BootstrapAuthUserRecord,
   type BootstrapProfileRecord,
   type BootstrapRequestContext,
-} from "./supabaseSuperAdminBootstrap.ts";
+} from "./supabaseSuperAdminBootstrap.js";
 
 function assertServerRuntimeOnly(override?: boolean): void {
   const isBrowser =

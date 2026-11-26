@@ -1,7 +1,6 @@
 node_modules/
 build/
 dist/
-api/_vercelBundle.mjs
 coverage/
 .DS_Store
 *.log
