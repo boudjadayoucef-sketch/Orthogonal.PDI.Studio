@@ -1051,10 +1051,28 @@ describe("STAGING-00-B4 FIX-01 — Cohérence stricte de runtimeEnv dans createP
     process.env.PDI_ENV = "sandbox";
     process.env.VITE_PDI_ENV = "sandbox";
 
+    const DEV_SUPABASE_URL = "https://devruntime.supabase.co";
+    const DEV_SUPABASE_UID = "7243efe7-113d-45f2-8f2e-044799b25ff0";
+    const toB64Url = (obj: Record<string, unknown>) =>
+      Buffer.from(JSON.stringify(obj), "utf8")
+        .toString("base64")
+        .replace(/=/g, "")
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_");
+    const validSupabaseDevJwt = `${toB64Url({ alg: "HS256", typ: "JWT" })}.${toB64Url({
+      iss: `${DEV_SUPABASE_URL}/auth/v1`,
+      sub: DEV_SUPABASE_UID,
+      email: "superadmin@orthogonal.invalid",
+      aud: "authenticated",
+      role: "authenticated",
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    })}.dev_sig`;
+
     const devRuntimeEnv: NodeJS.ProcessEnv = {
       NODE_ENV: "development",
       PDI_ENV: "development",
       VITE_PDI_ENV: "development",
+      SUPABASE_URL: DEV_SUPABASE_URL,
       FIREBASE_PROJECT_ID: EXPECTED_SERVER_PROJECT_ID,
       FIREBASE_DATABASE_ID: EXPECTED_SERVER_DATABASE_ID,
     };
@@ -1076,6 +1094,35 @@ describe("STAGING-00-B4 FIX-01 — Cohérence stricte de runtimeEnv dans createP
     const fakeAdminAuth = {
       verifyIdToken: verifyIdTokenSpy,
       setCustomUserClaims: setCustomUserClaimsSpy,
+    };
+    const fakeSupabaseGateway = {
+      verifyAccessTokenAndGetUser: async (token: string) =>
+        token === validSupabaseDevJwt
+          ? {
+              id: DEV_SUPABASE_UID,
+              email: "superadmin@orthogonal.invalid",
+              email_confirmed_at: "2026-11-23T10:00:00.000Z",
+            }
+          : null,
+      findProfileByUserId: async (userId: string) =>
+        userId === DEV_SUPABASE_UID
+          ? {
+              id: DEV_SUPABASE_UID,
+              email: "superadmin@orthogonal.invalid",
+              name: "Dev SuperAdmin",
+              display_name: "Dev SuperAdmin",
+              role: "super_admin" as const,
+              status: "active" as const,
+              account_type: "enterprise" as const,
+              subscription_plan: "yearly" as const,
+              company: "Orthogonal",
+              country: "Algérie",
+              country_code: "DZ",
+              city: "Alger",
+              created_at: "2026-11-23T10:00:00.000Z",
+              updated_at: "2026-11-23T10:00:00.000Z",
+            }
+          : null,
     };
     const fakeAdminDb = {
       collection: vi.fn((_name: string) => ({
@@ -1111,6 +1158,7 @@ describe("STAGING-00-B4 FIX-01 — Cohérence stricte de runtimeEnv dans createP
       attachFrontend: false,
       env: devRuntimeEnv,
       dependencies: {
+        supabaseAuthGateway: fakeSupabaseGateway,
         getAdminAuth: () => fakeAdminAuth as any,
         getAdminDb: () => fakeAdminDb as any,
         getUserProjects: getUserProjectsSpy as any,
@@ -1122,19 +1170,23 @@ describe("STAGING-00-B4 FIX-01 — Cohérence stricte de runtimeEnv dans createP
 
     try {
       const baseUrl = `http://127.0.0.1:${started.port}`;
+      const supabaseAuthHeaders = {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${validSupabaseDevJwt}`,
+      };
       const authHeaders = {
         "Content-Type": "application/json",
         Authorization: "Bearer simulated.valid.superadmin.jwt",
       };
 
-      // 1. Routes projets, sync-user et administration suivent runtimeEnv=development (jamais 403 sandbox)
-      const getProjectsRes = await fetch(`${baseUrl}/api/projects`, { headers: authHeaders });
+      // 1. Routes projets, sync-user (Supabase strict) et administration suivent runtimeEnv=development (jamais 403 sandbox)
+      const getProjectsRes = await fetch(`${baseUrl}/api/projects`, { headers: supabaseAuthHeaders });
       expect(getProjectsRes.status).toBe(200);
-      expect(getUserProjectsSpy).toHaveBeenCalledWith("dev_superadmin_01");
+      expect(getUserProjectsSpy).toHaveBeenCalledWith(DEV_SUPABASE_UID);
 
       const postProjectRes = await fetch(`${baseUrl}/api/projects`, {
         method: "POST",
-        headers: authHeaders,
+        headers: supabaseAuthHeaders,
         body: JSON.stringify({ name: "Collecteur Dev" }),
       });
       expect(postProjectRes.status).toBe(200);
@@ -1142,14 +1194,14 @@ describe("STAGING-00-B4 FIX-01 — Cohérence stricte de runtimeEnv dans createP
 
       const deleteProjectRes = await fetch(`${baseUrl}/api/projects/10`, {
         method: "DELETE",
-        headers: authHeaders,
+        headers: supabaseAuthHeaders,
       });
       expect(deleteProjectRes.status).toBe(200);
-      expect(deleteUserProjectSpy).toHaveBeenCalledWith("dev_superadmin_01", 10);
+      expect(deleteUserProjectSpy).toHaveBeenCalledWith(DEV_SUPABASE_UID, 10);
 
       const syncUserRes = await fetch(`${baseUrl}/api/auth/sync-user`, {
         method: "POST",
-        headers: authHeaders,
+        headers: supabaseAuthHeaders,
         body: JSON.stringify({ displayName: "Dev SuperAdmin" }),
       });
       expect(syncUserRes.status).toBe(200);

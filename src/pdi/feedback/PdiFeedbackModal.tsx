@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { submitUserFeedback, PdiUserFeedback } from "../../lib/firebase";
+import type { PdiUserFeedback } from "../../types/pdiAuthTypes";
 import { pdiAlert } from "../ui/PdiNotice";
 
 export function PdiFeedbackModal({
@@ -30,6 +30,7 @@ export function PdiFeedbackModal({
 
     setSubmitting(true);
     try {
+      const { submitUserFeedback } = await import("../../lib/firebase");
       await submitUserFeedback({
         userEmail: userEmail || "visiteur@pdi-vision.dz",
         userName: userName || "Utilisateur PD&I",

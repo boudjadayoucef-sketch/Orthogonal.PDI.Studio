@@ -588,7 +588,7 @@ describe("MIG-04-AUTH-01 — Intégration Supabase Auth & autorisation serveur",
       expect(deniedBody.code).toBe("auth/forbidden-super-admin");
     });
 
-    it("GET /api/projects accepte un JWT Supabase vérifié ET préserve la compatibilité avec un ID Token Firebase existant", async () => {
+    it("GET /api/projects accepte un JWT Supabase vérifié et rejette un ID Token Firebase hérité (MIG-05-FIX-01)", async () => {
       const sbToken = makeValidJwtFor(ACTIVE_CLIENT_ID, "engineer@orthogonal.dz");
       const sbRes = await fetch(`${baseUrl}/api/projects`, {
         headers: { Authorization: `Bearer ${sbToken}` },
@@ -600,9 +600,9 @@ describe("MIG-04-AUTH-01 — Intégration Supabase Auth & autorisation serveur",
       const fbRes = await fetch(`${baseUrl}/api/projects`, {
         headers: { Authorization: "Bearer valid_legacy_firebase_token" },
       });
-      expect(fbRes.status).toBe(200);
+      expect(fbRes.status).toBe(401);
       const fbBody = (await fbRes.json()) as any;
-      expect(fbBody.projects[0].user_id).toBe("firebase_legacy_uid_1");
+      expect(fbBody.code).toBe("auth/supabase-token-required");
     });
 
     it("protections Sandbox (401/403) et Fail-Closed (503) sur createRequireSupabaseAuth et requireSupabaseSuperAdmin", async () => {

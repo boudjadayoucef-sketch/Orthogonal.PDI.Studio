@@ -65,6 +65,13 @@ export interface CreateRequireAuthOptions {
   getAdminAuth?: typeof getServerAdminAuth;
   verifySupabaseToken?: (token: string) => Promise<SupabaseSessionVerificationResult | null>;
   expectedSupabaseUrl?: string;
+  /**
+   * MIG-05-FIX-01 :
+   * Lorsque `false`, rejette strictement tout jeton qui n'est pas un JWT Supabase vérifié
+   * sans jamais appeler `getServerAdminAuth().verifyIdToken()` (utilisé par `/api/auth/sync-user`
+   * et `/api/projects`). Conservé à `true` par défaut pour la route héritée `/api/admin/set-user-role`.
+   */
+  allowFirebaseFallback?: boolean;
 }
 
 export function createRequireAuth(
@@ -72,6 +79,7 @@ export function createRequireAuth(
   options: CreateRequireAuthOptions = {}
 ) {
   const resolveAdminAuth = options.getAdminAuth ?? getServerAdminAuth;
+  const allowFirebaseFallback = options.allowFirebaseFallback !== false;
 
   return async (req: AuthRequest, res: Response, next: NextFunction) => {
     const effectiveEnv = env ?? process.env;
@@ -109,16 +117,14 @@ export function createRequireAuth(
     // STAGING-00-B3-R1 (Partie B): In Sandbox mode, server authentication is disabled
     if (isStagingSandboxMode(effectiveEnv)) {
       return res.status(403).json({
-        error: 'Forbidden: Firebase Admin authentication is disabled in Sandbox mode.',
+        error: 'Forbidden: Server authentication is disabled in Sandbox mode.',
         code: 'sandbox/server-auth-disabled',
       });
     }
 
-    // MIG-04-AUTH-01: Vérification autoritative des JWT Supabase lorsque le token est émis par Supabase Auth
-    if (
-      options.verifySupabaseToken &&
-      isLikelySupabaseAccessToken(token, options.expectedSupabaseUrl)
-    ) {
+    // MIG-04-AUTH-01 & MIG-05-FIX-01 : Vérification autoritative des JWT Supabase
+    const isSupabaseCandidate = isLikelySupabaseAccessToken(token, options.expectedSupabaseUrl);
+    if (options.verifySupabaseToken && isSupabaseCandidate) {
       const supabaseResult = await options.verifySupabaseToken(token);
       if (!supabaseResult) {
         return res.status(503).json({
@@ -146,6 +152,19 @@ export function createRequireAuth(
         auth_provider: 'supabase',
       } as unknown as DecodedIdToken;
       return next();
+    }
+
+    if (!allowFirebaseFallback) {
+      if (!options.verifySupabaseToken) {
+        return res.status(503).json({
+          error: 'Service Unavailable: Supabase server authentication is not configured.',
+          code: 'server/supabase-auth-unconfigured',
+        });
+      }
+      return res.status(401).json({
+        error: 'Unauthorized: Valid Supabase Bearer token required',
+        code: 'auth/supabase-token-required',
+      });
     }
 
     try {

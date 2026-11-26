@@ -38,6 +38,37 @@ import {
   seedSandboxDefaultProjectIfEmpty,
   resolveScopedStorageKey,
 } from "./stagingSandbox";
+import {
+  PdiAuthAccessError,
+  type PdiUserRole,
+  type PdiAccountType,
+  type PdiSubscriptionPlan,
+  type PdiUserProfile,
+  type PdiConnectionLog,
+  type PdiCommercialVisit,
+  type PdiUserFeedback,
+  type PdiSubscriberUsage,
+  type PdiLicenseKey,
+  type PdiAuthDenialReason,
+  type WorkspaceSessionResolution,
+} from "../types/pdiAuthTypes";
+import { purgeLocalAuthCaches } from "./localAuthCache";
+
+export {
+  PdiAuthAccessError,
+  purgeLocalAuthCaches,
+  type PdiUserRole,
+  type PdiAccountType,
+  type PdiSubscriptionPlan,
+  type PdiUserProfile,
+  type PdiConnectionLog,
+  type PdiCommercialVisit,
+  type PdiUserFeedback,
+  type PdiSubscriberUsage,
+  type PdiLicenseKey,
+  type PdiAuthDenialReason,
+  type WorkspaceSessionResolution,
+};
 
 // ==========================================
 // FIRESTORE ERROR HANDLING & CONNECTION TEST
@@ -588,81 +619,8 @@ export {
 };
 
 // ==========================================
-// MODELS & SERVICES
+// MODELS & SERVICES (Types neutres réexportés depuis ../types/pdiAuthTypes)
 // ==========================================
-
-export type PdiUserRole = "super_admin" | "admin" | "client" | "guest" | "demo";
-export type PdiAccountType = "basic" | "pro" | "enterprise" | "team";
-export type PdiSubscriptionPlan = "monthly" | "yearly" | "trial" | "lifetime";
-
-export interface PdiUserProfile {
-  uid: string;
-  email: string;
-  name: string;
-  company?: string;
-  country?: string;
-  countryCode?: string;
-  city?: string;
-  paymentGateway?: string;
-  currency?: string;
-  role: PdiUserRole;
-  accountType: PdiAccountType;
-  subscriptionPlan: PdiSubscriptionPlan;
-  status: "active" | "suspended" | "pending_activation" | "revoked" | "disabled";
-  createdAt: string;
-  lastLoginAt?: string;
-  loginCount?: number;
-  projectsCount?: number;
-  storageUsedKb?: number;
-}
-
-export interface PdiConnectionLog {
-  id: string;
-  userId: string;
-  userEmail: string;
-  userName: string;
-  userRole: string;
-  accountType?: string;
-  ip?: string;
-  userAgent?: string;
-  device?: string;
-  timestamp: string;
-  status: "success" | "failed";
-}
-
-export interface PdiCommercialVisit {
-  id: string;
-  path: string;
-  referrer?: string;
-  section?: string;
-  action?: string;
-  device?: string;
-  timestamp: string;
-}
-
-export interface PdiUserFeedback {
-  id: string;
-  userId?: string;
-  userEmail: string;
-  userName?: string;
-  category: "feature_request" | "bug_report" | "general_feedback" | "satisfaction";
-  rating: number; // 1 to 5
-  title: string;
-  message: string;
-  status: "new" | "reviewed" | "in_progress" | "resolved";
-  createdAt: string;
-  adminNotes?: string;
-}
-
-export interface PdiSubscriberUsage {
-  id: string;
-  userId: string;
-  userEmail: string;
-  action: string;
-  module: string;
-  details?: string;
-  timestamp: string;
-}
 
 // ------------------------------------------
 // PROFILES API
@@ -1177,21 +1135,8 @@ export async function sendResetPasswordEmail(emailInput: string): Promise<void> 
 }
 
 // ------------------------------------------
-// LICENSE KEYS API
+// LICENSE KEYS API (PdiLicenseKey réexporté depuis ../types/pdiAuthTypes)
 // ------------------------------------------
-export interface PdiLicenseKey {
-  id: string;
-  code: string;
-  type: string; // e.g., 'TRIAL_7', 'TRIAL_30', 'PRO_YEAR', 'TEAM_YEAR', 'ENTERPRISE'
-  plan: string; // 'BASIC', 'PRO', 'TEAM', 'ENTERPRISE'
-  status: "generated" | "active" | "revoked" | "expired";
-  assignedTo?: string; // email
-  activatedBy?: string; // email who used it
-  activatedAt?: string;
-  createdAt: string;
-  expiresAt: string;
-  maxUsers?: number;
-}
 
 export async function getFirebaseLicenseKeys(): Promise<PdiLicenseKey[]> {
   try {
@@ -1281,92 +1226,8 @@ export async function hasSuperAdminPasswordConfigured(): Promise<boolean> {
   }
 }
 
-export type PdiAuthDenialReason =
-  | "profile_not_found"
-  | "pending_activation"
-  | "suspended"
-  | "revoked"
-  | "disabled"
-  | "inactive_status"
-  | "permission_denied"
-  | "network_error"
-  | "token_error"
-  | "invalid_claims"
-  | "unexpected_error"
-  | "signout_failed";
-
-export class PdiAuthAccessError extends Error {
-  readonly reason: PdiAuthDenialReason;
-  readonly code?: string;
-  readonly transient: boolean;
-  readonly sessionTerminated: boolean;
-  readonly pendingProfile?: PdiUserProfile;
-
-  constructor(options: {
-    message: string;
-    reason: PdiAuthDenialReason;
-    code?: string;
-    transient?: boolean;
-    sessionTerminated?: boolean;
-    pendingProfile?: PdiUserProfile;
-  }) {
-    super(options.message);
-    this.name = "PdiAuthAccessError";
-    this.reason = options.reason;
-    this.code = options.code;
-    this.transient = Boolean(options.transient);
-    this.sessionTerminated = Boolean(options.sessionTerminated);
-    this.pendingProfile = options.pendingProfile;
-    Object.setPrototypeOf(this, PdiAuthAccessError.prototype);
-  }
-}
-
-const LOCAL_IDENTITY_CACHE_KEYS = [
-  "pdi_user_profile",
-  "pdi.user.profile.v1",
-  "pdi.userProfile.v1",
-  "pdi.force.app.v1",
-  "pdi.activation.pendingToken.v1",
-  "pdi.auth.pendingUser.v1"
-] as const;
-
-const SESSION_IDENTITY_CACHE_KEYS = [
-  "pdi.stage.v4",
-  "pdi.drive.accessToken.v1"
-] as const;
-
-/**
- * AUTH-ADMIN-05-FIX-11-R2 : Purge atomique des caches locaux d'identité et d'autorisation workspace.
- */
-export function purgeLocalAuthCaches(options?: { preservePendingState?: boolean }): void {
-  const preservePending = Boolean(options?.preservePendingState);
-  try {
-    if (typeof localStorage !== "undefined") {
-      if (!preservePending) {
-        for (const key of LOCAL_IDENTITY_CACHE_KEYS) {
-          localStorage.removeItem(key);
-        }
-        localStorage.setItem("pdi.auth.mode.v1", "guest");
-      } else {
-        localStorage.removeItem("pdi.force.app.v1");
-        localStorage.setItem("pdi.auth.mode.v1", "pending_email");
-      }
-      localStorage.setItem("pdi.activeModule.v1", "home");
-    }
-  } catch {
-    // Ignore storage access errors
-  }
-
-  try {
-    if (typeof sessionStorage !== "undefined") {
-      for (const key of SESSION_IDENTITY_CACHE_KEYS) {
-        sessionStorage.removeItem(key);
-      }
-    }
-  } catch {
-    // Ignore sessionStorage access errors
-  }
-}
+// PdiAuthDenialReason, PdiAuthAccessError et purgeLocalAuthCaches sont extraits et réexportés
+// depuis ../types/pdiAuthTypes et ./localAuthCache (MIG-05-FIX-01).
 
 /**
  * AUTH-ADMIN-05-FIX-11-R2 (A3) : Classification stricte des erreurs Firestore lors de la lecture de profiles/{uid}.
@@ -1719,17 +1580,7 @@ async function verifyAuthenticatedUserProfileAndClaims(options: {
   return { profile: userProfile, isSuperAdmin: isSuperAdminUser };
 }
 
-export interface WorkspaceSessionResolution {
-  status: "unauthenticated" | "active" | "pending_activation" | "denied" | "error";
-  canAccessWorkspace: boolean;
-  canAccessActivation: boolean;
-  isSuperAdmin: boolean;
-  authMode: "guest" | "pending_email" | "client" | "super_admin";
-  profile: PdiUserProfile | null;
-  reason?: PdiAuthDenialReason;
-  transient?: boolean;
-  errorMessage?: string;
-}
+// WorkspaceSessionResolution réexporté depuis ../types/pdiAuthTypes (MIG-05-FIX-01).
 
 /**
  * AUTH-ADMIN-05-FIX-11-R2 (BLOC B & BLOC C) :

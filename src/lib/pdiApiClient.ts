@@ -1,10 +1,9 @@
 /**
  * ORTHOGONAL - ENG · PIPING DESIGN & ISOMETRICS (PD&I)
- * UNIFIED AUTHORIZED CLIENT API HELPER
- * Ensures all requests to /api/* carry valid Firebase Auth ID tokens
+ * UNIFIED AUTHORIZED CLIENT API HELPER (MIG-05-FIX-01)
+ * Ensures all requests to /api/* carry verified Supabase Auth Bearer tokens.
  */
 
-import { auth } from './firebase.ts';
 import { getSupabaseAccessToken } from './supabaseAuth.ts';
 
 export class ApiError extends Error {
@@ -19,26 +18,11 @@ export class ApiError extends Error {
 }
 
 /**
- * Retrieves the current user's active Bearer token (Supabase JWT prioritized; legacy Firebase fallback only if no Supabase session).
+ * Retrieves the current user's active Supabase Bearer JWT (zero Firebase Auth fallback).
  * Forces token refresh if requested or expired.
  */
 export async function getAuthToken(forceRefresh = false): Promise<string | null> {
-  const supabaseToken = await getSupabaseAccessToken(forceRefresh);
-  if (supabaseToken) {
-    return supabaseToken;
-  }
-
-  const currentUser = auth.currentUser;
-  if (currentUser) {
-    try {
-      return await currentUser.getIdToken(forceRefresh);
-    } catch (err) {
-      console.error('Failed to retrieve legacy Firebase ID token:', err);
-      return null;
-    }
-  }
-
-  return null;
+  return await getSupabaseAccessToken(forceRefresh);
 }
 
 /**

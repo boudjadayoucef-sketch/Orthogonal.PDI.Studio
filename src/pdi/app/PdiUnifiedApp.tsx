@@ -67,9 +67,11 @@ const SketchToIsoModule = React.lazy(() =>
 // PATCH 004c : modules applicatifs PD&I
 import HomePdi from "../home/HomePdi";
 import PdiIllustratorHome from "../home/PdiIllustratorHome";
-import PdiAuthPage from "../auth/PdiAuthPage";
+const PdiAuthPage = React.lazy(() => import("../auth/PdiAuthPage"));
 import { PdiLoginLoadingOverlay } from "../auth/PdiLoginLoadingOverlay";
-import { GoogleDriveWorkspace } from "../../components/GoogleDriveWorkspace";
+const GoogleDriveWorkspace = React.lazy(() =>
+  import("../../components/GoogleDriveWorkspace").then((m) => ({ default: m.GoogleDriveWorkspace }))
+);
 import isoPiping3D from "../../assets/images/pdi_iso_piping_3d_1787006532562.jpg";
 import valve3D from "../../assets/images/pdi_valve_3d_1787006543831.jpg";
 import plantScan3D from "../../assets/images/pdi_plant_scan_3d_1787006555680.jpg";
@@ -81,13 +83,18 @@ import { pdiAlert } from "../ui/PdiNotice";
 // PATCH 017K2
 import { PdiCompanyPanel } from "../ui/PdiCompanyPanel";
 import { PdiSupabaseSuperAdminPanel } from "../superadmin/PdiSupabaseSuperAdminPanel";
-import { PdiFeedbackModal } from "../feedback/PdiFeedbackModal";
+const PdiFeedbackModal = React.lazy(() =>
+  import("../feedback/PdiFeedbackModal").then((m) => ({ default: m.PdiFeedbackModal }))
+);
 import { PdiNewProjectModal } from "../modals/PdiNewProjectModal";
 import {
   purgeLocalAuthCaches,
-  type WorkspaceSessionResolution,
-  type PdiUserProfile
-} from "../../lib/firebase";
+  syncVerifiedUserProfileCache,
+} from "../../lib/localAuthCache";
+import type {
+  WorkspaceSessionResolution,
+  PdiUserProfile,
+} from "../../types/pdiAuthTypes";
 import {
   attachSupabaseAuthMonitor,
   clearSensitiveAuthParamsFromUrl,
@@ -1247,6 +1254,10 @@ export default function PdiUnifiedApp() {
           emailStatus: verified.emailConfirmed ? "vérifié (Supabase)" : "non confirmé",
           createdAt: verified.profile.createdAt,
         });
+        syncVerifiedUserProfileCache({
+          ...verified.profile,
+          role: verified.isSuperAdmin ? "super_admin" : verified.profile.role,
+        });
         setActiveModule((prev) =>
           getAuthorizedView(prev, verified.isSuperAdmin, "isometric") as PdiModule
         );
@@ -1393,9 +1404,7 @@ export default function PdiUnifiedApp() {
       emailStatus: currentAuth.emailVerified ? (meta?.provider === "supabase" ? "vérifié (Supabase)" : "vérifié") : "non confirmé",
       createdAt: profile.createdAt,
     });
-    try {
-      window.localStorage.setItem(resolveScopedStorageKey("pdi.user.profile.v1"), JSON.stringify({ ...profile, role }));
-    } catch {}
+    syncVerifiedUserProfileCache({ ...profile, role });
 
     if (!isStagingSandboxMode()) {
       // Asynchronously sync user to PostgreSQL Cloud SQL in the background
@@ -1476,21 +1485,29 @@ export default function PdiUnifiedApp() {
     return (
       <>
         {sandboxBannerNode}
-        <PdiAuthPage
-          initialTab={authPageTab}
-          passwordRecoveryMode={passwordRecoveryActive}
-          passwordRecoveryEmail={passwordRecoveryEmail}
-          passwordRecoveryError={passwordRecoveryError}
-          onExitPasswordRecovery={handleExitPasswordRecovery}
-          onBackToLanding={() => {
-            if (passwordRecoveryActive) {
-              handleExitPasswordRecovery();
-            }
-            setStage("landing");
-            try { window.location.hash = "landing"; } catch {}
-          }}
-          onSuccess={handleAuthSuccess}
-        />
+        <React.Suspense
+          fallback={
+            <div className="min-h-screen bg-[#070B12] flex items-center justify-center text-cyan-400 font-bold text-xs">
+              Chargement de l&apos;interface de connexion...
+            </div>
+          }
+        >
+          <PdiAuthPage
+            initialTab={authPageTab}
+            passwordRecoveryMode={passwordRecoveryActive}
+            passwordRecoveryEmail={passwordRecoveryEmail}
+            passwordRecoveryError={passwordRecoveryError}
+            onExitPasswordRecovery={handleExitPasswordRecovery}
+            onBackToLanding={() => {
+              if (passwordRecoveryActive) {
+                handleExitPasswordRecovery();
+              }
+              setStage("landing");
+              try { window.location.hash = "landing"; } catch {}
+            }}
+            onSuccess={handleAuthSuccess}
+          />
+        </React.Suspense>
       </>
     );
   }
@@ -2216,7 +2233,17 @@ export default function PdiUnifiedApp() {
             onOpenModule={(m) => openModuleInTab(m as PdiModule)}
           />
         )}
-        {activeModule === "drive" && <GoogleDriveWorkspace onLoadProjectToEditor={(data, name) => { openModuleInTab("isometric", name); }} />}
+        {activeModule === "drive" && (
+          <React.Suspense
+            fallback={
+              <div className="flex items-center justify-center min-h-[400px] text-cyan-400 font-bold text-xs">
+                Chargement de l&apos;espace Google Drive...
+              </div>
+            }
+          >
+            <GoogleDriveWorkspace onLoadProjectToEditor={(data, name) => { openModuleInTab("isometric", name); }} />
+          </React.Suspense>
+        )}
         {activeModule === "vision" && <ComingSoonPanel title="Vision PD&I"><p><b>Vision PD&I</b> préparera le flux <code>photo réelle → analyse agent → scripts Python → JSON PD&I → validation → ISO</code>. Les images restent en cache local temporaire navigateur.</p></ComingSoonPanel>}
         {activeModule === "sketch" && (
           <React.Suspense
@@ -2702,13 +2729,17 @@ export default function PdiUnifiedApp() {
         {activeModule === "assistant" && <ComingSoonPanel title="Assistant et agents spécialisés"><p>PD&I orchestrera le repo <code>pipeline-design-skill</code> : agents Vision, Croquis, CAO, JSON, ISO, QA. Les agents proposent ; Python calcule.</p></ComingSoonPanel>}
       </main>
 
-      {/* Modal Retour Expérience Utilisateur connecté à Firebase */}
-      <PdiFeedbackModal
-        isOpen={feedbackModalOpen}
-        onClose={() => setFeedbackModalOpen(false)}
-        userEmail={pdiUserProfile.email}
-        userName={pdiUserProfile.name}
-      />
+      {/* Modal Retour Expérience Utilisateur (chargée paresseusement uniquement à l'ouverture) */}
+      {feedbackModalOpen && (
+        <React.Suspense fallback={null}>
+          <PdiFeedbackModal
+            isOpen={feedbackModalOpen}
+            onClose={() => setFeedbackModalOpen(false)}
+            userEmail={pdiUserProfile.email}
+            userName={pdiUserProfile.name}
+          />
+        </React.Suspense>
+      )}
 
       {/* Modal Nouveau Projet & Raccordement ISO Étape 5 */}
       <PdiNewProjectModal

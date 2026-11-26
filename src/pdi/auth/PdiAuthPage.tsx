@@ -1,13 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import PdiBrandMark from "../app/PdiBrandMark";
 import { PdiLoginLoadingOverlay } from "./PdiLoginLoadingOverlay";
-import {
-  auth,
-  registerWithEmailAndPasswordSecure,
-  activateAccountWithLicenseKey,
-  getCountryRestrictionsFromFirebase,
-  PdiUserProfile
-} from "../../lib/firebase";
+import type { PdiUserProfile } from "../../types/pdiAuthTypes";
 import { PdiCountryConfig, PDI_DEFAULT_COUNTRIES } from "../data/pdiGeoData";
 import PdiInfoModals, { ModalType } from "../modals/PdiInfoModals";
 import { isSupabaseBrowserConfigured } from "../../lib/supabase";
@@ -391,15 +385,24 @@ export default function PdiAuthPage({
     }
   }, [passwordRecoveryMode]);
 
-  // MIG-04-AUTH-01-FIX-02 : Ne charger les restrictions pays Firestore que sur l'onglet d'inscription,
-  // afin qu'aucun appel Firebase/Firestore ne soit déclenché au chargement de la page de connexion.
+  // MIG-04-AUTH-01-FIX-02 & MIG-05-FIX-01 : Charger le module Firebase uniquement de façon
+  // paresseuse lorsque l'onglet d'inscription est effectivement ouvert (0 import statique au boot).
   useEffect(() => {
     if (tab !== "register") return;
-    void getCountryRestrictionsFromFirebase().then(res => {
-      if (isMountedRef.current && res && res.length > 0) {
-        setAllCountries(res);
-      }
-    });
+    let cancelled = false;
+    void import("../../lib/firebase")
+      .then(({ getCountryRestrictionsFromFirebase }) => getCountryRestrictionsFromFirebase())
+      .then((res) => {
+        if (!cancelled && isMountedRef.current && res && res.length > 0) {
+          setAllCountries(res);
+        }
+      })
+      .catch(() => {
+        // Fallback silencieux sur PDI_DEFAULT_COUNTRIES déjà initialisé
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [tab]);
 
   // When country changes, reset city to the first default city of that country
@@ -536,6 +539,7 @@ export default function PdiAuthPage({
     setLoading(true);
 
     try {
+      const { auth, registerWithEmailAndPasswordSecure } = await import("../../lib/firebase");
       const profile = await registerWithEmailAndPasswordSecure({
         email: regEmail,
         password: regPassword,
@@ -587,6 +591,7 @@ export default function PdiAuthPage({
     setLoading(true);
 
     try {
+      const { auth, activateAccountWithLicenseKey } = await import("../../lib/firebase");
       const profile = await activateAccountWithLicenseKey(actEmail, actKey);
       if (!isMountedRef.current) return;
       if (!isCoherentAuthorizedLoginResult({ profile, isSuperAdmin: false }, auth.currentUser)) {

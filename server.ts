@@ -245,21 +245,34 @@ export function createPdiExpressApp(options: CreatePdiExpressAppOptions = {}): e
     gateway: deps.supabaseAuthGateway,
   });
 
+  const verifySupabaseTokenForRoutes = async (token: string) => {
+    const resolved = getSupabaseGateway();
+    if (!resolved) {
+      return null;
+    }
+    return verifySupabaseSessionFromBearerToken(token, {
+      gateway: resolved.gateway,
+      expectedSupabaseUrl: resolved.expectedSupabaseUrl,
+    });
+  };
+
+  // MIG-05-FIX-01 : Authentification Supabase stricte (sans fallback Firebase) pour /api/auth/sync-user et /api/projects
+  const strictSupabaseApiAuthMiddleware =
+    deps.requireAuthMiddleware ??
+    createRequireAuth(runtimeEnv, {
+      allowFirebaseFallback: false,
+      expectedSupabaseUrl: runtimeEnv.SUPABASE_URL || runtimeEnv.VITE_SUPABASE_URL,
+      verifySupabaseToken: verifySupabaseTokenForRoutes,
+    });
+
+  // Fallback Firebase conservé exclusivement pour la route héritée POST /api/admin/set-user-role
   const authMiddleware =
     deps.requireAuthMiddleware ??
     createRequireAuth(runtimeEnv, {
+      allowFirebaseFallback: true,
       getAdminAuth: resolveAdminAuth,
       expectedSupabaseUrl: runtimeEnv.SUPABASE_URL || runtimeEnv.VITE_SUPABASE_URL,
-      verifySupabaseToken: async (token) => {
-        const resolved = getSupabaseGateway();
-        if (!resolved) {
-          return null;
-        }
-        return verifySupabaseSessionFromBearerToken(token, {
-          gateway: resolved.gateway,
-          expectedSupabaseUrl: resolved.expectedSupabaseUrl,
-        });
-      },
+      verifySupabaseToken: verifySupabaseTokenForRoutes,
     });
   const fetchProjects = deps.getUserProjects ?? getUserProjects;
   const upsertProject = deps.createOrUpdateProject ?? createOrUpdateProject;
@@ -313,8 +326,8 @@ export function createPdiExpressApp(options: CreatePdiExpressAppOptions = {}): e
     }
   );
 
-  // Cloud SQL User Sync & Projects Endpoints (Protected by C2 sandboxGuard bound to runtimeEnv)
-  app.post("/api/auth/sync-user", sandboxGuard, authMiddleware, async (req: AuthRequest, res) => {
+  // Cloud SQL User Sync & Projects Endpoints (MIG-05-FIX-01: strict Supabase auth + C2 sandboxGuard)
+  app.post("/api/auth/sync-user", sandboxGuard, strictSupabaseApiAuthMiddleware, async (req: AuthRequest, res) => {
     try {
       const uid = req.user?.uid;
       const email = req.user?.email || "unknown@domain.com";
@@ -455,7 +468,7 @@ export function createPdiExpressApp(options: CreatePdiExpressAppOptions = {}): e
     );
   }
 
-  app.get("/api/projects", sandboxGuard, authMiddleware, async (req: AuthRequest, res) => {
+  app.get("/api/projects", sandboxGuard, strictSupabaseApiAuthMiddleware, async (req: AuthRequest, res) => {
     try {
       const uid = req.user?.uid;
       if (!uid) return res.status(401).json({ error: "Unauthorized" });
@@ -467,7 +480,7 @@ export function createPdiExpressApp(options: CreatePdiExpressAppOptions = {}): e
     }
   });
 
-  app.post("/api/projects", sandboxGuard, authMiddleware, async (req: AuthRequest, res) => {
+  app.post("/api/projects", sandboxGuard, strictSupabaseApiAuthMiddleware, async (req: AuthRequest, res) => {
     try {
       const uid = req.user?.uid;
       if (!uid) return res.status(401).json({ error: "Unauthorized" });
@@ -479,7 +492,7 @@ export function createPdiExpressApp(options: CreatePdiExpressAppOptions = {}): e
     }
   });
 
-  app.delete("/api/projects/:id", sandboxGuard, authMiddleware, async (req: AuthRequest, res) => {
+  app.delete("/api/projects/:id", sandboxGuard, strictSupabaseApiAuthMiddleware, async (req: AuthRequest, res) => {
     try {
       const uid = req.user?.uid;
       const projectId = Number(req.params.id);

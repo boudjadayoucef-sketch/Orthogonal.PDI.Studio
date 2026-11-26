@@ -14,12 +14,20 @@
 // PD&I PATCH 007a — shell SaaS branding/fullscreen wording reviewed
 // PD&I PATCH 003 — V4.8d restored
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { onAuthStateChanged } from "firebase/auth";
 import {
   isStagingSandboxMode,
   resolveScopedStorageKey,
   getSandboxSyntheticProfile,
 } from "../../../lib/stagingSandbox";
+import {
+  PDI_IDENTITY_SYNCED_EVENT,
+  isCanonicalSupabaseUuid,
+} from "../../../lib/localAuthCache";
+import {
+  resolveCanonicalIsometricUserUid,
+  resolveIsometricIdentityTransition,
+  migrateLocalIsometricAutosaveToCanonicalUuid,
+} from "../state/isometricIdentityMigration";
 // PATCH 017J : identite de cartouche parametrable (R15).
 import { pdiCompanyName } from "../../branding/pdiBranding";
 // PATCH 017P : precision geometrique (accroche a priorites, axes ISO, QA).
@@ -98,7 +106,6 @@ import {
   CanvasVisibilityControls18,
   CanvasVisibilityLayerKey,
 } from "../ui/CanvasVisibilityControls18";
-import { auth } from "../../../lib/firebase";
 import PdiBrandMark from "../../app/PdiBrandMark";
 // V4.8d_DIMENSIONS_ALIGNMENT : logos PD & I réels haute définition.
 
@@ -413,64 +420,45 @@ export function migrateProjectFileV474(value:unknown, fallbackOwnerUid = ""):Iso
 // PATCH 017F1 : le moteur recoit le projet actif de l onglet.
 function IsometrieModule(props: { projectId?: string }) {
   const projectId = props?.projectId;
-  // V4.7.4e_PROFILE_SCOPED_STORAGE : identité et clés par profil.
-  // V4.7.4f_PLATFORM_PROFILE_FALLBACK : Firebase Auth reste prioritaire,
-  // puis le profil applicatif validé par App.tsx est utilisé en mode fallback.
-  const readPlatformProfileUid=()=>{
-    if (isStagingSandboxMode()) {
-      return getSandboxSyntheticProfile().uid;
-    }
-    try{
-      const raw=localStorage.getItem(resolveScopedStorageKey("pdi.userProfile.v1"))||localStorage.getItem(resolveScopedStorageKey("pdi_user_profile"));
-      if(!raw)return null;
-      const profile=JSON.parse(raw);
-      return typeof profile?.uid==="string"&&profile.uid.trim()?profile.uid.trim():null;
-    }catch{return null;}
-  };
-  // PATCH 017E : identite locale de secours.
-  // Sans compte Firebase ni profil plateforme, autosavePrefix restait vide et
-  // TOUTE sauvegarde locale etait desactivee : le dessin disparaissait a F5.
-  const readLocalFallbackUid=()=>{
-    try{
-      const key = resolveScopedStorageKey("pdi.localUid.v1");
-      const existing=localStorage.getItem(key);
-      if(existing&&existing.trim())return existing.trim();
-      const generated="local-"+Math.random().toString(36).slice(2,10)+Date.now().toString(36);
-      localStorage.setItem(key,generated);
-      return generated;
-    }catch{return "local-session";}
-  };
-  const resolveStableUid=()=>
-    isStagingSandboxMode()
-      ? getSandboxSyntheticProfile().uid
-      : auth.currentUser?.uid||readPlatformProfileUid()||readLocalFallbackUid();
-  const initialAuthUidRef=useRef<string|null>(resolveStableUid());
-  const authSeenRef=useRef(false);
-  const [authReady,setAuthReady]=useState(false);
-  const [userUid,setUserUid]=useState<string|null>(resolveStableUid());
-  useEffect(()=>{
-    const syncIdentity=()=>{
-      const nextUid=resolveStableUid();
-      if(authSeenRef.current&&initialAuthUidRef.current!==nextUid){
-        // Le cache du profil précédent ne doit jamais rester monté sous le nouveau compte.
-        window.location.reload();
+  // MIG-05-FIX-01 : Identité canonique Supabase UUID (0 dépendance Firebase Auth, 0 reload intempestif).
+  const resolveStableUid = () =>
+    resolveCanonicalIsometricUserUid({
+      sandboxMode: isStagingSandboxMode(),
+      sandboxUid: isStagingSandboxMode() ? getSandboxSyntheticProfile().uid : undefined,
+    });
+  const initialAuthUidRef = useRef<string | null>(resolveStableUid());
+  const [authReady, setAuthReady] = useState(true);
+  const [userUid, setUserUid] = useState<string | null>(resolveStableUid());
+  useEffect(() => {
+    const syncIdentity = () => {
+      const nextUid = resolveStableUid();
+      const transition = resolveIsometricIdentityTransition(initialAuthUidRef.current, nextUid);
+      if (transition.action === "noop") {
+        setAuthReady(true);
         return;
       }
-      authSeenRef.current=true;
-      initialAuthUidRef.current=nextUid;
+      initialAuthUidRef.current = nextUid;
+      if (transition.requiresInMemoryReset) {
+        // Isolation stricte entre utilisateurs A et B sans rechargement intempestif de la page.
+        setNodesRaw([]);
+        setSegmentsRaw([]);
+        setDimensionsRaw([]);
+      }
       setUserUid(nextUid);
       setAuthReady(true);
     };
-    const unsubscribe = isStagingSandboxMode()
-      ? (() => {
-          syncIdentity();
-          return () => {};
-        })()
-      : onAuthStateChanged(auth,syncIdentity);
-    const timer=window.setInterval(syncIdentity,1000);
-    window.addEventListener("focus",syncIdentity);
-    return()=>{unsubscribe();window.clearInterval(timer);window.removeEventListener("focus",syncIdentity);};
-  },[]);
+    syncIdentity();
+    const timer = window.setInterval(syncIdentity, 1000);
+    window.addEventListener("focus", syncIdentity);
+    window.addEventListener("storage", syncIdentity);
+    window.addEventListener(PDI_IDENTITY_SYNCED_EVENT, syncIdentity);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", syncIdentity);
+      window.removeEventListener("storage", syncIdentity);
+      window.removeEventListener(PDI_IDENTITY_SYNCED_EVENT, syncIdentity);
+    };
+  }, []);
   // PATCH 017F1 & Protection C3 (STAGING-00-B3) : isolation par projet et par namespace Sandbox.
   const activeProjectKey=(projectId&&projectId.trim())?projectId.trim():"default";
   const rawAutosavePrefix=userUid?`isometrie.autosave.v474.user.${userUid}.project.${activeProjectKey}`:"";
@@ -7409,6 +7397,14 @@ function IsometrieModule(props: { projectId?: string }) {
     autosaveBaselineRef.current=persistenceFingerprint(buildProjectFileV474());
     if(!userUid){
       setSaveState("error");setStatusMessage("Autosauvegarde suspendue · utilisateur non identifié");setRecoveryChecked(true);return;
+    }
+    // MIG-05-FIX-01 : reprise non destructive d'une sauvegarde locale `local-...` vers l'UUID Supabase canonique
+    // (n'écrase jamais une cible existante, préserve intégralement la source locale).
+    if (isCanonicalSupabaseUuid(userUid)) {
+      migrateLocalIsometricAutosaveToCanonicalUuid({
+        canonicalUuid: userUid,
+        projectId: activeProjectKey,
+      });
     }
     // PATCH 017F1 : migration unique de l ancienne archive globale du profil
     // vers le projet par defaut, pour ne perdre aucun plan existant.

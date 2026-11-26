@@ -23,7 +23,7 @@ import type {
   PdiUserProfile,
   PdiUserRole,
   WorkspaceSessionResolution,
-} from "./firebase";
+} from "../types/pdiAuthTypes";
 import {
   getSupabaseBrowserClient,
   isSupabaseBrowserConfigured,

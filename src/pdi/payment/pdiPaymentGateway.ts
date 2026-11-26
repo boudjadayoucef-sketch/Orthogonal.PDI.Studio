@@ -1,4 +1,4 @@
-import { PdiAccountType, PdiSubscriptionPlan } from "../../lib/firebase";
+import type { PdiAccountType, PdiSubscriptionPlan } from "../../types/pdiAuthTypes";
 
 export type PdiPaymentProvider = "slickpay_baridimob" | "paddle";
 

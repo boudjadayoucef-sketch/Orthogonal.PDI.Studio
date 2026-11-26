@@ -6,15 +6,12 @@ import {StrictMode} from 'react';
 import {createRoot} from 'react-dom/client';
 import App from './App.tsx';
 import { ErrorBoundary } from './components/ErrorBoundary.tsx';
-import { testConnection } from './lib/firebase.ts';
 import { isStagingSandboxMode, seedSandboxDefaultProjectIfEmpty } from './lib/stagingSandbox.ts';
 import { initClarity } from './lib/clarity.ts';
 
-// Protection C1 (STAGING-00-B3): Do not call testConnection() in Sandbox mode
+// MIG-05-FIX-01 : Aucun appel reseau Firebase/Firestore au demarrage de l'application.
 if (isStagingSandboxMode()) {
   seedSandboxDefaultProjectIfEmpty();
-} else {
-  void testConnection();
 }
 
 // Initialiser Microsoft Clarity si configuré
