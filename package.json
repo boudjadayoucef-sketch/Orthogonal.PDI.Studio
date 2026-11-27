@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "build:vercel-api": "esbuild src/server/vercelHandler.ts --bundle --platform=node --format=cjs --target=node20 --packages=external --outfile=api/_vercelHandler.cjs",
+    "build:vercel-api": "esbuild src/server/vercelHandler.ts --bundle --minify --platform=node --format=cjs --target=node20 --alias:firebase-admin/app=./src/server/vercelFirebaseStub.ts --alias:firebase-admin/auth=./src/server/vercelFirebaseStub.ts --alias:@google-cloud/firestore=./src/server/vercelFirebaseStub.ts --alias:pg-native=./src/server/vercelFirebaseStub.ts --outfile=api/_vercelHandler.cjs",
     "build": "npm run build:vercel-api && vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
     "start": "node dist/server.cjs",
     "lint": "tsc --noEmit",

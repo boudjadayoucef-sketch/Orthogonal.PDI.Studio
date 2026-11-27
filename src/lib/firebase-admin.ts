@@ -662,15 +662,16 @@ function bootstrapActiveServerFirebaseRuntime(): ServerFirebaseAdminRuntime {
   const isVercelRuntime =
     typeof process !== 'undefined' &&
     (process.env?.VERCEL === '1' || process.env?.VERCEL === 'true');
-  if (!isVercelRuntime) {
-    return initializeServerFirebaseAdminRuntime();
-  }
   try {
     return initializeServerFirebaseAdminRuntime();
   } catch (err) {
+    const message = err instanceof Error ? err.message : '';
+    if (!isVercelRuntime && !message.includes('disabled on Vercel Serverless')) {
+      throw err;
+    }
     console.warn(
       '[VERCEL-API-01] Firebase Admin top-level initialization disabled (fail-closed) on Vercel:',
-      err instanceof Error ? err.message : 'configuration unavailable'
+      message || 'configuration unavailable'
     );
     return {
       sandboxDisabled: false,

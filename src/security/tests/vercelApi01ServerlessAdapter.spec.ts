@@ -798,12 +798,17 @@ describe("VERCEL-API-01 — Raccordement du serveur Express à Vercel Serverless
     expect(apiEntryCode).toContain('from "./_vercelHandler.cjs"');
     expect(apiEntryCode).not.toContain("../src/");
 
-    // Vérifier que le bundle api/_vercelHandler.cjs est présent, à jour, et sans référence statique à vite
+    // Vérifier que le bundle api/_vercelHandler.cjs est présent, 100% autonome (zéro dépendance npm externe ni Firebase/Firestore/Vite)
     const cjsBundlePath = path.join(rootDir, "api", "_vercelHandler.cjs");
     expect(fs.existsSync(cjsBundlePath)).toBe(true);
     const cjsBundleSrc = fs.readFileSync(cjsBundlePath, "utf-8");
     expect(cjsBundleSrc).not.toContain('require("vite")');
     expect(cjsBundleSrc).not.toContain("require('vite')");
+    expect(cjsBundleSrc).not.toContain('require("firebase-admin');
+    expect(cjsBundleSrc).not.toContain('require("@google-cloud/firestore")');
+    expect(cjsBundleSrc).not.toContain('require("express")');
+    expect(cjsBundleSrc).not.toContain('require("@supabase/supabase-js")');
+    expect(cjsBundleSrc).not.toContain('require("pg-native")');
 
     // Vérifier l'invocation HTTP réelle du handler par défaut exporté par api/index.ts
     const { baseUrl } = await mountServerlessHandlerForTest((req, res) => {
