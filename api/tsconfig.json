@@ -10,20 +10,6 @@
   },
   "include": [
     "./**/*.ts",
-    "../server.ts",
-    "../src/server/**/*.ts",
-    "../src/middleware/**/*.ts",
-    "../src/lib/firebase-admin.ts",
-    "../src/lib/stagingSandbox.ts",
-    "../src/security/sec01SecurityService.ts",
-    "../src/security/webhookAuth.ts",
-    "../src/security/webhooks/**/*.ts",
-    "../src/security/payments/pendingOrderRoute.ts",
-    "../src/pdi/payment/pdiPaymentGateway.ts",
-    "../src/types/pdiAuthTypes.ts",
-    "../src/db/index.ts",
-    "../src/db/schema.ts",
-    "../src/db/projects.ts",
-    "../src/db/users.ts"
+    "./**/*.d.cts"
   ]
 }

@@ -4,16 +4,55 @@
  *
  * - Aucun appel à `app.listen()`
  * - Aucun démarrage de Vite
- * - Import statique ESM direct vers `../src/server/vercelHandler.js` afin que `@vercel/node`
- *   et `@vercel/nft` compilent et embarquent nativement tous les modules serveur et leurs
- *   dépendances npm (`express`, `@supabase/supabase-js`, etc.) sans bundle intermédiaire.
+ * - Import statique direct d'un module CommonJS pré-assemblé dans `api/_vercelHandler.cjs`
+ *   (préfixé par `_` donc ignoré comme route publique par Vercel) afin d'éliminer tout
+ *   import TypeScript inter-répertoires (`../src/*`) et de garantir le traçage natif par
+ *   `@vercel/nft` de l'ensemble des dépendances npm serveur (`express`, `@supabase/supabase-js`, etc.).
  * - Attend la fin effective de la réponse HTTP (`finish` / `close`) pour garantir
  *   que les routes asynchrones (`/api/auth/supabase/session`, `/api/admin/supabase/overview`)
  *   ne soient jamais interrompues prématurément par le runtime Serverless.
  */
 
 import type { IncomingMessage, ServerResponse } from "http";
-import vercelApiHandler from "../src/server/vercelHandler.js";
+import vercelHandlerModule from "./_vercelHandler.cjs";
+
+type VercelHandlerFn = (req: IncomingMessage, res: ServerResponse) => void;
+
+function resolveVercelApiHandler(mod: unknown): VercelHandlerFn {
+  if (typeof mod === "function") {
+    return mod as VercelHandlerFn;
+  }
+  const record = mod as {
+    default?: unknown;
+    vercelApiHandler?: unknown;
+  } | null;
+  if (record && typeof record.default === "function") {
+    return record.default as VercelHandlerFn;
+  }
+  if (record && typeof record.vercelApiHandler === "function") {
+    return record.vercelApiHandler as VercelHandlerFn;
+  }
+  if (
+    record &&
+    record.default &&
+    typeof record.default === "object" &&
+    typeof (record.default as { default?: unknown; vercelApiHandler?: unknown }).default ===
+      "function"
+  ) {
+    return (record.default as { default: VercelHandlerFn }).default;
+  }
+  if (
+    record &&
+    record.default &&
+    typeof record.default === "object" &&
+    typeof (record.default as { vercelApiHandler?: unknown }).vercelApiHandler === "function"
+  ) {
+    return (record.default as { vercelApiHandler: VercelHandlerFn }).vercelApiHandler;
+  }
+  throw new Error("Vercel API handler export unavailable");
+}
+
+const vercelApiHandler = resolveVercelApiHandler(vercelHandlerModule);
 
 export default async function vercelApiEntrypoint(
   req: IncomingMessage,

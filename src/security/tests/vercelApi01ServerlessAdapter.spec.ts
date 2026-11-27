@@ -774,9 +774,9 @@ describe("VERCEL-API-01 — Raccordement du serveur Express à Vercel Serverless
       }
     };
 
-    walkServerGraph(path.join(rootDir, "api", "index.ts"));
+    walkServerGraph(path.join(rootDir, "src", "server", "vercelHandler.ts"));
 
-    // Aucun import relatif .ts ou sans extension ne doit subsister (sinon ERR_MODULE_NOT_FOUND sur Vercel ESM)
+    // Aucun import relatif .ts ou sans extension ne doit subsister dans le graphe serveur source
     expect(violations).toEqual([]);
     // Le graphe serveur ne doit jamais référencer le SDK navigateur client src/lib/firebase.ts
     const relVisited = Array.from(visited).map((f) => path.relative(rootDir, f));
@@ -784,17 +784,26 @@ describe("VERCEL-API-01 — Raccordement du serveur Express à Vercel Serverless
     expect(relVisited).toContain("server.ts");
     expect(relVisited).not.toContain("src/lib/firebase.ts");
 
-    // Vérifier la présence de api/tsconfig.json (NodeNext, noEmit: false) couvrant le graphe serveur
+    // Vérifier la présence de api/tsconfig.json (NodeNext, noEmit: false) scopé sur api/
     const apiTsconfig = JSON.parse(
       fs.readFileSync(path.join(rootDir, "api", "tsconfig.json"), "utf-8")
     );
     expect(apiTsconfig.compilerOptions.moduleResolution).toBe("NodeNext");
     expect(apiTsconfig.compilerOptions.noEmit).toBe(false);
-    expect(apiTsconfig.include).toContain("../server.ts");
 
-    // Vérifier que api/index.ts importe statiquement ../src/server/vercelHandler.js (tracé nativement par @vercel/nft)
+    // Vérifier que api/index.ts importe statiquement le bundle CJS local ./_vercelHandler.cjs
+    // sans aucun import TypeScript inter-répertoires ../src/* (prévention FUNCTION_INVOCATION_FAILED)
     const apiEntrySrc = fs.readFileSync(path.join(rootDir, "api", "index.ts"), "utf-8");
-    expect(apiEntrySrc).toContain('from "../src/server/vercelHandler.js"');
+    const apiEntryCode = stripTsComments(apiEntrySrc);
+    expect(apiEntryCode).toContain('from "./_vercelHandler.cjs"');
+    expect(apiEntryCode).not.toContain("../src/");
+
+    // Vérifier que le bundle api/_vercelHandler.cjs est présent, à jour, et sans référence statique à vite
+    const cjsBundlePath = path.join(rootDir, "api", "_vercelHandler.cjs");
+    expect(fs.existsSync(cjsBundlePath)).toBe(true);
+    const cjsBundleSrc = fs.readFileSync(cjsBundlePath, "utf-8");
+    expect(cjsBundleSrc).not.toContain('require("vite")');
+    expect(cjsBundleSrc).not.toContain("require('vite')");
 
     // Vérifier l'invocation HTTP réelle du handler par défaut exporté par api/index.ts
     const { baseUrl } = await mountServerlessHandlerForTest((req, res) => {
